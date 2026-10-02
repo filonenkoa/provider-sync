@@ -288,19 +288,38 @@ Examples:
 `;
 
 // ---------- http ----------
-async function req(url, { method = "GET", key, body, timeout = 6000 } = {}) {
+// `cap` stops reading after N bytes (used for the huge Unsloth openapi.json,
+// where only info.title matters) — the rest of the body is never downloaded
+async function readCapped(r, cap) {
+  if (!cap || !r.body) return r.text();
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let out = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+      if (out.length >= cap) break;
+    }
+  } finally { try { await reader.cancel(); } catch {} }
+  return out;
+}
+
+async function req(url, { method = "GET", key, body, timeout = 6000, cap = 0 } = {}) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try {
     const r = await fetch(url, {
       method, signal: c.signal,
       headers: {
+        Accept: "application/json",
         ...(key ? { Authorization: "Bearer " + key } : {}),
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-    const text = await r.text();
+    const text = await readCapped(r, cap);
     let json = null;
     try { json = JSON.parse(text); } catch {}
     return { status: r.status, text, json };
@@ -313,12 +332,23 @@ const v1Of = (b) => { b = b.replace(/\/+$/, ""); return /\/v1$/.test(b) ? b : b 
 const nz = (v) => (typeof v === "number" && v > 0 ? v : null);
 
 // ---------- detection ----------
+// one probe per server per run: the opencode and hermes sections often point at
+// the same URL, and re-probing it would triple the request count for no new data
+const _probes = new Map();
+export function probeCached(base, key) {
+  const k = normUrl(base) + "|" + (key || "");
+  if (!_probes.has(k)) _probes.set(k, probe(base, key));
+  return _probes.get(k);
+}
+export const clearProbeCache = () => _probes.clear();
+
 async function probe(base, key) {
   const root = rootOf(base);
-  let r = await req(root + "/openapi.json");
+  // only info.title is read from the Unsloth spec, so cap the download
+  let r = await req(root + "/openapi.json", { cap: 8192 });
   if (r.status === 200 && /unsloth/i.test(r.json?.info?.title || "")) return { kind: "unsloth", root };
-  r = await req(root + "/api/v0/models");
-  if (r.status === 200 && r.json) return { kind: "lmstudio", root };
+  r = await req(root + "/api/v0/models", { key });
+  if (r.status === 200 && r.json) return { kind: "lmstudio", root, models: Array.isArray(r.json) ? r.json : r.json.data || [] };
   r = await req(v1Of(base) + "/models", { key });
   if (r.status === 200 && r.json) {
     const data = Array.isArray(r.json) ? r.json : Array.isArray(r.json.data) ? r.json.data : null;
@@ -335,9 +365,11 @@ async function probe(base, key) {
 async function fetchModels(pr, base, key) {
   if (pr.kind === "llamacpp" || pr.kind === "openai") return pr.models.map(specAny);
   if (pr.kind === "lmstudio") {
-    const r = await req(rootOf(base) + "/api/v0/models", { key });
-    if (r.status !== 200) throw new Error("/api/v0/models HTTP " + r.status);
-    const data = Array.isArray(r.json) ? r.json : r.json?.data || [];
+    // probe() already fetched /api/v0/models and handed the payload over
+    const data = pr.models || await req(rootOf(base) + "/api/v0/models", { key }).then((r) => {
+      if (r.status !== 200) throw new Error("/api/v0/models HTTP " + r.status);
+      return Array.isArray(r.json) ? r.json : r.json?.data || [];
+    });
     return data.filter((m) => m && m.id).map((m) => ({
       id: m.id,
       ctx: nz(m.loaded_context_length || m.max_context_length),
@@ -711,12 +743,12 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   const h = parseHermes(text);
   if (!h) { console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers — skipped`); return { status: "no-section", why: "no custom_providers section" }; }
   if (!h.entries.length) { console.log(`hermes: custom_providers found but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : " (unexpected indentation?)"} — skipped`); return { status: "empty", why: "no entries parsed" }; }
-  console.log(`hermes (~/.hermes/config.yaml): ${h.entries.length} custom provider(s)`);
+  console.log(`hermes (${disp(HERMES_CFG)}): ${h.entries.length} custom provider(s)`);
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(h.entries.map(async (e) => {
     if (!e.base_url) return { e, skip: "no base_url" };
     const key = hermesKey(e, ocCfg, ocAuth);
-    const pr = await probe(e.base_url, key);
+    const pr = await probeCached(e.base_url, key);
     if (pr.kind === "offline") return { e, offline: pr.error || "HTTP " + pr.status };
     if (pr.kind === "auth") return { e, badauth: true };
     try { return { e, kind: pr.kind, server: await fetchModels(pr, e.base_url, key) }; }
@@ -786,7 +818,7 @@ async function cmdSetCtx(pid) {
   if (!p) die(`unknown provider "${pid}" (see provider-sync list)`);
   const base = p.options?.baseURL;
   const key = loadAuth()[pid]?.key || null;
-  const pr = await probe(base, key);
+  const pr = await probeCached(base, key);
   if (pr.kind === "offline" || pr.kind === "auth") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   let server;
   try { server = await fetchModels(pr, base, key); } catch (e) { die(e.message); }
@@ -833,8 +865,9 @@ function cmdList() {
 
 async function cmdAdd(id, url) {
   const base = v1Of(url);
-  let key = flags.key || loadAuth()[id]?.key || null; // persisted key
-  const pr = await probe(base, key);
+  const a = loadAuth();
+  let key = flags.key || a[id]?.key || null; // persisted key
+  const pr = await probeCached(base, key);
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   if (pr.kind === "auth") die(`${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
   let runKey = key; // credential used for this run's requests
@@ -881,7 +914,7 @@ async function cmdAdd(id, url) {
   for (const nt of notes) console.log("  note: " + nt);
 
   const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
-  const hkey = key || loadAuth()[id]?.key || null;
+  const hkey = key || a[id]?.key || null;
   const hmodel = flags.model || hmodels[0]?.id || null;
   const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
   // every target is reported afterwards: what was written and what was skipped, and why
@@ -900,7 +933,6 @@ async function cmdAdd(id, url) {
   }
   saveCfg(cfg);
   if (fresh) console.log(`created ${CFG}`);
-  const a = loadAuth();
   if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
   if (reportValidate(cfg)) console.log(`OK — ${Object.keys(prov.models).length} models in ${id}`);
   if (!flags["no-hermes"])
@@ -936,7 +968,7 @@ async function cmdSync() {
       const base = cfg.provider[id].options?.baseURL;
       if (!base) return { id, err: "no baseURL in config" };
       const key = auth[id]?.key || null;
-      const pr = await probe(base, key);
+      const pr = await probeCached(base, key);
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
       if (pr.kind === "auth") return { id, badauth: true };
       try { return { id, kind: pr.kind, base, server: await fetchModels(pr, base, key) }; }
