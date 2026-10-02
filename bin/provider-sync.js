@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdi
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 
 // config file resolution mirrors OpenCode's own discovery (config.ts):
 // PS_CONFIG override (legacy: OCP_CONFIG) > first existing of opencode.jsonc / opencode.json /
@@ -16,87 +17,118 @@ function detectCfg() {
   const hit = CFG_CANDIDATES.find((f) => existsSync(path.join(CFG_DIR, f)));
   return path.join(CFG_DIR, hit || CFG_CANDIDATES[0]);
 }
-const CFG = process.env.PS_CONFIG || process.env.OCP_CONFIG || detectCfg();
+const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || null;
+const CFG = CFG_ENV || detectCfg();
 const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
 const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 
 // ---------- cli ----------
-const argv = process.argv.slice(2);
-const flags = {};
-const pos = [];
-for (let i = 0; i < argv.length; i++) {
-  const a = argv[i];
-  if (a.startsWith("--")) {
-    const k = a.slice(2);
-    if (argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) flags[k] = argv[++i];
-    else flags[k] = true;
-  } else pos.push(a);
-}
-const cmd = pos[0];
 const die = (m) => { console.error("error: " + m); process.exit(1); };
-
-// strip // and /* */ comments outside string literals (.jsonc support)
-function stripJsonComments(s) {
-  let out = "", i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === '"') {
-      out += c; i++;
-      while (i < s.length && s[i] !== '"') {
-        if (s[i] === "\\") { out += s.slice(i, i + 2); i += 2; }
-        else { out += s[i]; i++; }
-      }
-      if (i < s.length) { out += s[i]; i++; }
-    } else if (c === "/" && s[i + 1] === "/") {
-      while (i < s.length && s[i] !== "\n") i++;
-    } else if (c === "/" && s[i + 1] === "*") {
-      const end = s.indexOf("*/", i + 2);
-      i = end === -1 ? s.length : end + 2;
-    } else { out += c; i++; }
+// parses ["--k","v"] and ["--k=v"]; boolean flags are the known no-value ones
+const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h"]);
+export function parseArgs(argv) {
+  const flags = {};
+  const pos = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { pos.push(...argv.slice(i + 1)); break; }
+    if (!a.startsWith("--")) { pos.push(a); continue; }
+    const eq = a.indexOf("=");
+    if (eq > 2) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
+    const k = a.slice(2);
+    if (BOOL_FLAGS.has(k)) { flags[k] = true; continue; }
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith("--")) die(`--${k} needs a value`);
+    flags[k] = argv[++i];
   }
-  return out;
+  return { flags, pos };
+}
+const { flags, pos } = parseArgs(process.argv.slice(2));
+const cmd = pos[0];
+
+// JSONC: strip // and /* */ comments plus trailing commas, both only outside
+// string literals — one string-aware pass so a model id like "a, }" survives
+export function parseJsonc(raw) {
+  let out = "", i = 0, hadComments = false;
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === '"') { // copy the string literal verbatim, escapes included
+      out += c; i++;
+      while (i < raw.length && raw[i] !== '"') {
+        if (raw[i] === "\\") { out += raw.slice(i, i + 2); i += 2; }
+        else { out += raw[i]; i++; }
+      }
+      if (i < raw.length) { out += raw[i]; i++; }
+      continue;
+    }
+    if (c === "/" && raw[i + 1] === "/") {
+      hadComments = true;
+      while (i < raw.length && raw[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && raw[i + 1] === "*") {
+      hadComments = true;
+      const end = raw.indexOf("*/", i + 2);
+      i = end === -1 ? raw.length : end + 2;
+      continue;
+    }
+    if (c === ",") { // a comma directly before a closer is not part of the data
+      let j = i + 1;
+      while (j < raw.length && /\s/.test(raw[j])) j++;
+      if (raw[j] === "}" || raw[j] === "]") { i++; continue; }
+    }
+    out += c; i++;
+  }
+  return { text: out, hadComments };
 }
 
 // ---------- store ----------
 let _cfgWarned = false;
 function warnMultiCfg() {
-  if (_cfgWarned || process.env.PS_CONFIG || process.env.OCP_CONFIG) return;
+  if (_cfgWarned || CFG_ENV) return;
   _cfgWarned = true;
   const present = CFG_CANDIDATES.filter((f) => existsSync(path.join(CFG_DIR, f)));
   if (present.length > 1) console.error(`note: multiple config files in ${CFG_DIR} (${present.join(", ")}); OpenCode deep-merges them — provider-sync edits ${path.basename(CFG)}`);
 }
 let _cfgHadComments = false, _cmtWarned = false;
-const loadCfg = () => {
+export const loadCfg = () => {
   if (!existsSync(CFG)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
   warnMultiCfg();
-  const raw = readFileSync(CFG, "utf8");
-  const cleaned = stripJsonComments(raw);
-  _cfgHadComments = cleaned.length !== raw.length;
+  const { text, hadComments } = parseJsonc(readFileSync(CFG, "utf8"));
+  _cfgHadComments = hadComments;
   try {
-    const p = JSON.parse(cleaned.replace(/,(\s*[}\]])/g, "$1"));
+    const p = JSON.parse(text);
     if (!p.provider) p.provider = {}; // fresh configs have no provider section
     return p;
   }
   catch (e) { die(`cannot parse ${CFG}: ${e.message}`); }
 };
-const loadAuth = () => (existsSync(AUTH) ? JSON.parse(readFileSync(AUTH, "utf8")) : {});
+export const loadAuth = () => {
+  if (!existsSync(AUTH)) return {};
+  let a;
+  try { a = JSON.parse(readFileSync(AUTH, "utf8")); }
+  catch (e) { die(`cannot parse ${AUTH}: ${e.message}\nfix or remove the file, then retry`); }
+  if (!a || typeof a !== "object" || Array.isArray(a)) die(`${AUTH} must contain a JSON object of provider keys`);
+  return a;
+};
 // same, but an absent config is a fresh install rather than an error (add bootstraps it)
 const loadCfgOrEmpty = () => (existsSync(CFG) ? loadCfg() : { provider: {} });
 
 // atomic write: backup (keep last 3), tmp file in the same dir, rename over target
+const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
+// drop all but the newest `keep` backups of `file`; legacy .bak-ocp- files included
+function pruneBackups(file, keep = 3) {
+  const dir = path.dirname(file);
+  const prefixes = [path.basename(file) + ".bak-provider-sync-", path.basename(file) + ".bak-ocp-"];
+  const baks = readdirSync(dir).filter((f) => prefixes.some((p) => f.startsWith(p))).sort();
+  for (const f of baks.slice(0, -keep)) unlinkSync(path.join(dir, f));
+}
 function saveJson(file, obj) {
   mkdirSync(path.dirname(file), { recursive: true });
   if (existsSync(file)) {
-    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
-    copyFileSync(file, file + ".bak-provider-sync-" + stamp);
-    try {
-      const base = path.basename(file);
-      const baks = readdirSync(path.dirname(file))
-        .filter((f) => f.startsWith(base + ".bak-provider-sync-") || f.startsWith(base + ".bak-ocp-")) // legacy prefix
-        .sort();
-      for (const f of baks.slice(0, -3)) unlinkSync(path.join(path.dirname(file), f));
-    } catch {}
+    copyFileSync(file, file + ".bak-provider-sync-" + stamp());
+    try { pruneBackups(file); } catch {}
   }
   const tmp = file + ".tmp-provider-sync";
   writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
@@ -110,7 +142,8 @@ const saveAuth = (a) => saveJson(AUTH, a);
 
 // numeric flag: undefined stays undefined, anything non-numeric is an error
 const numFlag = (v) => {
-  if (v === undefined || v === true) return undefined;
+  if (v === undefined) return undefined;
+  if (v === true) die("numeric flag needs a value");
   const n = +v;
   if (!Number.isFinite(n)) die(`bad number "${v}"`);
   return n;
@@ -616,13 +649,8 @@ function hermesSetField(lines, e, key, value) {
 
 // atomic write with a rotating backup; returns the backup path
 function writeHermesCfg(lines, eol = "\n") {
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
-  copyFileSync(HERMES_CFG, HERMES_CFG + ".bak-provider-sync-" + stamp);
-  try {
-    for (const f of readdirSync(path.dirname(HERMES_CFG))
-      .filter((f) => /^config\.yaml\.bak-(?:provider-sync|ocp)-\d{8}_\d{6}$/.test(f)).sort().slice(0, -3)) // legacy prefix
-      unlinkSync(path.join(path.dirname(HERMES_CFG), f));
-  } catch {}
+  copyFileSync(HERMES_CFG, HERMES_CFG + ".bak-provider-sync-" + stamp());
+  try { pruneBackups(HERMES_CFG); } catch {}
   const tmp = HERMES_CFG + ".tmp-provider-sync";
   writeFileSync(tmp, lines.join(eol));
   renameSync(tmp, HERMES_CFG);
@@ -941,6 +969,9 @@ async function cmdSync() {
 }
 
 // ---------- main ----------
+// run only when executed directly; importing the module (tests) must not exit
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain)
 try {
   if (cmd === "list") cmdList();
   else if (cmd === "add") {
@@ -954,4 +985,4 @@ try {
   else if (!cmd) { console.error(HELP); process.exit(1); }
   else die(`unknown command "${cmd}" — see provider-sync help`);
 } catch (e) { die(e.stack || e.message); }
-process.exit(process.exitCode ?? 0);
+if (isMain) process.exit(process.exitCode ?? 0);
