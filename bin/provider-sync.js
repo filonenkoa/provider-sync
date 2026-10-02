@@ -20,7 +20,7 @@ function detectCfg() {
 const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || null;
 const CFG = CFG_ENV || detectCfg();
 const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
-const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
+export const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 
 // ---------- cli ----------
@@ -116,7 +116,9 @@ export const loadAuth = () => {
 const loadCfgOrEmpty = () => (existsSync(CFG) ? loadCfg() : { provider: {} });
 
 // atomic write: backup (keep last 3), tmp file in the same dir, rename over target
-const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
+// millisecond precision: two writes in the same second must not overwrite
+// each other's backup (the name doubles as the sort key)
+const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").replace(/\.(\d{3})Z$/, "_$1");
 // drop all but the newest `keep` backups of `file`; legacy .bak-ocp- files included
 function pruneBackups(file, keep = 3) {
   const dir = path.dirname(file);
@@ -374,10 +376,13 @@ const MOD_BY_ID = (id) => /qwen3\.8/i.test(id) ? ["text", "image", "video"]
 const TOOL_BY_ID = (id) => !/(^|[-/])base[-_]/i.test(id);
 const REASON_BY_ID = (id) => /qwen3\.[5-9]|qwen4|muse.?glimmer|thinking/i.test(id);
 
+// context windows are powers of two in practice, so snap a parsed "262K" (268288)
+// down to 262144 rather than trusting the digits in the name
+const pow2 = (n) => { let p = 4096; while (p * 2 <= n) p *= 2; return p; };
 // guess a context window from the model id (only used as prompt hint / report)
-function guessCtx(id) {
+export function guessCtx(id) {
   const k = id.match(/(^|[^A-Za-z0-9])(\d+)K/i);
-  if (k) return parseInt(k[2]) * 1024;
+  if (k) return pow2(parseInt(k[2]) * 1024);
   if (/1M/i.test(id)) return 1048576;
   if (/qwen3\.[5-9]/i.test(id)) return 262144;
   return 131072;
@@ -418,7 +423,8 @@ async function resolveCtxs(server, { ctxFlag, mode, notes, existing = [] }) {
 
 function freshEntry(id, m, { out, ctxMap }) {
   const inp = m.input || MOD_BY_ID(id);
-  const c = m.ctx ?? ctxMap?.[id] ?? null;
+  const raw = m.ctx ?? ctxMap?.[id] ?? null;
+  const c = typeof raw === "number" && raw > 0 ? raw : null; // ctx 0 means "omit the limit"
   const e = { name: id };
   if (inp.length > 1) e.attachment = true;
   e.modalities = { input: inp, output: ["text"] };
@@ -427,7 +433,7 @@ function freshEntry(id, m, { out, ctxMap }) {
   if (REASON_BY_ID(id)) e.reasoning = true;
   return e;
 }
-function upsertEntry(old, m, opts) {
+export function upsertEntry(old, m, opts) {
   if (!old) return freshEntry(m.id, m, opts);
   const e = structuredClone(old);
   if (m.input) e.modalities = { input: m.input, output: e.modalities?.output || ["text"] };
@@ -436,7 +442,7 @@ function upsertEntry(old, m, opts) {
 }
 
 // existing models object + server specs -> merged + diff
-function reconcile(models, server, { out, ctxMap, notes }) {
+export function reconcile(models, server, { out, ctxMap }) {
   const res = { added: [], removed: [], ctx: [], mods: [] };
   const next = {};
   const seen = new Set();
@@ -444,7 +450,7 @@ function reconcile(models, server, { out, ctxMap, notes }) {
     seen.add(m.id);
     if (m.skip) { if (models[m.id]) next[m.id] = models[m.id]; continue; }
     const old = models[m.id];
-    next[m.id] = upsertEntry(old, m, { out, ctxMap, notes });
+    next[m.id] = upsertEntry(old, m, { out, ctxMap });
     if (!old) res.added.push(m.id);
     else {
       if (m.ctx != null && old.limit?.context !== m.ctx) res.ctx.push([m.id, old.limit?.context, m.ctx]);
@@ -460,7 +466,7 @@ function reconcile(models, server, { out, ctxMap, notes }) {
 // Surgical line-based YAML edits: no full-file reparse/rewrite, comments and
 // formatting of untouched sections are preserved. Only the per-provider
 // `models:` block (a fallback catalog for offline use) is rewritten.
-const normUrl = (b) => (b || "").replace(/\/v1\/?$/i, "").replace(/\/+$/, "").toLowerCase().replace("localhost", "127.0.0.1");
+export const normUrl = (b) => (b || "").replace(/\/v1\/?$/i, "").replace(/\/+$/, "").toLowerCase().replace("localhost", "127.0.0.1");
 
 let _henv = null;
 function hermesEnv() {
@@ -475,13 +481,13 @@ function hermesEnv() {
 }
 
 // unquote a YAML scalar; double-quoted strings are JSON (yq quotes via JSON.stringify)
-const deq = (s) => {
+export const deq = (s) => {
   if (/^".*"$/.test(s)) { try { return JSON.parse(s); } catch {} }
   return s.replace(/^(['"])(.*)\1$/, "$2");
 };
 
 // quote a YAML scalar only when needed; JSON quoting is always valid YAML
-const yq = (s) => (/^[A-Za-z0-9_.@-]/.test(s) && !/: /.test(s) && !/^\s|\s$/.test(s) && !s.includes("#") ? s : JSON.stringify(s));
+export const yq = (s) => (/^[A-Za-z0-9_.@-]/.test(s) && !/: /.test(s) && !/^\s|\s$/.test(s) && !s.includes("#") ? s : JSON.stringify(s));
 
 // short paths in reports: ~/.config/... instead of /Users/x/.config/...
 const disp = (p) => (typeof p === "string" && p.startsWith(os.homedir()) ? "~" + p.slice(os.homedir().length) : p);
@@ -491,7 +497,7 @@ const indentOf = (l) => l.length - l.trimStart().length;
 
 // hermes yaml: indentation is detected from the file instead of assumed, so
 // configs written with a different indent (or by a Windows editor) still parse
-function parseHermes(text) {
+export function parseHermes(text) {
   const lines = text.split(/\r?\n/);
   const start = lines.findIndex((l) => /^custom_providers:\s*(#.*)?$/.test(l));
   if (start < 0) return null;
@@ -545,7 +551,7 @@ function parseHermes(text) {
   return { lines, entries, listInd: li, fldInd: entries[0]?.fldInd ?? li + 2, listEnd: i, unparsed: dashes, eol: text.includes("\r\n") ? "\r\n" : "\n" };
 }
 
-function parseModelsBlock(lines, a, b, mdl, ctx) {
+export function parseModelsBlock(lines, a, b, mdl, ctx) {
   const models = [];
   const keyRe = new RegExp("^ {" + mdl + "}(.+?):(?:\\s+(\\{.*\\}))?\\s*$");
   const ctxRe = new RegExp("^ {" + ctx + "}context_length:\\s*(\\d+)\\s*$");
@@ -579,7 +585,7 @@ function parseModelsBlock(lines, a, b, mdl, ctx) {
   return models;
 }
 
-function renderModels(models, mdl = 6, ctx = 8) {
+export function renderModels(models, mdl = 6, ctx = 8) {
   const lines = [];
   for (const m of models)
     if (m.ctx != null) lines.push(`${ind(mdl)}${yq(m.id)}:`, `${ind(ctx)}context_length: ${m.ctx}`);
@@ -612,7 +618,7 @@ function entryEnd(lines, idx, listInd) {
 
 // replace (or create) an entry's models region; index arithmetic stays valid because
 // the marker line is consumed from the replaced region and re-emitted fresh
-function hermesSetModels(lines, e, models) {
+export function hermesSetModels(lines, e, models) {
   const body = renderModels(models, e.mdlInd, e.ctxInd);
   const marker = `${ind(e.fldInd)}models_discovered: true`;
   const markerRe = new RegExp("^ {" + e.fldInd + "}models_discovered:");
@@ -635,7 +641,7 @@ function hermesSetModels(lines, e, models) {
 
 // set (or insert) a scalar field of an entry; located by content so it stays
 // correct after a models-region splice shifted the line numbers
-function hermesSetField(lines, e, key, value) {
+export function hermesSetField(lines, e, key, value) {
   const end = entryEnd(lines, e.idx, e.listInd);
   const re = new RegExp("^ {" + e.fldInd + "}" + key + ":");
   for (let k = e.idx + 1; k < end; k++)
@@ -659,7 +665,7 @@ function writeHermesCfg(lines, eol = "\n") {
 
 // create or update a custom_providers entry so `add` reaches every installed
 // harness; matched by base URL, so re-running updates instead of duplicating
-function hermesUpsert({ name, base, key, model, models, dryRun }) {
+export function hermesUpsert({ name, base, key, model, models, dryRun }) {
   if (!existsSync(HERMES_CFG)) return { status: "absent", why: `hermes not installed (${disp(HERMES_CFG)} not found)` };
   const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
   if (!h) return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };

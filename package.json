@@ -7,7 +7,8 @@
     "provider-sync": "./bin/provider-sync.js"
   },
   "scripts": {
-    "start": "node bin/provider-sync.js"
+    "start": "node bin/provider-sync.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
