@@ -81,6 +81,8 @@ const loadCfg = () => {
   catch (e) { die(`cannot parse ${CFG}: ${e.message}`); }
 };
 const loadAuth = () => (existsSync(AUTH) ? JSON.parse(readFileSync(AUTH, "utf8")) : {});
+// same, but an absent config is a fresh install rather than an error (add bootstraps it)
+const loadCfgOrEmpty = () => (existsSync(CFG) ? loadCfg() : { provider: {} });
 
 // atomic write: backup (keep last 3), tmp file in the same dir, rename over target
 function saveJson(file, obj) {
@@ -130,7 +132,8 @@ Files:
 
 Commands:
   provider-sync list
-      List configured providers with model counts and key status.
+      List configured providers with model counts and key status. Prints
+      "not found" instead of failing when OpenCode is not installed.
 
   provider-sync add <id> <baseURL> [options]
       Register or update a provider. The server type is auto-detected:
@@ -144,6 +147,8 @@ Commands:
       Key resolution: --key K > existing auth.json key for <id>. For an
       Unsloth UI with neither, pass --username U --password P: provider-sync logs in
       and creates (and stores) a persistent API key named after <id>.
+      On a machine without an OpenCode config the file is created (first
+      provider bootstraps it); --dry-run writes nothing.
       Options:
         --name N          display name (default: existing value, else <id>)
         --key K           API key; stored to auth.json under <id>
@@ -173,6 +178,11 @@ Commands:
                   go into Hermes. Model entries keep only context_length —
                   any other fields are dropped (with a warning).
         all       both (default)
+      Harnesses are independent — a target whose config file is missing is
+      reported as "not found — skipped" and the other one still runs, so
+      hermes-only and opencode-only machines work. Asking for a target
+      explicitly (--target opencode / --provider ID) without an OpenCode
+      config is still an error.
       Options: --provider ID (opencode target only), --ctx N, --output N.
 
   provider-sync set-ctx <provider>
@@ -668,6 +678,7 @@ async function cmdSetCtx(pid) {
 
 // ---------- commands ----------
 function cmdList() {
+  if (!existsSync(CFG)) { console.log(`opencode (${CFG}): not found — no opencode providers`); return; }
   const cfg = loadCfg();
   const auth = loadAuth();
   for (const [id, p] of Object.entries(cfg.provider || {})) {
@@ -704,7 +715,8 @@ async function cmdAdd(id, url) {
   const ctxFlag = numFlag(flags.ctx);
   const notes = [];
   const mode = flags["dry-run"] ? "report" : "write";
-  const cfg = loadCfg();
+  const fresh = !existsSync(CFG); // first provider on a machine without OpenCode config
+  const cfg = loadCfgOrEmpty();
   const oldProv = cfg.provider[id] || {};
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
   const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes });
@@ -726,6 +738,7 @@ async function cmdAdd(id, url) {
 
   if (flags["dry-run"]) { console.log("dry-run: nothing written"); return; }
   saveCfg(cfg);
+  if (fresh) console.log(`created ${CFG}`);
   const a = loadAuth();
   if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
   if (reportValidate(cfg)) console.log(`OK — config written, ${Object.keys(prov.models).length} models in ${id}`);
@@ -734,10 +747,16 @@ async function cmdAdd(id, url) {
 async function cmdSync() {
   const target = flags.target || "all";
   if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
-  // for a hermes-only run the opencode config is optional (key borrowing only)
-  const cfg = target === "hermes" && !existsSync(CFG) ? {} : loadCfg();
+  // harnesses are independent: a missing config only skips its own target, so a
+  // hermes-only (or opencode-only) machine still syncs what it has. The opencode
+  // config is optional for hermes anyway — it is only used to borrow API keys.
+  const haveOc = existsSync(CFG);
+  if (!haveOc && (target === "opencode" || flags.provider)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
+  const cfg = haveOc ? loadCfg() : {};
   const auth = loadAuth();
-  if (target === "all" || target === "opencode") {
+  const wantOc = target === "all" || target === "opencode";
+  if (wantOc && !haveOc) console.log(`opencode (${CFG}): not found — skipped`);
+  if (wantOc && haveOc) {
     const disabled = new Set(cfg.disabled_providers || []);
     const out = numFlag(flags.output) ?? 65536;
     const ctxFlag = numFlag(flags.ctx);
