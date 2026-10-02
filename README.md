@@ -28,7 +28,7 @@ provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
 | Command | What it does |
 | --- | --- |
 | `provider-sync list` | Providers, model counts, key status |
-| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert); creates the OpenCode config if it does not exist yet. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--ctx N`, `--output N`, `--dry-run` |
+| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). Creates the OpenCode config if absent. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
 | `provider-sync sync [--apply] [--target all\|opencode\|hermes] [--provider ID]` | Check/apply drift between servers and config |
 | `provider-sync set-ctx <provider>` | Interactively re-ask context for models whose server reports none (needs a TTY) |
 | `provider-sync help` | Full in-tool documentation |
@@ -53,6 +53,13 @@ Sync never clobbers already-configured values — re-ask them with `provider-syn
 | --- | --- |
 | OpenCode config — first existing of `opencode.jsonc` / `opencode.json` / `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode` (override: `PS_CONFIG`) | provider definitions (models, limits, modalities); skipped if OpenCode is not installed |
 | `~/.local/share/opencode/auth.json` | API keys per provider id |
-| `~/.hermes/config.yaml` | only the `models:` maps under `custom_providers` — surgical line edits, comments preserved; skipped if Hermes is not installed |
+| `~/.hermes/config.yaml` | `custom_providers` entries: created/updated by `add`, and their `models:` maps refreshed by `sync` — surgical line edits, comments and other fields preserved; skipped if Hermes is not installed |
 
-Every write is atomic (tmp + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept). Offline or auth-failing servers are reported and skipped without blocking the rest. Targets are independent: a missing config only skips its own target, so `sync` works on a hermes-only or opencode-only machine (the opencode config is additionally optional for hermes — it is only used to borrow API keys for providers pointing at the same server). Only an explicit `--target opencode` / `--provider ID` without an OpenCode config is an error.
+Every write is atomic (tmp + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept). Writes report per target — file, what changed, and why anything was skipped:
+
+```
+written:
+  opencode  ~/.config/opencode/opencode.jsonc  provider "3090" (26 models)
+  keys      ~/.local/share/opencode/auth.json  no change (no new key)
+  hermes    ~/.hermes/config.yaml  custom_providers "100.64.0.10:64980" updated (26 models, model: IY/Qwen…)
+``` Offline or auth-failing servers are reported and skipped without blocking the rest. Targets are independent: a missing config only skips its own target, so `sync` works on a hermes-only or opencode-only machine (the opencode config is additionally optional for hermes — it is only used to borrow API keys for providers pointing at the same server). Only an explicit `--target opencode` / `--provider ID` without an OpenCode config is an error.

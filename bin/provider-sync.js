@@ -149,11 +149,21 @@ Commands:
       and creates (and stores) a persistent API key named after <id>.
       On a machine without an OpenCode config the file is created (first
       provider bootstraps it); --dry-run writes nothing.
+      Reaches every installed harness: the same provider is also created or
+      updated under custom_providers in ~/.hermes/config.yaml (matched by
+      base URL, so re-running updates instead of duplicating). Whatever
+      happens, the last lines report per target: what was written and what
+      was skipped, with the reason.
       Options:
         --name N          display name (default: existing value, else <id>)
-        --key K           API key; stored to auth.json under <id>
+        --key K           API key; stored to auth.json under <id>, and
+                          written into the hermes entry as a literal api_key
+                          (dummy when the server needs no auth)
         --username U      Unsloth UI login (together with --password P)
         --password P
+        --model M         model written into the hermes entry's model:
+                          field (default: first model the server reports)
+        --no-hermes       do not touch ~/.hermes/config.yaml
         --ctx N           ctx for models whose server reports none
                           (0 = omit the limit). Without it, provider-sync asks
                           interactively in a terminal; with --dry-run a
@@ -440,82 +450,107 @@ const deq = (s) => {
 // quote a YAML scalar only when needed; JSON quoting is always valid YAML
 const yq = (s) => (/^[A-Za-z0-9_.@-]/.test(s) && !/: /.test(s) && !/^\s|\s$/.test(s) && !s.includes("#") ? s : JSON.stringify(s));
 
+// short paths in reports: ~/.config/... instead of /Users/x/.config/...
+const disp = (p) => (typeof p === "string" && p.startsWith(os.homedir()) ? "~" + p.slice(os.homedir().length) : p);
+
+const ind = (n) => " ".repeat(n);
+const indentOf = (l) => l.length - l.trimStart().length;
+
+// hermes yaml: indentation is detected from the file instead of assumed, so
+// configs written with a different indent (or by a Windows editor) still parse
 function parseHermes(text) {
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
   const start = lines.findIndex((l) => /^custom_providers:\s*(#.*)?$/.test(l));
   if (start < 0) return null;
   const entries = [];
+  let listInd = null;
+  let dashes = 0; // list items we could not parse — appending next to them would corrupt the yaml
   let i = start + 1;
   while (i < lines.length) {
-    const m = lines[i].match(/^ {2}- name:\s*(.*)$/);
+    const m = lines[i].match(/^( *)- +(.*)$/);
     if (!m) {
       if (lines[i].trim() === "") { i++; continue; }
       if (/^\S/.test(lines[i])) break;
       i++; continue;
     }
+    const li = m[1].length;
+    if (listInd === null) listInd = li;
+    if (li > listInd) { i++; continue; } // a list nested inside the previous entry
+    if (li < listInd) break; // the custom_providers list ended
+    const nm = m[2].match(/^name:\s*(.*)$/);
+    if (!nm) { dashes++; i++; continue; }
     let j = i + 1;
-    while (j < lines.length && lines[j].trim() !== "" && /^ {4,}\S/.test(lines[j])) j++;
+    while (j < lines.length && (lines[j].trim() === "" || indentOf(lines[j]) > li)) j++;
     let e2 = j;
     while (e2 > i + 1 && lines[e2 - 1].trim() === "") e2--;
-    const entry = { idx: i, end: e2, name: deq(m[1].trim()), base_url: null, api_key: null, key_env: null, model: null, modelsIdx: -1, blockEnd: -1, models: [], modelsDiscovered: false };
+    let fi = null; // field indent = indent of the first field line (usually dash + 2)
+    for (let k = i + 1; k < e2; k++)
+      if (lines[k].trim() && indentOf(lines[k]) > li) { fi = indentOf(lines[k]); break; }
+    if (fi === null) fi = li + 2;
+    const entry = { idx: i, end: e2, name: deq(nm[1].trim()), listInd: li, fldInd: fi, mdlInd: fi + 2, ctxInd: fi + 4, base_url: null, api_key: null, key_env: null, model: null, modelsIdx: -1, blockEnd: -1, models: [], modelsDiscovered: false };
+    const fld = (k) => new RegExp("^ {" + fi + "}" + k + ":\\s*(\\S.*?)\\s*$");
     for (let k = i + 1; k < e2; k++) {
       const l = lines[k];
       let f;
-      if ((f = l.match(/^ {4}base_url:\s*(\S.*?)\s*$/))) entry.base_url = deq(f[1]);
-      else if ((f = l.match(/^ {4}api_key:\s*(\S.*?)\s*$/))) entry.api_key = deq(f[1]);
-      else if ((f = l.match(/^ {4}key_env:\s*(\S.*?)\s*$/))) entry.key_env = deq(f[1]);
-      else if ((f = l.match(/^ {4}model:\s*(\S.*?)\s*$/))) entry.model = deq(f[1]);
-      else if ((f = l.match(/^ {4}models_discovered:\s*(\S.*?)\s*$/))) entry.modelsDiscovered = /^(true|yes|1)$/i.test(f[1]);
-      else if ((f = l.match(/^ {4}models:\s*$/))) {
+      if ((f = l.match(fld("base_url")))) entry.base_url = deq(f[1]);
+      else if ((f = l.match(fld("api_key")))) entry.api_key = deq(f[1]);
+      else if ((f = l.match(fld("key_env")))) entry.key_env = deq(f[1]);
+      else if ((f = l.match(fld("model")))) entry.model = deq(f[1]);
+      else if ((f = l.match(fld("models_discovered")))) entry.modelsDiscovered = /^(true|yes|1)$/i.test(f[1]);
+      else if (new RegExp("^ {" + fi + "}models:\\s*$").test(l)) {
         entry.modelsIdx = k;
         let b = k + 1;
-        while (b < e2 && (lines[b].trim() === "" || /^ {6,}\S/.test(lines[b]))) b++;
+        while (b < e2 && (lines[b].trim() === "" || indentOf(lines[b]) > fi)) b++;
         entry.blockEnd = b;
-        entry.models = parseModelsBlock(lines, k + 1, b);
+        entry.models = parseModelsBlock(lines, k + 1, b, fi + 2, fi + 4);
       }
     }
     entries.push(entry);
     i = e2;
   }
-  return { lines, entries };
+  const li = listInd ?? 2;
+  return { lines, entries, listInd: li, fldInd: entries[0]?.fldInd ?? li + 2, listEnd: i, unparsed: dashes, eol: text.includes("\r\n") ? "\r\n" : "\n" };
 }
 
-function parseModelsBlock(lines, a, b) {
+function parseModelsBlock(lines, a, b, mdl, ctx) {
   const models = [];
+  const keyRe = new RegExp("^ {" + mdl + "}(.+?):(?:\\s+(\\{.*\\}))?\\s*$");
+  const ctxRe = new RegExp("^ {" + ctx + "}context_length:\\s*(\\d+)\\s*$");
   let i = a;
   while (i < b) {
     const l = lines[i];
     if (l.trim() === "") { i++; continue; }
-    const m = l.match(/^ {6}(.+?):(?:\s+(\{.*\}))?\s*$/);
+    const m = l.match(keyRe);
     if (!m) { i++; continue; }
     const id = deq(m[1]);
-    let ctx = null, extra = false; // extra: fields provider-sync does not preserve (only context_length is kept)
+    let ctxv = null, extra = false; // extra: fields provider-sync does not preserve (only context_length is kept)
     if (m[2]) {
       const ic = m[2].match(/context_length:\s*(\d+)/);
-      if (ic) ctx = parseInt(ic[1]);
+      if (ic) ctxv = parseInt(ic[1]);
       const rest = m[2].replace(/^\{\s*|\s*\}$/g, "").replace(/"?context_length"?\s*:\s*\d+/g, "");
       if (rest.replace(/[,\s]/g, "") !== "") extra = true;
     } else {
       for (let k = i + 1; k < b; k++) {
-        const cl = lines[k].match(/^ {8}context_length:\s*(\d+)\s*$/);
-        if (cl) { ctx = parseInt(cl[1]); continue; }
-        if (/^ {6}\S/.test(lines[k])) break;
-        if (/^ {8,}\S/.test(lines[k])) extra = true;
+        if (lines[k].trim() === "") continue;
+        const c2 = lines[k].match(ctxRe);
+        if (c2) { ctxv = parseInt(c2[1]); continue; }
+        if (indentOf(lines[k]) <= mdl) break;
+        extra = true;
       }
     }
     let e = i + 1;
-    while (e < b && lines[e].trim() !== "" && /^ {8,}\S/.test(lines[e])) e++;
-    models.push({ id, ctx, extra });
+    while (e < b && lines[e].trim() !== "" && indentOf(lines[e]) > mdl) e++;
+    models.push({ id, ctx: ctxv, extra });
     i = e;
   }
   return models;
 }
 
-function renderModels(models) {
+function renderModels(models, mdl = 6, ctx = 8) {
   const lines = [];
   for (const m of models)
-    if (m.ctx != null) lines.push(`      ${yq(m.id)}:`, `        context_length: ${m.ctx}`);
-    else lines.push(`      ${yq(m.id)}: {}`);
+    if (m.ctx != null) lines.push(`${ind(mdl)}${yq(m.id)}:`, `${ind(ctx)}context_length: ${m.ctx}`);
+    else lines.push(`${ind(mdl)}${yq(m.id)}: {}`);
   return lines;
 }
 
@@ -532,12 +567,116 @@ function hermesKey(e, ocCfg, ocAuth) {
   return null;
 }
 
+// ---------- hermes writes (shared by sync and add) ----------
+// first line index after an entry that is not part of it (next entry / top-level key)
+function entryEnd(lines, idx, listInd) {
+  for (let k = idx + 1; k < lines.length; k++) {
+    if (lines[k].trim() === "") continue;
+    if (indentOf(lines[k]) <= listInd) return k;
+  }
+  return lines.length;
+}
+
+// replace (or create) an entry's models region; index arithmetic stays valid because
+// the marker line is consumed from the replaced region and re-emitted fresh
+function hermesSetModels(lines, e, models) {
+  const body = renderModels(models, e.mdlInd, e.ctxInd);
+  const marker = `${ind(e.fldInd)}models_discovered: true`;
+  const markerRe = new RegExp("^ {" + e.fldInd + "}models_discovered:");
+  if (e.modelsIdx >= 0) {
+    let end = e.blockEnd;
+    for (let k = end; k < e.end; k++) {
+      if (lines[k].trim() === "") continue;
+      if (markerRe.test(lines[k])) { end = k + 1; break; }
+      break;
+    }
+    lines.splice(e.modelsIdx + 1, end - e.modelsIdx - 1, ...body, marker);
+  } else {
+    let at = e.end, have = false;
+    for (let k = e.idx + 1; k < e.end; k++)
+      if (markerRe.test(lines[k])) { at = k; have = true; break; }
+    lines.splice(at, 0, `${ind(e.fldInd)}models:`, ...body, ...(have ? [] : [marker]));
+  }
+  return lines;
+}
+
+// set (or insert) a scalar field of an entry; located by content so it stays
+// correct after a models-region splice shifted the line numbers
+function hermesSetField(lines, e, key, value) {
+  const end = entryEnd(lines, e.idx, e.listInd);
+  const re = new RegExp("^ {" + e.fldInd + "}" + key + ":");
+  for (let k = e.idx + 1; k < end; k++)
+    if (re.test(lines[k])) { lines[k] = `${ind(e.fldInd)}${key}: ${yq(value)}`; return; }
+  let at = e.idx + 1;
+  const baseRe = new RegExp("^ {" + e.fldInd + "}base_url:");
+  for (let k = e.idx + 1; k < end; k++)
+    if (baseRe.test(lines[k])) { at = k + 1; break; }
+  lines.splice(at, 0, `${ind(e.fldInd)}${key}: ${yq(value)}`);
+}
+
+// atomic write with a rotating backup; returns the backup path
+function writeHermesCfg(lines, eol = "\n") {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
+  copyFileSync(HERMES_CFG, HERMES_CFG + ".bak-provider-sync-" + stamp);
+  try {
+    for (const f of readdirSync(path.dirname(HERMES_CFG))
+      .filter((f) => /^config\.yaml\.bak-(?:provider-sync|ocp)-\d{8}_\d{6}$/.test(f)).sort().slice(0, -3)) // legacy prefix
+      unlinkSync(path.join(path.dirname(HERMES_CFG), f));
+  } catch {}
+  const tmp = HERMES_CFG + ".tmp-provider-sync";
+  writeFileSync(tmp, lines.join(eol));
+  renameSync(tmp, HERMES_CFG);
+  return `config.yaml.bak-provider-sync-${stamp}`;
+}
+
+// create or update a custom_providers entry so `add` reaches every installed
+// harness; matched by base URL, so re-running updates instead of duplicating
+function hermesUpsert({ name, base, key, model, models, dryRun }) {
+  if (!existsSync(HERMES_CFG)) return { status: "absent", why: `hermes not installed (${disp(HERMES_CFG)} not found)` };
+  const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
+  if (!h) return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };
+  const n = models.length;
+  const found = h.entries.find((e) => normUrl(e.base_url) === normUrl(base));
+  if (found) {
+    if (dryRun) return { status: "updated", name: found.name, n };
+    const lines = h.lines.slice();
+    hermesSetModels(lines, found, models);
+    if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
+    writeHermesCfg(lines, h.eol);
+    return { status: "updated", name: found.name, n };
+  }
+  if (dryRun) return { status: "created", name, n };
+  if (h.unparsed) return { status: "unparsed", why: `${h.unparsed} custom_providers item(s) not understood (unexpected layout) — refusing to append, update them by hand` };
+  // yaml requires the fields of a list item exactly two columns right of its dash;
+  // anything else means the file is hand-made and we must not guess its style
+  if (h.entries.length && h.fldInd !== h.listInd + 2)
+    return { status: "layout", why: `existing entries are indented unusually (dash ${h.listInd}, fields ${h.fldInd}) — refusing to append, update by hand` };
+  const li = h.listInd, fi = li + 2;
+  const block = [
+    `${ind(li)}- name: ${yq(name)}`,
+    `${ind(fi)}base_url: ${yq(base)}`,
+    `${ind(fi)}api_key: ${key ? yq(key) : "dummy"}`,
+    ...(model ? [`${ind(fi)}model: ${yq(model)}`] : []),
+    `${ind(fi)}models:`,
+    ...renderModels(models, fi + 2, fi + 4),
+    `${ind(fi)}models_discovered: true`,
+  ];
+  const lines = h.lines.slice();
+  let at = h.listEnd;
+  while (at > 0 && lines[at - 1].trim() === "") at--;
+  // separate the new entry from a following top-level key with one blank line
+  const blank = at < lines.length && lines[at].trim() !== "" ? [""] : [];
+  lines.splice(at, 0, ...block, ...blank);
+  writeHermesCfg(lines, h.eol);
+  return { status: "created", name, n };
+}
+
 async function syncHermes({ apply, ocCfg, ocAuth }) {
-  if (!existsSync(HERMES_CFG)) { console.log("hermes (~/.hermes/config.yaml): not found — skipped"); return; }
+  if (!existsSync(HERMES_CFG)) { console.log(`hermes (${disp(HERMES_CFG)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
   const text = readFileSync(HERMES_CFG, "utf8");
   const h = parseHermes(text);
-  if (!h) { console.log("hermes (~/.hermes/config.yaml): no custom_providers — skipped"); return; }
-  if (!h.entries.length) { console.log("hermes: custom_providers found but no entries parsed (unexpected indentation?) — skipped"); return; }
+  if (!h) { console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers — skipped`); return { status: "no-section", why: "no custom_providers section" }; }
+  if (!h.entries.length) { console.log(`hermes: custom_providers found but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : " (unexpected indentation?)"} — skipped`); return { status: "empty", why: "no entries parsed" }; }
   console.log(`hermes (~/.hermes/config.yaml): ${h.entries.length} custom provider(s)`);
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(h.entries.map(async (e) => {
@@ -573,42 +712,13 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
     changes += added.length + removed.length + ctxCh.length;
     edits.push({ e, live });
   }
-  if (!edits.length) return;
-  if (!apply) { console.log(`  ${changes} change(s) pending — re-run with --apply to write`); return; }
+  if (!edits.length) return { status: "in-sync", n: h.entries.length };
+  if (!apply) { console.log(`  ${changes} change(s) pending — re-run with --apply to write`); return { status: "pending", changes }; }
   // apply bottom-up so earlier line indices stay valid
   const lines = h.lines.slice();
-  for (const ed of edits.sort((a, b) => b.e.idx - a.e.idx)) {
-    const body = renderModels(ed.live);
-    const tail = ed.e.modelsDiscovered ? [] : ["    models_discovered: true"];
-    if (ed.e.modelsIdx >= 0) {
-      // consume an existing trailing models_discovered line so it is not duplicated;
-      // the replaced region always ends with a fresh marker
-      let end = ed.e.blockEnd;
-      for (let k = end; k < ed.e.end; k++) {
-        if (lines[k].trim() === "") continue;
-        if (/^ {4}models_discovered:/.test(lines[k])) { end = k + 1; break; }
-        break;
-      }
-      lines.splice(ed.e.modelsIdx + 1, end - ed.e.modelsIdx - 1, ...body, "    models_discovered: true");
-    } else {
-      // insert before an existing models_discovered line if the entry has one
-      let at = ed.e.end;
-      for (let k = ed.e.idx + 1; k < ed.e.end; k++)
-        if (/^ {4}models_discovered:/.test(lines[k])) { at = k; break; }
-      lines.splice(at, 0, "    models:", ...body, ...tail);
-    }
-  }
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
-  copyFileSync(HERMES_CFG, HERMES_CFG + ".bak-provider-sync-" + stamp);
-  try {
-    for (const f of readdirSync(path.dirname(HERMES_CFG))
-      .filter((f) => /^config\.yaml\.bak-(?:provider-sync|ocp)-\d{8}_\d{6}$/.test(f)).sort().slice(0, -3)) // legacy prefix
-      unlinkSync(path.join(path.dirname(HERMES_CFG), f));
-  } catch {}
-  const tmp = HERMES_CFG + ".tmp-provider-sync";
-  writeFileSync(tmp, lines.join("\n"));
-  renameSync(tmp, HERMES_CFG);
-  console.log(`  APPLIED ${changes} change(s) — backup at config.yaml.bak-provider-sync-${stamp}`);
+  for (const ed of edits.sort((a, b) => b.e.idx - a.e.idx)) hermesSetModels(lines, ed.e, ed.live);
+  console.log(`  APPLIED ${changes} change(s) — backup at ${writeHermesCfg(lines, h.eol)}`);
+  return { status: "applied", changes, providers: edits.length };
 }
 
 // ---------- validation ----------
@@ -736,16 +846,41 @@ async function cmdAdd(id, url) {
   if (!res.added.length && !res.removed.length && !res.ctx.length && !res.mods.length) console.log("  up to date");
   for (const nt of notes) console.log("  note: " + nt);
 
-  if (flags["dry-run"]) { console.log("dry-run: nothing written"); return; }
+  const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
+  const hkey = key || loadAuth()[id]?.key || null;
+  const hmodel = flags.model || hmodels[0]?.id || null;
+  const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
+  // every target is reported afterwards: what was written and what was skipped, and why
+  const hermesLine = (r, verb) => {
+    if (["off", "absent", "no-section", "unparsed", "layout", "error"].includes(r.status)) return `skipped — ${r.why}`;
+    return `custom_providers "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
+  };
+  let hres = flags["no-hermes"] ? { status: "off", why: "disabled with --no-hermes" } : hermesUpsert({ ...hargs, dryRun: true });
+
+  if (flags["dry-run"]) {
+    console.log("dry-run: nothing written. Would write:");
+    console.log(`  opencode  ${disp(CFG)}  provider "${id}" (${Object.keys(prov.models).length} models)`);
+    console.log(`  keys      ${disp(AUTH)}  ${key ? `api key for "${id}"` : "no change (no --key)"}`);
+    console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "would be ")}`);
+    return;
+  }
   saveCfg(cfg);
   if (fresh) console.log(`created ${CFG}`);
   const a = loadAuth();
   if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
-  if (reportValidate(cfg)) console.log(`OK — config written, ${Object.keys(prov.models).length} models in ${id}`);
+  if (reportValidate(cfg)) console.log(`OK — ${Object.keys(prov.models).length} models in ${id}`);
+  if (!flags["no-hermes"])
+    try { hres = hermesUpsert({ ...hargs, dryRun: false }); }
+    catch (e) { hres = { status: "error", why: `cannot write ${disp(HERMES_CFG)}: ${e.message}` }; }
+  console.log("written:");
+  console.log(`  opencode  ${disp(CFG)}  provider "${id}" (${Object.keys(prov.models).length} models)`);
+  console.log(`  keys      ${disp(AUTH)}  ${key && a[id]?.key === key ? `api key for "${id}"` : "no change (no new key)"}`);
+  console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "")}`);
 }
 
 async function cmdSync() {
   const target = flags.target || "all";
+  const written = [];
   if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
   // harnesses are independent: a missing config only skips its own target, so a
   // hermes-only (or opencode-only) machine still syncs what it has. The opencode
@@ -794,10 +929,15 @@ async function cmdSync() {
       changes += total;
       if (flags.apply) { cfg.provider[r.id].models = res.models; console.log(`  APPLIED ${total} change(s)`); }
     }
-    if (flags.apply && changes) { saveCfg(cfg); reportValidate(cfg); console.log("config written"); }
+    if (flags.apply && changes) { saveCfg(cfg); reportValidate(cfg); written.push(`  opencode  ${disp(CFG)}  ${changes} change(s)`); }
     if (!flags.apply && changes) console.log(`${changes} change(s) pending — re-run with --apply to write`);
   }
-  if (target === "all" || target === "hermes") await syncHermes({ apply: !!flags.apply, ocCfg: cfg, ocAuth: auth });
+  if (target === "all" || target === "hermes") {
+    const hr = await syncHermes({ apply: !!flags.apply, ocCfg: cfg, ocAuth: auth });
+    if (hr?.status === "applied") written.push(`  hermes    ${disp(HERMES_CFG)}  ${hr.changes} change(s) in ${hr.providers} provider(s)`);
+    else if (hr && ["absent", "no-section", "empty"].includes(hr.status)) written.push(`  hermes    ${disp(HERMES_CFG)}  skipped — ${hr.why}`);
+  }
+  if (written.length) { console.log("written:"); for (const w of written) console.log(w); }
 }
 
 // ---------- main ----------
