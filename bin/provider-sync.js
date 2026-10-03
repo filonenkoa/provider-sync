@@ -2,7 +2,7 @@
 // provider-sync — manage local model providers for OpenCode and Hermes Agent.
 // Zero dependencies, Node >= 18. Run `provider-sync help` for full documentation.
 
-import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync, realpathSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
@@ -986,7 +986,15 @@ const VERSION = (() => {
 
 // ---------- main ----------
 // run only when executed directly; importing the module (tests) must not exit
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+// argv[1] is however the user spelled the command: a symlink in ~/.local/bin,
+// an npm bin link, a relative path. compare real paths, or every installed copy
+// would silently do nothing.
+const isMain = (() => {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  try { return realpathSync(arg) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+})();
 if (isMain)
 try {
   if (cmd === "list") cmdList();
