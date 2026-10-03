@@ -7,6 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 // config file resolution mirrors OpenCode's own discovery (config.ts):
 // PS_CONFIG override (legacy: OCP_CONFIG) > first existing of opencode.jsonc / opencode.json /
@@ -220,9 +221,11 @@ Commands:
       provider bootstraps it); --dry-run writes nothing.
       Reaches every installed harness: the same provider is also created or
       updated under custom_providers in ~/.hermes/config.yaml (matched by
-      base URL, so re-running updates instead of duplicating). Whatever
-      happens, the last lines report per target: what was written and what
-      was skipped, with the reason.
+      base URL, so re-running updates instead of duplicating). A harness that
+      is not installed is left alone — no config file is created for it — and
+      --target opencode is how you ask for one to be created anyway.
+      Whatever happens, the last lines report per target: what was written,
+      what was skipped, and which of the two reasons it was.
       Options:
         --name N          display name (default: existing value, else <id>)
         --key K           API key; stored to auth.json under <id>, and
@@ -232,7 +235,9 @@ Commands:
         --password P
         --model M         model written into the hermes entry's model:
                           field (default: first model the server reports)
-        --no-hermes       do not touch ~/.hermes/config.yaml
+        --target T        all|opencode|hermes (default all); only the chosen
+                          harnesses are written
+        --no-hermes       shortcut for --target opencode
         --ctx N           ctx for models whose server reports none
                           (0 = omit the limit). Without it, provider-sync asks
                           interactively in a terminal; with --dry-run a
@@ -851,8 +856,22 @@ async function cmdAdd(id, url) {
   const ctxFlag = numFlag(flags.ctx);
   const notes = [];
   const mode = flags["dry-run"] ? "report" : "write";
-  const fresh = !existsSync(CFG); // first provider on a machine without OpenCode config
-  const cfg = loadCfgOrEmpty();
+  // a harness is written only if it is installed on this machine; --target
+  // opencode is the explicit way to create an OpenCode config where there is none
+  const target = flags.target || "all";
+  if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  const haveOcFile = existsSync(CFG);
+  const skipHermes = !!flags["no-hermes"] || target === "opencode";
+  const wantOc = target !== "hermes" && (haveOcFile || target === "opencode");
+  const wantH = !skipHermes && existsSync(HERMES_CFG);
+  // why a target was skipped: "not chosen" and "not installed" are different problems
+  const ocWhy = target === "hermes" ? "not selected (--target hermes)"
+    : !haveOcFile ? "opencode is not installed here" : "";
+  const hWhy = flags["no-hermes"] ? "disabled with --no-hermes"
+    : target === "opencode" ? "not selected (--target opencode)"
+    : wantH ? "" : "hermes is not installed here";
+  const fresh = wantOc && !existsSync(CFG);
+  const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
   const oldProv = cfg.provider[id] || {};
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
   const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes });
@@ -876,30 +895,41 @@ async function cmdAdd(id, url) {
   const hkey = key || a[id]?.key || null;
   const hmodel = flags.model || hmodels[0]?.id || null;
   const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
+  const nModels = Object.keys(prov.models).length;
   // every target is reported afterwards: what was written and what was skipped, and why
+  const ocLine = (verb) => wantOc
+    ? `provider "${id}" (${nModels} models${fresh ? ", new config file" : ""}${verb ? ", " + verb : ""})`
+    : `skipped — ${ocWhy}`;
+  const keysLine = (verb) => !wantOc
+    ? `skipped — ${ocWhy}`
+    : key ? `api key for "${id}"${verb ? ", " + verb : ""}` : "no change (no --key)";
   const hermesLine = (r, verb) => {
-    if (["off", "absent", "no-section", "unparsed", "layout", "error"].includes(r.status)) return `skipped — ${r.why}`;
+    if (!wantH) return `skipped — ${hWhy}`;
+    if (["absent", "no-section", "unparsed", "layout", "error"].includes(r.status)) return `skipped — ${r.why}`;
     return `custom_providers "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
   };
-  let hres = flags["no-hermes"] ? { status: "off", why: "disabled with --no-hermes" } : hermesUpsert({ ...hargs, dryRun: true });
+  let hres = { status: "off", why: hWhy };
+  if (wantH) hres = hermesUpsert({ ...hargs, dryRun: true });
 
   if (flags["dry-run"]) {
     console.log("dry-run: nothing written. Would write:");
-    console.log(`  opencode  ${disp(CFG)}  provider "${id}" (${Object.keys(prov.models).length} models)`);
-    console.log(`  keys      ${disp(AUTH)}  ${key ? `api key for "${id}"` : "no change (no --key)"}`);
+    console.log(`  opencode  ${disp(CFG)}  ${ocLine("would be written")}`);
+    console.log(`  keys      ${disp(AUTH)}  ${keysLine("would be written")}`);
     console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "would be ")}`);
     return;
   }
-  saveCfg(cfg);
-  if (fresh) console.log(`created ${CFG}`);
-  if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
-  if (reportValidate(cfg)) console.log(`OK — ${Object.keys(prov.models).length} models in ${id}`);
-  if (!flags["no-hermes"])
+  if (wantOc) {
+    saveCfg(cfg);
+    if (fresh) console.log(`created ${CFG}`);
+    if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
+    if (reportValidate(cfg)) console.log(`OK — ${nModels} models in ${id}`);
+  }
+  if (wantH)
     try { hres = hermesUpsert({ ...hargs, dryRun: false }); }
     catch (e) { hres = { status: "error", why: `cannot write ${disp(HERMES_CFG)}: ${e.message}` }; }
   console.log("written:");
-  console.log(`  opencode  ${disp(CFG)}  provider "${id}" (${Object.keys(prov.models).length} models)`);
-  console.log(`  keys      ${disp(AUTH)}  ${key && a[id]?.key === key ? `api key for "${id}"` : "no change (no new key)"}`);
+  console.log(`  opencode  ${disp(CFG)}  ${ocLine("")}`);
+  console.log(`  keys      ${disp(AUTH)}  ${keysLine("")}`);
   console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "")}`);
 }
 
@@ -984,7 +1014,9 @@ async function cmdSync() {
 // ---------- run lock ----------
 // two mutating runs at once would race on read-modify-write and on the backup
 // file, so a writer takes an exclusive lock for the whole command
-const LOCK = path.join(CFG_DIR, ".provider-sync.lock");
+// kept in the temp dir, keyed by the config it guards: a run on a machine where
+// OpenCode is not installed must not create ~/.config/opencode just to lock
+const LOCK = path.join(os.tmpdir(), `provider-sync-${createHash("sha1").update(CFG_DIR).digest("hex").slice(0, 10)}.lock`);
 export function lockHeld() {
   if (!existsSync(LOCK)) return 0;
   const pid = parseInt(readFileSync(LOCK, "utf8").trim(), 10);
@@ -997,7 +1029,6 @@ export function lockHeld() {
   }
 }
 export function acquireLock() {
-  mkdirSync(CFG_DIR, { recursive: true });
   // two passes: the second one is only reached when the first found a stale lock
   for (let attempt = 0; attempt < 2; attempt++) {
     const held = lockHeld();

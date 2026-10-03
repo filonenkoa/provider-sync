@@ -2,7 +2,8 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
@@ -11,8 +12,8 @@ process.env.HOME = home;
 process.env.USERPROFILE = home;
 const { acquireLock, releaseLock, lockHeld } = await import("../bin/provider-sync.js");
 
-const lockDir = path.join(home, ".config/opencode");
-const lockFile = path.join(lockDir, ".provider-sync.lock");
+const lockDir = os.tmpdir();
+const lockFile = path.join(os.tmpdir(), `provider-sync-${createHash("sha1").update(path.join(home, ".config/opencode")).digest("hex").slice(0, 10)}.lock`);
 const posix = process.platform !== "win32"; // process.kill(pid, 0) is POSIX-only
 
 // a process that is definitely alive, and not us
@@ -85,6 +86,8 @@ test("our own lock is not reported as a conflict", () => {
   releaseLock();
 });
 
-test("the lock lives next to the config it protects", () => {
-  assert.equal(path.dirname(lockFile), lockDir);
+test("the lock lives in the temp dir, not inside the config tree", () => {
+  // a hermes-only machine must not grow a ~/.config/opencode just to take a lock
+  assert.equal(path.dirname(lockFile), os.tmpdir());
+  assert.ok(!path.dirname(lockFile).includes(home));
 });

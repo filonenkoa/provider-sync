@@ -45,7 +45,7 @@ provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
 | Command | What it does |
 | --- | --- |
 | `provider-sync list [--target all\|opencode\|hermes]` | Providers per harness — id/name, model count, base URL, key status (for Hermes also where the key comes from). A harness that is not installed is reported as `not found — skipped`, so Hermes-only and OpenCode-only machines both work |
-| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). Creates the OpenCode config if absent. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
+| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). A harness that is not installed is skipped, not created — `--target opencode` creates the OpenCode config anyway. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--target`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
 | `provider-sync sync [--apply] [--target all\|opencode\|hermes] [--provider ID]` | Check/apply drift between servers and config |
 | `provider-sync set-ctx <provider>` | Interactively re-ask context for models whose server reports none (needs a TTY) |
 | `provider-sync help` / `--version` | Full in-tool documentation / version |

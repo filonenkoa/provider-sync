@@ -12,7 +12,7 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 ## Golden rules
 
 1. Run `provider-sync sync` (no `--apply`) **first** — it is read-only and shows exactly what would change.
-2. Write only when the user asked for it (or the task explicitly includes applying). Writing commands: `sync --apply`, `add`, `set-ctx`. `add` writes to *every* installed harness (OpenCode + Hermes) — use `--no-hermes` when the user wants only OpenCode.
+2. Write only when the user asked for it (or the task explicitly includes applying). Writing commands: `sync --apply`, `add`, `set-ctx`. `add` writes to every *installed* harness (OpenCode + Hermes) and never creates a config for one that is missing; `--target opencode|hermes` narrows it, `--no-hermes` is a shortcut for `--target opencode`.
 3. Never hand-edit the files this tool manages. The hermes top-level `model:` block is never touched; hermes model entries keep only `context_length` (other fields are dropped with a warning).
 4. `OFFLINE (…) — skipped` or `AUTH 401` in output means the server is unreachable — report it to the user, do not retry in a loop. The rest of the run is unaffected.
 5. `not found — skipped` in output means that harness is not installed on this machine (only the other target ran) — not an error, nothing to fix unless the user expects that harness.
@@ -28,7 +28,7 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 | `provider-sync sync --apply` | apply all drift (in a TTY it may ask interactively for ctx of new models whose server reports none; non-TTY omits such values with a note) |
 | `provider-sync sync --target hermes` / `--target opencode` | single target; each target works standalone (hermes only borrows opencode API keys) |
 | `provider-sync sync --provider ID` | opencode target, one provider |
-| `provider-sync add <id> <baseURL> [--key K \| --username U --password P] [--model M] [--no-hermes] [--ctx N] [--output N] [--dry-run]` | register/update a provider (upsert — re-running is safe, existing model config is kept) in OpenCode **and** Hermes `custom_providers`; creates the OpenCode config if absent |
+| `provider-sync add <id> <baseURL> [--key K \| --username U --password P] [--model M] [--target all\|opencode\|hermes] [--no-hermes] [--ctx N] [--output N] [--dry-run]` | register/update a provider (upsert — re-running is safe, existing model config is kept) in every **installed** harness: OpenCode config and Hermes `custom_providers`; a missing harness is skipped, `--target opencode` creates that config anyway |
 | `provider-sync set-ctx <id>` | interactively re-ask context; TTY required |
 
 ## Decision table
