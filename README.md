@@ -34,6 +34,7 @@ No `npm install` — there are no dependencies. Needs Node >= 18 (built-in `fetc
 ## Quick start
 
 ```sh
+provider-sync list            # what is configured, per harness
 provider-sync sync            # status check, writes nothing (safe default)
 provider-sync add 3090 http://10.0.0.5:64980/v1 --key <api-key>    # register a provider
 provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
@@ -43,7 +44,7 @@ provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
 
 | Command | What it does |
 | --- | --- |
-| `provider-sync list` | Providers, model counts, key status |
+| `provider-sync list [--target all\|opencode\|hermes]` | Providers per harness — id/name, model count, base URL, key status (for Hermes also where the key comes from). A harness that is not installed is reported as `not found — skipped`, so Hermes-only and OpenCode-only machines both work |
 | `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). Creates the OpenCode config if absent. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
 | `provider-sync sync [--apply] [--target all\|opencode\|hermes] [--provider ID]` | Check/apply drift between servers and config |
 | `provider-sync set-ctx <provider>` | Interactively re-ask context for models whose server reports none (needs a TTY) |

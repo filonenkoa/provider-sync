@@ -197,9 +197,12 @@ Files:
            ~/.hermes/.env                      key source for Hermes providers
 
 Commands:
-  provider-sync list
-      List configured providers with model counts and key status. Prints
-      "not found" instead of failing when OpenCode is not installed.
+  provider-sync list [--target all|opencode|hermes]
+      List configured providers per harness — id/name, model count, base URL
+      and key status (for Hermes also where the key comes from: literal,
+      ~/.hermes/.env, or borrowed from a matching OpenCode provider). A
+      harness that is not installed is reported as "not found — skipped"
+      instead of failing, so a Hermes-only or OpenCode-only machine is fine.
 
   provider-sync add <id> <baseURL> [options]
       Register or update a provider. The server type is auto-detected:
@@ -573,6 +576,17 @@ function hermesKey(e, ocCfg, ocAuth) {
   return null;
 }
 
+// where a hermes entry gets its key from; shown by `list` so that "no-key"
+// can be told apart from "key that just could not be resolved"
+function hermesKeySource(e, ocCfg, ocAuth) {
+  if (e.api_key && e.api_key !== "dummy")
+    return e.api_key.startsWith("${") && e.api_key.endsWith("}") ? "key (env)" : "key";
+  if (e.key_env) return hermesEnv()[e.key_env] ? "key (env)" : `no-key (${e.key_env} is unset in ~/.hermes/.env)`;
+  for (const [pid, p] of Object.entries(ocCfg.provider || {}))
+    if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && ocAuth[pid]?.key) return `key (borrowed from ${pid})`;
+  return "no-key";
+}
+
 // ---------- hermes writes (shared by sync and add) ----------
 
 // read the file we just wrote and confirm it still says what we intended;
@@ -658,6 +672,7 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   if (!h) { console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers — skipped`); return { status: "no-section", why: "no custom_providers section" }; }
   if (!h.entries.length) { console.log(`hermes: custom_providers found but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : " (unexpected indentation?)"} — skipped`); return { status: "empty", why: "no entries parsed" }; }
   console.log(`hermes (${disp(HERMES_CFG)}): ${h.entries.length} custom provider(s)`);
+  if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — skipped, provider-sync will not touch them`);
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(h.entries.map(async (e) => {
     if (!e.base_url) return { e, skip: "no base_url" };
@@ -772,12 +787,38 @@ async function cmdSetCtx(pid) {
 
 // ---------- commands ----------
 function cmdList() {
-  if (!existsSync(CFG)) { console.log(`opencode (${CFG}): not found — no opencode providers`); return; }
-  const cfg = loadCfg();
+  const target = flags.target || "all";
+  if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  const haveOc = existsSync(CFG);
+  const cfg = haveOc ? loadCfg() : {}; // absent config is not an error here
   const auth = loadAuth();
-  for (const [id, p] of Object.entries(cfg.provider || {})) {
-    const n = Object.keys(p.models || {}).length;
-    console.log(`${id.padEnd(18)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${auth[id]?.key ? "key" : "no-key"}`);
+  if (target !== "hermes") {
+    if (!haveOc) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
+    else {
+      console.log(`opencode  ${disp(CFG)}`);
+      const ids = Object.keys(cfg.provider || {});
+      if (!ids.length) console.log("  (no providers)");
+      for (const id of ids) {
+        const p = cfg.provider[id];
+        const n = Object.keys(p.models || {}).length;
+        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${auth[id]?.key ? "key" : "no-key"}`);
+      }
+    }
+  }
+  if (target !== "opencode") {
+    if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
+    else {
+      const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
+      console.log(`hermes  ${disp(HERMES_CFG)}`);
+      if (!h) console.log("  no custom_providers section — skipped");
+      else if (!h.entries.length) console.log(`  custom_providers present but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""}`);
+      else {
+        // partial coverage must be visible: those entries are listed nowhere
+        if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — not listed, and provider-sync will not touch them`);
+        for (const e of h.entries)
+          console.log(`  ${e.name.padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}  ${hermesKeySource(e, cfg, auth)}`);
+      }
+    }
   }
 }
 

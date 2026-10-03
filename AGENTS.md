@@ -23,7 +23,7 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 
 | Command | Effect |
 | --- | --- |
-| `provider-sync list` | overview: id, model count, baseURL, key present |
+| `provider-sync list [--target all\|opencode\|hermes]` | per-harness overview: id/name, model count, baseURL, key status (Hermes: literal key, `~/.hermes/.env`, or borrowed from a matching OpenCode provider). Missing harness = `not found — skipped` |
 | `provider-sync sync` | drift report, all targets, **nothing written** |
 | `provider-sync sync --apply` | apply all drift (in a TTY it may ask interactively for ctx of new models whose server reports none; non-TTY omits such values with a note) |
 | `provider-sync sync --target hermes` / `--target opencode` | single target; each target works standalone (hermes only borrows opencode API keys) |
