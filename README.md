@@ -10,10 +10,26 @@ Zero dependencies · Node ≥ 18 (built-in `fetch`) · Linux/macOS (all paths vi
 
 ```sh
 git clone https://github.com/filonenkoa/provider-sync.git && cd provider-sync
-npm link    # or: ln -s "$PWD/bin/provider-sync.js" ~/.local/bin/provider-sync
+npm link
 ```
 
-No `npm install` — there are no dependencies.
+`npm link` puts the symlink in `$(npm prefix -g)/bin` — whether that directory is on your `PATH` depends on how node was installed, so check it:
+
+```sh
+command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+provider-sync --version   # 1.0.0
+```
+
+Prefer no npm? Symlink it into a directory you already keep bins in:
+
+```sh
+mkdir -p ~/.local/bin && ln -s "$PWD/bin/provider-sync.js" ~/.local/bin/provider-sync
+```
+
+`command not found` after installing always means "not in PATH", not a broken install. On Fedora/RHEL use `~/.bash_profile` instead of `~/.bashrc`.
+
+No `npm install` — there are no dependencies. Needs Node >= 18 (built-in `fetch`).
 
 ## Quick start
 
