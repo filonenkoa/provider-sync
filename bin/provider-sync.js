@@ -26,7 +26,7 @@ const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 // ---------- cli ----------
 const die = (m) => { console.error("error: " + m); process.exit(1); };
 // parses ["--k","v"] and ["--k=v"]; boolean flags are the known no-value ones
-const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h"]);
+const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h", "version"]);
 export function parseArgs(argv) {
   const flags = {};
   const pos = [];
@@ -155,7 +155,8 @@ const numFlag = (v) => {
 const HELP = `provider-sync — manage local model providers for OpenCode (and Hermes Agent)
 
 Zero dependencies; requires Node >= 18 (built-in fetch).
-Run \`provider-sync\`, \`provider-sync help\`, \`-h\` or \`--help\` to see this text again.
+Run \`provider-sync\`, \`provider-sync help\`, \`-h\` or \`--help\` to see this text again;
+\`--version\` prints the version.
 
 Files:
   config   $OPENCODE_CONFIG_DIR or ~/.config/opencode — first existing of
@@ -306,7 +307,7 @@ async function readCapped(r, cap) {
   return out;
 }
 
-async function req(url, { method = "GET", key, body, timeout = 6000, cap = 0 } = {}) {
+export async function req(url, { method = "GET", key, body, timeout = 6000, cap = 0 } = {}) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try {
@@ -342,11 +343,13 @@ export function probeCached(base, key) {
 }
 export const clearProbeCache = () => _probes.clear();
 
-async function probe(base, key) {
+export async function probe(base, key) {
   const root = rootOf(base);
-  // only info.title is read from the Unsloth spec, so cap the download
+  // only info.title is read from the Unsloth spec, so cap the download; a capped
+  // body is truncated, hence the regex fallback instead of relying on r.json
   let r = await req(root + "/openapi.json", { cap: 8192 });
-  if (r.status === 200 && /unsloth/i.test(r.json?.info?.title || "")) return { kind: "unsloth", root };
+  const title = r.json?.info?.title ?? ((r.text || "").match(/"title"\s*:\s*"([^"]{0,200})"/) || [])[1] ?? "";
+  if (r.status === 200 && /unsloth/i.test(title)) return { kind: "unsloth", root };
   r = await req(root + "/api/v0/models", { key });
   if (r.status === 200 && r.json) return { kind: "lmstudio", root, models: Array.isArray(r.json) ? r.json : r.json.data || [] };
   r = await req(v1Of(base) + "/models", { key });
@@ -362,7 +365,7 @@ async function probe(base, key) {
 }
 
 // ---------- model specs ----------
-async function fetchModels(pr, base, key) {
+export async function fetchModels(pr, base, key) {
   if (pr.kind === "llamacpp" || pr.kind === "openai") return pr.models.map(specAny);
   if (pr.kind === "lmstudio") {
     // probe() already fetched /api/v0/models and handed the payload over
@@ -518,8 +521,17 @@ export const deq = (s) => {
   return s.replace(/^(['"])(.*)\1$/, "$2");
 };
 
-// quote a YAML scalar only when needed; JSON quoting is always valid YAML
-export const yq = (s) => (/^[A-Za-z0-9_.@-]/.test(s) && !/: /.test(s) && !/^\s|\s$/.test(s) && !s.includes("#") ? s : JSON.stringify(s));
+// a plain YAML scalar is not necessarily a string: 123, 1.5, true, yes, on, off,
+// null and ~ all resolve to a number/bool/null, which would turn a model id key
+// into something Hermes cannot look up. Quote anything ambiguous; JSON quoting
+// is always valid YAML, so over-quoting is harmless.
+const YAML_BOOL = /^(?:true|false|y|n|yes|no|on|off)$/i;
+const YAML_NULL = /^(?:~|null)$/i;
+const YAML_NUM = /^[-+]?(?:\d[\d_]*(?:\.[\d_]*)?|\.[\d_]+)(?:[eE][-+]?\d+)?$/;
+const YAML_ODD = /^(?:[-+]?\.(?:inf|nan)|0[xX][0-9a-fA-F]+|0[oO][0-7]+)$/i;
+const resolvesToNonString = (s) => YAML_BOOL.test(s) || YAML_NULL.test(s) || YAML_NUM.test(s) || YAML_ODD.test(s);
+// quote a YAML scalar only when needed
+export const yq = (s) => (!s || !/^[A-Za-z0-9_.@-]/.test(s) || /: /.test(s) || /^\s|\s$/.test(s) || s.includes("#") || resolvesToNonString(s) ? JSON.stringify(s) : s);
 
 // short paths in reports: ~/.config/... instead of /Users/x/.config/...
 const disp = (p) => (typeof p === "string" && p.startsWith(os.homedir()) ? "~" + p.slice(os.homedir().length) : p);
@@ -685,14 +697,41 @@ export function hermesSetField(lines, e, key, value) {
   lines.splice(at, 0, `${ind(e.fldInd)}${key}: ${yq(value)}`);
 }
 
+// read the file we just wrote and confirm it still says what we intended;
+// a mismatch means the line surgery produced something we do not understand,
+// so the backup (made a moment earlier) is put back and the caller is told
+function verifyHermesWrite(expect) {
+  const after = parseHermes(readFileSync(HERMES_CFG, "utf8"));
+  if (!after) return "the written file no longer has a custom_providers section";
+  if (expect.entries != null && after.entries.length !== expect.entries)
+    return `entry count changed (${expect.entries} -> ${after.entries.length})`;
+  for (const { base, ids } of expect.models || []) {
+    const e = after.entries.find((x) => normUrl(x.base_url) === normUrl(base));
+    if (!e) return `entry for ${base} disappeared`;
+    if (JSON.stringify(e.models.map((m) => m.id)) !== JSON.stringify(ids))
+      return `models of ${base} did not land as written`;
+  }
+  return null;
+}
 // atomic write with a rotating backup; returns the backup path
-function writeHermesCfg(lines, eol = "\n") {
-  copyFileSync(HERMES_CFG, HERMES_CFG + ".bak-provider-sync-" + stamp());
-  try { pruneBackups(HERMES_CFG); } catch {}
+function writeHermesCfg(lines, eol = "\n", expect = {}) {
+  const bak = HERMES_CFG + ".bak-provider-sync-" + stamp();
   const tmp = HERMES_CFG + ".tmp-provider-sync";
-  writeFileSync(tmp, lines.join(eol));
-  renameSync(tmp, HERMES_CFG);
-  return `config.yaml.bak-provider-sync-${stamp}`;
+  try {
+    copyFileSync(HERMES_CFG, bak);
+    try { pruneBackups(HERMES_CFG); } catch {}
+    writeFileSync(tmp, lines.join(eol));
+    renameSync(tmp, HERMES_CFG);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch {}
+    throw new Error(`cannot write ${disp(HERMES_CFG)}: ${e.message}`);
+  }
+  const bad = verifyHermesWrite(expect);
+  if (bad) {
+    copyFileSync(bak, HERMES_CFG); // roll back to the untouched original
+    throw new Error(`${bad} — ${disp(HERMES_CFG)} was restored from ${path.basename(bak)}`);
+  }
+  return path.basename(bak);
 }
 
 // create or update a custom_providers entry so `add` reaches every installed
@@ -708,7 +747,7 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
     const lines = h.lines.slice();
     hermesSetModels(lines, found, models);
     if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
-    writeHermesCfg(lines, h.eol);
+    writeHermesCfg(lines, h.eol, { entries: h.entries.length, models: [{ base, ids: models.map((m) => m.id) }] });
     return { status: "updated", name: found.name, n };
   }
   if (dryRun) return { status: "created", name, n };
@@ -733,7 +772,7 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
   // separate the new entry from a following top-level key with one blank line
   const blank = at < lines.length && lines[at].trim() !== "" ? [""] : [];
   lines.splice(at, 0, ...block, ...blank);
-  writeHermesCfg(lines, h.eol);
+  writeHermesCfg(lines, h.eol, { entries: h.entries.length + 1, models: [{ base, ids: models.map((m) => m.id) }] });
   return { status: "created", name, n };
 }
 
@@ -783,7 +822,11 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   // apply bottom-up so earlier line indices stay valid
   const lines = h.lines.slice();
   for (const ed of edits.sort((a, b) => b.e.idx - a.e.idx)) hermesSetModels(lines, ed.e, ed.live);
-  console.log(`  APPLIED ${changes} change(s) — backup at ${writeHermesCfg(lines, h.eol)}`);
+  const bak = writeHermesCfg(lines, h.eol, {
+    entries: h.entries.length,
+    models: edits.map((ed) => ({ base: ed.e.base_url, ids: ed.live.map((m) => m.id) })),
+  });
+  console.log(`  APPLIED ${changes} change(s) — backup at ${bak}`);
   return { status: "applied", changes, providers: edits.length };
 }
 
@@ -995,16 +1038,38 @@ async function cmdSync() {
       changes += total;
       if (flags.apply) { cfg.provider[r.id].models = res.models; console.log(`  APPLIED ${total} change(s)`); }
     }
-    if (flags.apply && changes) { saveCfg(cfg); reportValidate(cfg); written.push(`  opencode  ${disp(CFG)}  ${changes} change(s)`); }
+    if (flags.apply && changes) {
+      try {
+        saveCfg(cfg);
+        reportValidate(cfg);
+        written.push(`  opencode  ${disp(CFG)}  ${changes} change(s)`);
+      } catch (e) {
+        console.error(`error: opencode config not written: ${e.message}`);
+        process.exitCode = 1;
+      }
+    }
     if (!flags.apply && changes) console.log(`${changes} change(s) pending — re-run with --apply to write`);
   }
   if (target === "all" || target === "hermes") {
-    const hr = await syncHermes({ apply: !!flags.apply, ocCfg: cfg, ocAuth: auth });
+    let hr = null;
+    try { hr = await syncHermes({ apply: !!flags.apply, ocCfg: cfg, ocAuth: auth }); }
+    catch (e) {
+      // e.g. an unwritable config.yaml: report it, keep going, fail the exit code
+      console.error(`error: ${e.message}`);
+      process.exitCode = 1;
+      written.push(`  hermes    ${disp(HERMES_CFG)}  FAILED — nothing changed for this target`);
+    }
     if (hr?.status === "applied") written.push(`  hermes    ${disp(HERMES_CFG)}  ${hr.changes} change(s) in ${hr.providers} provider(s)`);
     else if (hr && ["absent", "no-section", "empty"].includes(hr.status)) written.push(`  hermes    ${disp(HERMES_CFG)}  skipped — ${hr.why}`);
   }
   if (written.length) { console.log("written:"); for (const w of written) console.log(w); }
 }
+
+// ---------- version ----------
+const VERSION = (() => {
+  try { return JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")).version; }
+  catch { return "unknown"; }
+})();
 
 // ---------- main ----------
 // run only when executed directly; importing the module (tests) must not exit
@@ -1019,7 +1084,8 @@ try {
   else if (cmd === "set-ctx") {
     if (!pos[1]) die("usage: provider-sync set-ctx <provider> — see provider-sync help");
     await cmdSetCtx(pos[1]);
-  } else if (cmd === "help" || cmd === "-h" || (!pos.length && (flags.help || flags.h))) console.log(HELP);
+  } else if (cmd === "--version" || cmd === "-v" || (!pos.length && flags.version)) console.log(VERSION);
+  else if (cmd === "help" || cmd === "-h" || (!pos.length && (flags.help || flags.h))) console.log(HELP);
   else if (!cmd) { console.error(HELP); process.exit(1); }
   else die(`unknown command "${cmd}" — see provider-sync help`);
 } catch (e) { die(e.stack || e.message); }
