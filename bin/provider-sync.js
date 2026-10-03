@@ -301,10 +301,14 @@ Hermes key resolution, first match wins:
      server URL (localhost and 127.0.0.1 count as the same host)
 
 Safety:
-  - every write is atomic (tmp file + rename) and preceded by a
+  - every write is atomic (tmp file + fsync + rename) and preceded by a
     .bak-provider-sync-* backup; only the last 3 backups per file are kept
-  - the config file is validated after each write; on errors they are
-    reported and provider-sync exits non-zero
+  - the config file is validated after each write; the hermes config is
+    re-read and rolled back from its backup if it no longer parses
+  - writing commands (add, sync --apply, set-ctx) take an exclusive lock
+    (~/.config/opencode/.provider-sync.lock), so two runs cannot interleave;
+    read-only commands never take it
+  - on errors nothing is reported as written and provider-sync exits non-zero
 
 Examples:
   provider-sync add 3090-lan http://192.168.9.50:64980/v1 --key 4117...
@@ -936,6 +940,44 @@ async function cmdSync() {
   if (written.length) { console.log("written:"); for (const w of written) console.log(w); }
 }
 
+// ---------- run lock ----------
+// two mutating runs at once would race on read-modify-write and on the backup
+// file, so a writer takes an exclusive lock for the whole command
+const LOCK = path.join(CFG_DIR, ".provider-sync.lock");
+export function lockHeld() {
+  if (!existsSync(LOCK)) return 0;
+  const pid = parseInt(readFileSync(LOCK, "utf8").trim(), 10);
+  if (!pid || pid === process.pid) return 0;
+  try {
+    process.kill(pid, 0); // signal 0 only checks that the pid exists
+    return pid;
+  } catch (e) {
+    return e.code === "EPERM" ? pid : 0; // alive but not ours
+  }
+}
+export function acquireLock() {
+  mkdirSync(CFG_DIR, { recursive: true });
+  // two passes: the second one is only reached when the first found a stale lock
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const held = lockHeld();
+    if (held) die(`another provider-sync run is in progress (pid ${held}) — wait for it or delete ${disp(LOCK)}`);
+    try {
+      const fd = openSync(LOCK, "wx"); // exclusive create: the atomic part
+      try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
+      return;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      // the file exists. if nobody live owns it, drop it and retry once;
+      // if a live run won the race in between, refuse rather than steal its lock
+      if (attempt === 1 || lockHeld())
+        die(`another provider-sync run is in progress (${disp(LOCK)}) — wait for it or delete that file`);
+      try { unlinkSync(LOCK); } catch {}
+    }
+  }
+}
+export function releaseLock() {
+  try { unlinkSync(LOCK); } catch {}
+}
 // ---------- version ----------
 const VERSION = (() => {
   try { return JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")).version; }
@@ -950,11 +992,15 @@ try {
   if (cmd === "list") cmdList();
   else if (cmd === "add") {
     if (!pos[1] || !pos[2]) die("usage: provider-sync add <id> <baseURL> [options] — see provider-sync help");
-    await cmdAdd(pos[1], pos[2]);
-  } else if (cmd === "sync") await cmdSync();
-  else if (cmd === "set-ctx") {
+    if (!flags["dry-run"]) { acquireLock(); try { await cmdAdd(pos[1], pos[2]); } finally { releaseLock(); } }
+    else await cmdAdd(pos[1], pos[2]);
+  } else if (cmd === "sync") {
+    if (flags.apply) { acquireLock(); try { await cmdSync(); } finally { releaseLock(); } }
+    else await cmdSync();
+  } else if (cmd === "set-ctx") {
     if (!pos[1]) die("usage: provider-sync set-ctx <provider> — see provider-sync help");
-    await cmdSetCtx(pos[1]);
+    acquireLock();
+    try { await cmdSetCtx(pos[1]); } finally { releaseLock(); }
   } else if (cmd === "--version" || cmd === "-v" || (!pos.length && flags.version)) console.log(VERSION);
   else if (cmd === "help" || cmd === "-h" || (!pos.length && (flags.help || flags.h))) console.log(HELP);
   else if (!cmd) { console.error(HELP); process.exit(1); }

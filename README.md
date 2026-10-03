@@ -55,7 +55,7 @@ Sync never clobbers already-configured values — re-ask them with `provider-syn
 | `~/.local/share/opencode/auth.json` | API keys per provider id |
 | `~/.hermes/config.yaml` | `custom_providers` entries: created/updated by `add`, and their `models:` maps refreshed by `sync` — surgical line edits, comments and other fields preserved; skipped if Hermes is not installed |
 
-Every write is atomic (tmp + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept). Writes report per target — file, what changed, and why anything was skipped:
+Every write is atomic (tmp + fsync + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept); the Hermes config is re-read after writing and rolled back if it no longer parses. Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock at `~/.config/opencode/.provider-sync.lock`, so two runs can never interleave — read-only commands never take it. Writes report per target — file, what changed, and why anything was skipped:
 
 ```
 written:
