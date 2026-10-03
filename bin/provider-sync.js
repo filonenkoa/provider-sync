@@ -2,7 +2,7 @@
 // provider-sync — manage local model providers for OpenCode and Hermes Agent.
 // Zero dependencies, Node >= 18. Run `provider-sync help` for full documentation.
 
-import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
@@ -130,15 +130,38 @@ function pruneBackups(file, keep = 3) {
   const baks = readdirSync(dir).filter((f) => prefixes.some((p) => f.startsWith(p))).sort();
   for (const f of baks.slice(0, -keep)) unlinkSync(path.join(dir, f));
 }
+// write via a temp file in the same directory, flush it to disk, then rename.
+// fsync on the file makes the content durable; fsync on the directory makes the
+// rename durable. without both, a power cut can leave a truncated config.
+export function atomicWrite(file, data) {
+  const dir = path.dirname(file);
+  mkdirSync(dir, { recursive: true });
+  const tmp = file + ".tmp-provider-sync";
+  let fd = null;
+  try {
+    fd = openSync(tmp, "w");
+    writeFileSync(fd, data);
+    try { fsyncSync(fd); } catch {} // not every fs supports it
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+  try {
+    renameSync(tmp, file);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch {}
+    throw e;
+  }
+  try { // POSIX only: opening a directory fails on Windows, and that is fine
+    const dfd = openSync(dir, "r");
+    try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  } catch {}
+}
 function saveJson(file, obj) {
-  mkdirSync(path.dirname(file), { recursive: true });
   if (existsSync(file)) {
     copyFileSync(file, file + ".bak-provider-sync-" + stamp());
     try { pruneBackups(file); } catch {}
   }
-  const tmp = file + ".tmp-provider-sync";
-  writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
-  renameSync(tmp, file);
+  atomicWrite(file, JSON.stringify(obj, null, 2) + "\n");
 }
 export const saveCfg = (c) => {
   if (cfgStore.hadComments && !cfgStore.warnedComments) {
@@ -567,14 +590,11 @@ function verifyHermesWrite(expect) {
 // atomic write with a rotating backup; returns the backup path
 function writeHermesCfg(lines, eol = "\n", expect = {}) {
   const bak = HERMES_CFG + ".bak-provider-sync-" + stamp();
-  const tmp = HERMES_CFG + ".tmp-provider-sync";
   try {
     copyFileSync(HERMES_CFG, bak);
     try { pruneBackups(HERMES_CFG); } catch {}
-    writeFileSync(tmp, lines.join(eol));
-    renameSync(tmp, HERMES_CFG);
+    atomicWrite(HERMES_CFG, lines.join(eol));
   } catch (e) {
-    try { unlinkSync(tmp); } catch {}
     throw new Error(`cannot write ${disp(HERMES_CFG)}: ${e.message}`);
   }
   const bad = verifyHermesWrite(expect);
