@@ -18,7 +18,7 @@ function detectCfg() {
   return path.join(CFG_DIR, hit || CFG_CANDIDATES[0]);
 }
 const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || null;
-const CFG = CFG_ENV || detectCfg();
+export const CFG = CFG_ENV || detectCfg();
 const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
 export const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
@@ -84,26 +84,30 @@ export function parseJsonc(raw) {
 }
 
 // ---------- store ----------
-let _cfgWarned = false;
-function warnMultiCfg() {
-  if (_cfgWarned || CFG_ENV) return;
-  _cfgWarned = true;
-  const present = CFG_CANDIDATES.filter((f) => existsSync(path.join(CFG_DIR, f)));
-  if (present.length > 1) console.error(`note: multiple config files in ${CFG_DIR} (${present.join(", ")}); OpenCode deep-merges them — provider-sync edits ${path.basename(CFG)}`);
-}
-let _cfgHadComments = false, _cmtWarned = false;
-export const loadCfg = () => {
-  if (!existsSync(CFG)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
-  warnMultiCfg();
-  const { text, hadComments } = parseJsonc(readFileSync(CFG, "utf8"));
-  _cfgHadComments = hadComments;
-  try {
-    const p = JSON.parse(text);
-    if (!p.provider) p.provider = {}; // fresh configs have no provider section
-    return p;
-  }
-  catch (e) { die(`cannot parse ${CFG}: ${e.message}`); }
+// Everything the tool remembers between load() and save() lives on this object,
+// so the coupling is visible instead of hidden in loose module variables.
+const cfgStore = {
+  hadComments: false, // the loaded file had comments, which a rewrite would drop
+  warnedMulti: false, // the "several config files" note was already printed
+  warnedComments: false,
+  load() {
+    if (!existsSync(CFG)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
+    if (!this.warnedMulti && !CFG_ENV) {
+      this.warnedMulti = true;
+      const present = CFG_CANDIDATES.filter((f) => existsSync(path.join(CFG_DIR, f)));
+      if (present.length > 1) console.error(`note: multiple config files in ${CFG_DIR} (${present.join(", ")}); OpenCode deep-merges them — provider-sync edits ${path.basename(CFG)}`);
+    }
+    const { text, hadComments } = parseJsonc(readFileSync(CFG, "utf8"));
+    this.hadComments = hadComments;
+    try {
+      const p = JSON.parse(text);
+      if (!p.provider) p.provider = {}; // fresh configs have no provider section
+      return p;
+    }
+    catch (e) { die(`cannot parse ${CFG}: ${e.message}`); }
+  },
 };
+export const loadCfg = () => cfgStore.load();
 export const loadAuth = () => {
   if (!existsSync(AUTH)) return {};
   let a;
@@ -136,8 +140,11 @@ function saveJson(file, obj) {
   writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
   renameSync(tmp, file);
 }
-const saveCfg = (c) => {
-  if (_cfgHadComments && !_cmtWarned) { _cmtWarned = true; console.error("note: comments in the config file are not preserved by provider-sync writes"); }
+export const saveCfg = (c) => {
+  if (cfgStore.hadComments && !cfgStore.warnedComments) {
+    cfgStore.warnedComments = true;
+    console.error("note: comments in the config file are not preserved by provider-sync writes");
+  }
   saveJson(CFG, c);
 };
 const saveAuth = (a) => saveJson(AUTH, a);
@@ -341,6 +348,7 @@ export function probeCached(base, key) {
   if (!_probes.has(k)) _probes.set(k, probe(base, key));
   return _probes.get(k);
 }
+// the cache is per-run state; tests need to start from a clean slate
 export const clearProbeCache = () => _probes.clear();
 
 export async function probe(base, key) {
@@ -422,12 +430,16 @@ export function guessCtx(id) {
   if (/qwen3\.[5-9]/i.test(id)) return 262144;
   return 131072;
 }
-let _rl = null;
-const ask = async (q) => {
-  if (!_rl) _rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try { return await _rl.question(q); }
-  catch { try { _rl.close(); } catch {} _rl = null; throw new Error("input ended"); }
-};
+// one readline interface for the whole run, created on first use
+const asker = (() => {
+  let rl = null;
+  return async (q) => {
+    if (!rl) rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try { return await rl.question(q); }
+    catch { try { rl.close(); } catch {} rl = null; throw new Error("input ended"); }
+  };
+})();
+const ask = asker;
 
 // for every model the server reports no ctx for: --ctx flag, interactive
 // prompt (mode "write" in a terminal), or guess (mode "report")
@@ -504,17 +516,17 @@ import { ind, normUrl, deq, yq, parseHermes, renderModels, hermesSetModels, herm
 // formatting of untouched sections are preserved. Only the per-provider
 // `models:` block (a fallback catalog for offline use) is rewritten.
 
-let _henv = null;
-function hermesEnv() {
-  if (_henv !== null) return _henv;
-  _henv = {};
+// parse ~/.hermes/.env once per run; the cache lives in this closure
+const once = (fn) => { let v; return () => (v === undefined ? (v = fn()) : v); };
+const hermesEnv = once(() => {
+  const env = {};
   if (existsSync(HERMES_ENV))
     for (const line of readFileSync(HERMES_ENV, "utf8").split("\n")) {
       const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-      if (m) _henv[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
+      if (m) env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
     }
-  return _henv;
-}
+  return env;
+});
 
 
 // short paths in reports: ~/.config/... instead of /Users/x/.config/...
