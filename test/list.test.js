@@ -5,9 +5,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { runCli, flat } from "./helpers.js";
 
-const CLI = new URL("../bin/provider-sync.js", import.meta.url).pathname;
 const made = [];
 
 const homeWith = (files) => {
@@ -21,13 +20,7 @@ const homeWith = (files) => {
   return home;
 };
 
-// column widths are a formatting choice, not part of the contract
-const flat = (s) => s.replace(/[ \t]+/g, " ");
-const list = (home, args = []) =>
-  flat(execFileSync(process.execPath, [CLI, "list", ...args], {
-    encoding: "utf8",
-    env: { ...process.env, HOME: home, USERPROFILE: home },
-  }));
+const list = (home, args = []) => flat(runCli(home, ["list", ...args]));
 
 test.after(() => { for (const h of made) rmSync(h, { recursive: true, force: true }); });
 
@@ -143,7 +136,7 @@ test("an unset key_env is explained instead of a bare no-key", () => {
         context_length: 1
 `,
   }));
-  assert.match(out, /no-key \(MISSING_KEY is unset in ~\/\.hermes\/\.env\)/);
+  assert.match(out, /no-key \(MISSING_KEY is unset in ~[\\/]\.hermes[\\/]\.env\)/);
 });
 
 test("an unusually indented hermes file is still parsed and listed", () => {

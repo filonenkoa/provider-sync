@@ -6,13 +6,12 @@ import os, { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { pinHomeForImport } from "./helpers.js";
 
 const home = mkdtempSync(path.join(tmpdir(), "ps-lock-"));
-process.env.HOME = home;
-process.env.USERPROFILE = home;
+pinHomeForImport(home); // XDG_CONFIG_HOME must be pinned too: it outranks HOME
 const { acquireLock, releaseLock, lockHeld } = await import("../bin/provider-sync.js");
 
-const lockDir = os.tmpdir();
 const lockFile = path.join(os.tmpdir(), `provider-sync-${createHash("sha1").update(path.join(home, ".config/opencode")).digest("hex").slice(0, 10)}.lock`);
 const posix = process.platform !== "win32"; // process.kill(pid, 0) is POSIX-only
 
@@ -32,7 +31,7 @@ const findDeadPid = () => {
 };
 const deadPid = findDeadPid();
 
-before(() => { acquireLock(); releaseLock(); }); // make sure the dir exists
+before(() => { acquireLock(); releaseLock(); }); // the lock dir is the temp dir, nothing to create
 after(() => {
   if (child) child.kill();
   rmSync(home, { recursive: true, force: true });

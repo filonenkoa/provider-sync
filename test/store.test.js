@@ -5,10 +5,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pinHomeForImport } from "./helpers.js";
 
 const home = mkdtempSync(path.join(tmpdir(), "ps-store-"));
-process.env.HOME = home;
-process.env.USERPROFILE = home;
+pinHomeForImport(home);
 const { loadCfg, saveCfg, loadAuth, CFG } = await import("../bin/provider-sync.js");
 
 const cfgPath = path.join(home, ".config/opencode/opencode.jsonc");

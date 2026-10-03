@@ -7,11 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileP = promisify(execFile);
-const CLI = new URL("../bin/provider-sync.js", import.meta.url).pathname;
+import { runCliAsyncP, flat } from "./helpers.js";
 let server, url;
 const homes = [];
 
@@ -39,11 +35,7 @@ const homeWith = (files) => {
   }
   return home;
 };
-const flat = (s) => s.replace(/[ \t]+/g, " ");
-const add = async (home, args = []) =>
-  flat((await execFileP(process.execPath, [CLI, "add", "mm", url, ...args], {
-    env: { ...process.env, HOME: home, USERPROFILE: home },
-  })).stdout);
+const add = async (home, args = []) => flat(await runCliAsyncP(home, ["add", "mm", url, ...args]));
 const OC_CFG = '{\n  "provider": {}\n}\n';
 const HERMES = "custom_providers:\n";
 const inHome = (home, rel) => path.join(home, rel);

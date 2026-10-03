@@ -3,14 +3,12 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { CLI, hermeticEnv } from "./helpers.js";
 
-const CLI = new URL("../bin/provider-sync.js", import.meta.url).pathname;
 const home = mkdtempSync(path.join(tmpdir(), "ps-cli-"));
-process.env.HOME = home;
-process.env.USERPROFILE = home;
 
 // a minimal config so commands that need one do not die
 before(() => {
@@ -22,7 +20,7 @@ after(() => rmSync(home, { recursive: true, force: true }));
 const run = (args, opts = {}) =>
   execFileSync(process.execPath, [opts.entry || CLI, ...args], {
     encoding: "utf8",
-    env: { ...process.env, HOME: home, USERPROFILE: home, ...(opts.env || {}) },
+    env: { ...hermeticEnv(home), ...(opts.env || {}) },
   });
 
 let binDir;

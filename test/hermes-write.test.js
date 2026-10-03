@@ -6,10 +6,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pinHomeForImport } from "./helpers.js";
 
 const home = mkdtempSync(path.join(tmpdir(), "ps-hermes-"));
-process.env.HOME = home;
-process.env.USERPROFILE = home;
+pinHomeForImport(home);
 const { HERMES_CFG, hermesUpsert } = await import("../bin/provider-sync.js");
 const { parseHermes } = await import("../lib/hermes-yaml.js");
 
