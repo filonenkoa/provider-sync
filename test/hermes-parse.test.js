@@ -83,6 +83,41 @@ test("counts list items it cannot parse instead of guessing", () => {
   assert.equal(h.entries.length, 1);
 });
 
+test("parses entries whose fields are sorted alphabetically (name last)", () => {
+  // editors and other tools may reorder fields; the entry must still parse
+  const h = parseHermes(`custom_providers:
+  - api_key: secret
+    base_url: http://a/v1
+    model: m1
+    models:
+      m1:
+        context_length: 4096
+    models_discovered: true
+    name: Alpha
+  - base_url: http://b/v1
+    models:
+      m2: {}
+    name: Beta
+`);
+  assert.equal(h.unparsed, 0);
+  assert.equal(h.entries.length, 2);
+  assert.equal(h.entries[0].name, "Alpha");
+  assert.equal(h.entries[0].base_url, "http://a/v1");
+  assert.equal(h.entries[0].api_key, "secret");
+  assert.equal(h.entries[0].model, "m1");
+  assert.equal(h.entries[0].modelsDiscovered, true);
+  assert.equal(h.entries[0].models[0].id, "m1");
+  assert.equal(h.entries[0].models[0].ctx, 4096);
+  assert.equal(h.entries[1].name, "Beta");
+  assert.equal(h.entries[1].models[0].id, "m2");
+});
+
+test("an entry with known fields but no name still parses, named by base_url", () => {
+  const h = parseHermes("custom_providers:\n  - base_url: http://c/v1\n    models:\n      m: {}\n");
+  assert.equal(h.unparsed, 0);
+  assert.equal(h.entries[0].name, "http://c/v1");
+});
+
 test("returns null when there is no custom_providers section", () => {
   assert.equal(parseHermes("model:\n  default: x\n"), null);
 });
