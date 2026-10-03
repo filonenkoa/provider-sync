@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node bin/provider-sync.js",
-    "test": "node --test test/*.test.js"
+    "test": "node test/run.js"
   },
   "engines": {
     "node": ">=18"
