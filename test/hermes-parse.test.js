@@ -1,7 +1,7 @@
 // hermes custom_providers parsing: indentation, dashes, line endings, models blocks
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseHermes, renderModels, yq, deq } from "../bin/provider-sync.js";
+import { parseHermes, renderModels, yq, deq } from "../lib/hermes-yaml.js";
 
 const STD = `model:
   default: x

@@ -10,7 +10,8 @@ import path from "node:path";
 const home = mkdtempSync(path.join(tmpdir(), "ps-hermes-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
-const { hermesUpsert, HERMES_CFG } = await import("../bin/provider-sync.js");
+const { HERMES_CFG, hermesUpsert } = await import("../bin/provider-sync.js");
+const { parseHermes } = await import("../lib/hermes-yaml.js");
 
 const MODELS = [
   { id: "IY/Qwen3.8-27B-262Kctx", ctx: 262144 },
