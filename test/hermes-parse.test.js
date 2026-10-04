@@ -1,7 +1,7 @@
 // hermes custom_providers parsing: indentation, dashes, line endings, models blocks
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseHermes, renderModels, yq, deq } from "../lib/hermes-yaml.js";
+import { parseHermes, renderModels, yq, deq, parseFlowMap } from "../lib/hermes-yaml.js";
 
 const STD = `model:
   default: x
@@ -116,6 +116,49 @@ test("an entry with known fields but no name still parses, named by base_url", (
   const h = parseHermes("custom_providers:\n  - base_url: http://c/v1\n    models:\n      m: {}\n");
   assert.equal(h.unparsed, 0);
   assert.equal(h.entries[0].name, "http://c/v1");
+});
+
+test("a flow-style entry is read, not counted as unparsed", () => {
+  const h = parseHermes(`custom_providers:
+  - {name: Flow, base_url: "http://127.0.0.1:8080/v1", api_key: dummy, models: {gemma: {context_length: 131072}, other: {}}}
+`);
+  assert.equal(h.unparsed, 0);
+  assert.equal(h.entries.length, 1);
+  const e = h.entries[0];
+  assert.equal(e.flow, true);
+  assert.equal(e.modelsOk, true);
+  assert.equal(e.name, "Flow");
+  assert.equal(e.base_url, "http://127.0.0.1:8080/v1");
+  assert.equal(e.api_key, "dummy");
+  assert.deepEqual(e.models.map((m) => [m.id, m.ctx]), [["gemma", 131072], ["other", null]]);
+});
+
+test("a flow entry with an unreadable models shape says so", () => {
+  const h = parseHermes("custom_providers:\n  - {name: F, base_url: http://h/v1, models: weird}\n");
+  assert.equal(h.entries.length, 1);
+  assert.equal(h.entries[0].flow, true);
+  assert.equal(h.entries[0].modelsOk, false);
+});
+
+test("flow entries and block entries can coexist", () => {
+  const h = parseHermes(`custom_providers:
+  - {name: A, base_url: http://a/v1, models: {m: {}}}
+  - name: B
+    base_url: http://b/v1
+    models:
+      m:
+        context_length: 4096
+`);
+  assert.equal(h.entries.length, 2);
+  assert.equal(h.entries[0].flow, true);
+  assert.equal(h.entries[1].flow, undefined);
+  assert.equal(h.entries[1].models[0].ctx, 4096);
+});
+
+test("parseFlowMap keeps nested braces and colons intact", () => {
+  const pairs = parseFlowMap('{a: 1, b: {c: "x:y"}, d: "z, w"}');
+  assert.deepEqual(pairs, [{ key: "a", value: "1" }, { key: "b", value: '{c: "x:y"}' }, { key: "d", value: '"z, w"' }]);
+  assert.equal(parseFlowMap("not a map"), null);
 });
 
 test("returns null when there is no custom_providers section", () => {

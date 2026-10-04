@@ -95,6 +95,15 @@ test("--no-hermes keeps working and says so", async () => {
   assert.equal(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), HERMES, "hermes untouched");
 });
 
+test("add refuses to rewrite a flow-style entry instead of corrupting it", async () => {
+  const line = `  - {name: Flow, base_url: "${url}", api_key: dummy, models: {old: {context_length: 128}}}`;
+  const home = homeWith({ ".hermes/config.yaml": `custom_providers:\n${line}\n` });
+  const out = await add(home, ["--key", "K1", "--target", "hermes"]);
+  assert.match(out, /hermes \S* skipped — the entry for .* is written in flow style/);
+  assert.equal(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), `custom_providers:\n${line}\n`,
+    "the flow line must be byte-identical");
+});
+
 test("an invalid --target is refused", async () => {
   await assert.rejects(() => add(homeWith({ ".hermes/config.yaml": HERMES }), ["--target", "bogus"]), /bad --target/);
 });

@@ -170,6 +170,15 @@ test("a list item without a name is counted and reported, not silently dropped",
   assert.match(out, /1 item\(s\) in an unexpected layout/, "and the odd one is reported");
 });
 
+test("a flow-style hermes entry is listed and marked read-only", () => {
+  const out = list(homeWith({
+    ".hermes/config.yaml": `custom_providers:
+  - {name: FlowOne, base_url: "http://127.0.0.1:8080/v1", api_key: dummy, models: {gemma: {context_length: 131072}}}
+`,
+  }));
+  assert.match(out, /FlowOne 1 models .*\(flow style, read-only\)/);
+});
+
 test("a hermes list with nothing parsable says so instead of looking empty", () => {
   const out = list(homeWith({
     ".hermes/config.yaml": "custom_providers:\n  - opaque: 1\n    other: 2\n",

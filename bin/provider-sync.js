@@ -637,6 +637,8 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
   const n = models.length;
   const found = h.entries.find((e) => normUrl(e.base_url) === normUrl(base));
   if (found) {
+    if (found.flow)
+      return { status: "flow", why: `the entry for ${base} is written in flow style on one line — provider-sync will not rewrite it` };
     if (dryRun) return { status: "updated", name: found.name, n };
     const lines = h.lines.slice();
     hermesSetModels(lines, found, models);
@@ -680,6 +682,7 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — skipped, provider-sync will not touch them`);
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(h.entries.map(async (e) => {
+    if (e.flow) return { e, skip: "flow-style entry (one line in braces) — listed, never rewritten" };
     if (!e.base_url) return { e, skip: "no base_url" };
     const key = hermesKey(e, ocCfg, ocAuth);
     const pr = await probeCached(e.base_url, key);
@@ -820,8 +823,10 @@ function cmdList() {
       else {
         // partial coverage must be visible: those entries are listed nowhere
         if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — not listed, and provider-sync will not touch them`);
-        for (const e of h.entries)
-          console.log(`  ${e.name.padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}  ${hermesKeySource(e, cfg, auth)}`);
+        for (const e of h.entries) {
+          const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
+          console.log(`  ${e.name.padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}  ${hermesKeySource(e, cfg, auth)}`);
+        }
       }
     }
   }
@@ -905,7 +910,7 @@ async function cmdAdd(id, url) {
     : key ? `api key for "${id}"${verb ? ", " + verb : ""}` : "no change (no --key)";
   const hermesLine = (r, verb) => {
     if (!wantH) return `skipped — ${hWhy}`;
-    if (["absent", "no-section", "unparsed", "layout", "error"].includes(r.status)) return `skipped — ${r.why}`;
+    if (["absent", "no-section", "unparsed", "layout", "flow", "error"].includes(r.status)) return `skipped — ${r.why}`;
     return `custom_providers "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
   };
   let hres = { status: "off", why: hWhy };

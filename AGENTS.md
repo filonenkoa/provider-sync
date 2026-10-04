@@ -47,6 +47,7 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 - OpenCode config discovery: first existing of `opencode.jsonc`, `opencode.json`, `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode`. Override the path with `PS_CONFIG=/path/to/file`.
 - Harnesses are independent: `sync` (and `list`) skip a target whose config file is absent instead of failing, so hermes-only and opencode-only machines are supported. `add` creates the OpenCode config when it is missing; `set-ctx` and an explicit `--target opencode` do need it.
 - Hermes entries are matched by base URL, so `add` never duplicates a provider that is already there under another id. If the file uses a hand-made layout provider-sync does not recognise, it refuses to append and says so instead of guessing.
+- Hermes: an entry written in flow style (`- {name: x, base_url: y}`) is listed but never rewritten; `sync` and `add` skip it with a reason. Fields it does not manage (`discover_models`, `free_only`, …) are left exactly as written.
 - API keys: OpenCode — `~/.local/share/opencode/auth.json` (managed by the tool; `--key` on `add` persists it). Hermes — `add` writes the key literally as `api_key:` (`dummy` for servers without auth); `sync` reads literal `api_key`, `${ENV}`/`key_env` from `~/.hermes/.env`, or borrows the OpenCode key of a provider pointing at the same server URL.
 - Exit codes: `0` success; non-zero error (stderr explains what to do).
 
