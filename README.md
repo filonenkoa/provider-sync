@@ -34,6 +34,7 @@ No `npm install` — there are no dependencies. Needs Node >= 18 (built-in `fetc
 ## Quick start
 
 ```sh
+provider-sync --version       # 1.1.0
 provider-sync list            # what is configured, per harness
 provider-sync sync            # status check, writes nothing (safe default)
 provider-sync add 3090 http://10.0.0.5:64980/v1 --key <api-key>    # register a provider
@@ -49,6 +50,8 @@ provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
 | `provider-sync sync [--apply] [--target all\|opencode\|hermes] [--provider ID]` | Check/apply drift between servers and config |
 | `provider-sync set-ctx <provider>` | Interactively re-ask context for models whose server reports none (needs a TTY) |
 | `provider-sync help` / `--version` | Full in-tool documentation / version |
+
+Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 

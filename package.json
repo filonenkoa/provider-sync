@@ -1,6 +1,6 @@
 {
   "name": "provider-sync",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Manage local model providers for OpenCode (and Hermes Agent) from the CLI: auto-detect server type, sync models/ctx/modalities, keep offline fallback catalogs current.",
   "type": "module",
   "bin": {
@@ -24,5 +24,10 @@
     "unsloth",
     "hermes",
     "cli"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/filonenkoa/provider-sync.git"
+  },
+  "homepage": "https://github.com/filonenkoa/provider-sync#readme"
 }
