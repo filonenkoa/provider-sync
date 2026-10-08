@@ -31,7 +31,9 @@ test("parses wrapped lists and tolerates junk", () => {
 test("OPENCODE_DB wins over the default location", () => {
   const b = detectBackend({ env: { OPENCODE_DB: "/somewhere/else.db" } });
   assert.equal(b.mode, "db");
-  assert.equal(b.dbPath, "/somewhere/else.db");
+  // path.resolve is drive-relative on Windows, so compare resolved forms
+  assert.equal(b.dbPath, path.resolve("/somewhere/else.db"));
+  assert.ok(path.isAbsolute(b.dbPath));
 });
 
 test("the documented default honours XDG_DATA_HOME", () => {
@@ -84,7 +86,9 @@ before(async () => {
   writeFileSync(script, `#!/bin/sh
 case "$1 $2" in
   "debug paths") echo "$FAKE_DB" ;;
-  "auth list") echo '[{"id":"v2prov","type":"api"}]' ;;
+  "auth list")
+    if [ -n "$FAKE_AUTH_FAIL" ]; then echo "opencode auth list"; echo "Usage: opencode auth list [options]"; exit 0; fi
+    echo '[{"id":"v2prov","type":"api"}]' ;;
   *) echo '{}' ;;
 esac
 `, { mode: 0o755 });
@@ -108,8 +112,12 @@ const OC_CFG = `{
   }
 }
 `;
-const withFakeOpencode = async (home, args) =>
-  flat(await runCliAsyncP(home, args, { PATH: `${binDir}:${process.env.PATH}`, FAKE_DB: path.join(home, ".local/share/opencode/opencode.db") }));
+const withFakeOpencode = async (home, args, extraEnv = {}) =>
+  flat(await runCliAsyncP(home, args, {
+    PATH: `${binDir}:${process.env.PATH}`,
+    FAKE_DB: path.join(home, ".local/share/opencode/opencode.db"),
+    ...extraEnv,
+  }));
 
 test("on 2.x, add --key does not write auth.json and names the real command", { skip: process.platform === "win32" }, async () => {
   const home = homeWith({
@@ -151,6 +159,30 @@ test("with no credential store at all, the legacy write still happens with a war
   const out = await withFakeOpencode(home, ["add", "v2prov", url, "--key", "SECRET"]);
   assert.match(out, /note: no OpenCode credential store was found/);
   assert.match(out, /opencode auth login v2prov --method key/, "still points at the 2.x way");
+});
+
+test("a mixed install still uses the readable key and says it may be stale", { skip: process.platform === "win32" }, async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url),
+    ".local/share/opencode/opencode.db": "SQLite format 3\0",      // 2.x store exists
+    ".local/share/opencode/auth.json": JSON.stringify({ v2prov: { type: "api", key: "OLD" } }),
+  });
+  const out = await withFakeOpencode(home, ["list"]);
+  // the value we can read wins over the store we cannot read
+  assert.match(out, /v2prov .* key \(auth\.json, may be stale\)/);
+  assert.match(out, /plain .* no-key/);
+  assert.match(out, /imported at migration and may be stale/);
+});
+
+test("a database with no listable CLI reports unknown, not no-key", { skip: process.platform === "win32" }, async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url),
+    ".local/share/opencode/opencode.db": "SQLite format 3\0",
+  });
+  // an opencode build whose "auth list" cannot answer (1.x binary, 2.x database)
+  const out = await withFakeOpencode(home, ["list"], { FAKE_AUTH_FAIL: "1" });
+  assert.match(out, /unknown \(a database is present; the opencode CLI cannot list credentials\)/);
+  assert.doesNotMatch(out, /no-key/);
 });
 
 test("detecting the backend must not create directories in the home", { skip: process.platform === "win32" }, async () => {

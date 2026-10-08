@@ -120,10 +120,14 @@ export const loadCfg = () => cfgStore.load();
 //              and nothing else, which is all the documentation allows
 //   absent   — no credential anywhere we know of
 export function credentialFor(id, auth = loadAuth()) {
+  // a readable value always wins: on a machine with both a 1.x-style file and a
+  // 2.x-style database (a mixed install), hiding the usable key would be worse
+  // than trusting it — the report below says which store it came from.
   if (auth[id]?.key) return { state: "value", key: auth[id].key, where: AUTH };
   if (authInDb) {
     const creds = dbCredentials();
-    return creds && id in creds
+    if (creds === null) return { state: "unknown", key: null, where: authBackend.dbPath };
+    return id in creds
       ? { state: "stored", key: null, where: authBackend.dbPath, type: creds[id] }
       : { state: "absent", key: null };
   }
@@ -136,12 +140,12 @@ function dbCredentials() {
 }
 // short label for reports
 export function credentialLabel(c) {
-  if (c.state === "value") return "key";
+  if (c.state === "value") return authInDb ? "key (auth.json, may be stale)" : "key";
   if (c.state === "stored") return c.type && c.type !== "unknown" ? `key (${c.type}, in opencode db)` : "key (in opencode db)";
+  if (c.state === "unknown") return "unknown (a database is present; the opencode CLI cannot list credentials)";
   return "no-key";
 }
 export const loadAuth = () => {
-  if (authInDb) return {}; // 2.x: credentials are not in this file, or are stale in it
   if (!existsSync(AUTH)) return {};
   let a;
   try { a = JSON.parse(readFileSync(AUTH, "utf8")); }
@@ -854,7 +858,7 @@ function cmdList() {
       }
     }
   }
-  if (authInDb) console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync can see that a key exists, never its value`);
+  if (authInDb) console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync never writes it and never shows a stored value${existsSync(AUTH) ? ", and an auth.json found here was imported at migration and may be stale" : ""}`);
   if (target !== "opencode") {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
@@ -1016,7 +1020,7 @@ async function cmdSync() {
       const pr = await probeCached(base, key);
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
       if (pr.kind === "auth")
-        return { id, badauth: true, unreadable: own.state === "stored" || (authInDb && !flags.key) };
+        return { id, badauth: true, unreadable: own.state === "stored" || own.state === "unknown" };
       try { return { id, kind: pr.kind, base, server: await fetchModels(pr, base, key) }; }
       catch (e) { return { id, err: e.message }; }
     }));
