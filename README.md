@@ -72,7 +72,7 @@ Sync never clobbers already-configured values — re-ask them with `provider-syn
 | File | What provider-sync does |
 | --- | --- |
 | OpenCode config — first existing of `opencode.jsonc` / `opencode.json` / `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode` (override: `PS_CONFIG`) | provider definitions (models, limits, modalities); skipped if OpenCode is not installed |
-| `~/.local/share/opencode/auth.json` | API keys per provider id |
+| `~/.local/share/opencode/auth.json` | API keys per provider id — **OpenCode 1.x only**. On OpenCode 2.x and newer keys live in its SQLite database (`$XDG_DATA_HOME\|~/.local/share/opencode/opencode.db`, or `$OPENCODE_DB`); provider-sync detects that, never writes the database, and prints the `opencode auth login <id> --method key` command you need — entering a key requires a terminal, so pass `--key K` to use a secret for a single run |
 | `~/.hermes/config.yaml` | `custom_providers` entries: created/updated by `add`, and their `models:` maps refreshed by `sync` — surgical line edits, comments and other fields preserved; skipped if Hermes is not installed |
 
 Hermes entries written in **flow style** (one line inside `{...}`) are read and listed, but never rewritten — the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip such an entry and say so. Fields other than `name`/`base_url`/`api_key`/`key_env`/`model`/`models`/`models_discovered` (for example `discover_models` or `free_only`) are preserved untouched and not managed.
