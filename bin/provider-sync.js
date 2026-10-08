@@ -7,6 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { detectBackend, listCredentials, loginCommand } from "../lib/opencode-auth.js";
 import { createHash } from "node:crypto";
 
 // config file resolution mirrors OpenCode's own discovery (config.ts):
@@ -21,6 +22,10 @@ function detectCfg() {
 const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || null;
 export const CFG = CFG_ENV || detectCfg();
 const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
+// OpenCode 1.x keeps credentials in that file; 2.x keeps them in SQLite and
+// only `auth` commands can write them. Detected once, reported honestly.
+const authBackend = detectBackend();
+const authInDb = authBackend.mode === "db";
 export const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 
@@ -109,7 +114,34 @@ const cfgStore = {
   },
 };
 export const loadCfg = () => cfgStore.load();
+// What we know about a provider's credential, without pretending to more.
+//   value    — readable, usable for probing
+//   stored   — present, but in OpenCode's database: we can see that it exists
+//              and nothing else, which is all the documentation allows
+//   absent   — no credential anywhere we know of
+export function credentialFor(id, auth = loadAuth()) {
+  if (auth[id]?.key) return { state: "value", key: auth[id].key, where: AUTH };
+  if (authInDb) {
+    const creds = dbCredentials();
+    return creds && id in creds
+      ? { state: "stored", key: null, where: authBackend.dbPath, type: creds[id] }
+      : { state: "absent", key: null };
+  }
+  return { state: "absent", key: null };
+}
+let _dbCreds;
+function dbCredentials() {
+  if (_dbCreds === undefined) _dbCreds = authInDb ? listCredentials() : null;
+  return _dbCreds;
+}
+// short label for reports
+export function credentialLabel(c) {
+  if (c.state === "value") return "key";
+  if (c.state === "stored") return c.type && c.type !== "unknown" ? `key (${c.type}, in opencode db)` : "key (in opencode db)";
+  return "no-key";
+}
 export const loadAuth = () => {
+  if (authInDb) return {}; // 2.x: credentials are not in this file, or are stale in it
   if (!existsSync(AUTH)) return {};
   let a;
   try { a = JSON.parse(readFileSync(AUTH, "utf8")); }
@@ -589,6 +621,11 @@ function hermesKeySource(e, ocCfg, ocAuth) {
   if (e.key_env) return hermesEnv()[e.key_env] ? "key (env)" : `no-key (${e.key_env} is unset in ~/.hermes/.env)`;
   for (const [pid, p] of Object.entries(ocCfg.provider || {}))
     if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && ocAuth[pid]?.key) return `key (borrowed from ${pid})`;
+  if (authInDb) {
+    for (const [pid, p] of Object.entries(ocCfg.provider || {}))
+      if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && credentialFor(pid, ocAuth).state === "stored")
+        return "no-key (opencode has a key for this server, stored in its database)";
+  }
   return "no-key";
 }
 
@@ -758,8 +795,12 @@ async function cmdSetCtx(pid) {
   const p = cfg.provider[pid];
   if (!p) die(`unknown provider "${pid}" (see provider-sync list)`);
   const base = p.options?.baseURL;
-  const key = loadAuth()[pid]?.key || null;
+  const own = credentialFor(pid);
+  const key = own.key || flags.key || null;
   const pr = await probeCached(base, key);
+  if (pr.kind === "auth" && own.state !== "value")
+    die(`${base} needs a key that provider-sync cannot read (OpenCode ${authInDb ? "keeps credentials in its database" : "has none for " + pid})
+pass it for this run: provider-sync set-ctx ${pid} --key K`);
   if (pr.kind === "offline" || pr.kind === "auth") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   let server;
   try { server = await fetchModels(pr, base, key); } catch (e) { die(e.message); }
@@ -809,10 +850,11 @@ function cmdList() {
       for (const id of ids) {
         const p = cfg.provider[id];
         const n = Object.keys(p.models || {}).length;
-        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${auth[id]?.key ? "key" : "no-key"}`);
+        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${credentialLabel(credentialFor(id, auth))}`);
       }
     }
   }
+  if (authInDb) console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync can see that a key exists, never its value`);
   if (target !== "opencode") {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
@@ -876,6 +918,7 @@ async function cmdAdd(id, url) {
     : target === "opencode" ? "not selected (--target opencode)"
     : wantH ? "" : "hermes is not installed here";
   const fresh = wantOc && !existsSync(CFG);
+  const hadAuthFile = existsSync(AUTH); // read before any write below
   const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
   const oldProv = cfg.provider[id] || {};
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
@@ -905,9 +948,13 @@ async function cmdAdd(id, url) {
   const ocLine = (verb) => wantOc
     ? `provider "${id}" (${nModels} models${fresh ? ", new config file" : ""}${verb ? ", " + verb : ""})`
     : `skipped — ${ocWhy}`;
-  const keysLine = (verb) => !wantOc
-    ? `skipped — ${ocWhy}`
-    : key ? `api key for "${id}"${verb ? ", " + verb : ""}` : "no change (no --key)";
+  const keysLine = (verb) => {
+    if (!wantOc) return `skipped — ${ocWhy}`;
+    if (!key) return "no change (no --key)";
+    // 2.x writes credentials to sqlite through its own interactive flow only
+    if (authInDb) return `not written by provider-sync — run: ${loginCommand(id)}`;
+    return `api key for "${id}"${verb ? ", " + verb : ""}`;
+  };
   const hermesLine = (r, verb) => {
     if (!wantH) return `skipped — ${hWhy}`;
     if (["absent", "no-section", "unparsed", "layout", "flow", "error"].includes(r.status)) return `skipped — ${r.why}`;
@@ -926,8 +973,11 @@ async function cmdAdd(id, url) {
   if (wantOc) {
     saveCfg(cfg);
     if (fresh) console.log(`created ${CFG}`);
-    if (key && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
+    if (key && !authInDb && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
     if (reportValidate(cfg)) console.log(`OK — ${nModels} models in ${id}`);
+    if (key && authInDb) console.log(`note: provider-sync did not store the key; OpenCode keeps credentials in ${disp(authBackend.dbPath || "its database")}`);
+    else if (key && !hadAuthFile)
+      console.log(`note: no OpenCode credential store was found (no database, no auth.json), so the key went to the legacy ${disp(AUTH)} — on OpenCode 2.x and newer, store it with \`${loginCommand(id)}\``);
   }
   if (wantH)
     try { hres = hermesUpsert({ ...hargs, dryRun: false }); }
@@ -961,17 +1011,24 @@ async function cmdSync() {
     const rs = await Promise.all(ids.map(async (id) => {
       const base = cfg.provider[id].options?.baseURL;
       if (!base) return { id, err: "no baseURL in config" };
-      const key = auth[id]?.key || null;
+      const own = credentialFor(id, auth);
+      const key = own.key || flags.key || null; // a readable key, or one passed for this run
       const pr = await probeCached(base, key);
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
-      if (pr.kind === "auth") return { id, badauth: true };
+      if (pr.kind === "auth")
+        return { id, badauth: true, unreadable: own.state === "stored" || (authInDb && !flags.key) };
       try { return { id, kind: pr.kind, base, server: await fetchModels(pr, base, key) }; }
       catch (e) { return { id, err: e.message }; }
     }));
     let changes = 0;
     for (const r of rs) {
       if (r.offline) { console.log(`${r.id}: OFFLINE (${r.offline}) — skipped`); continue; }
-      if (r.badauth) { console.log(`${r.id}: AUTH 401 — key missing or invalid`); continue; }
+      if (r.badauth) {
+        console.log(r.unreadable
+          ? `${r.id}: AUTH 401 — its key is in OpenCode's database and cannot be read here; pass --key K to check this server`
+          : `${r.id}: AUTH 401 — key missing or invalid`);
+        continue;
+      }
       if (r.err) { console.log(`${r.id}: ERROR — ${r.err}`); continue; }
       const notes = [];
       const cur = cfg.provider[r.id].models || {};

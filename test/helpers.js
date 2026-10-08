@@ -35,8 +35,8 @@ export const runCli = (home, args = [], opts = {}) =>
   execFileSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: hermeticEnv(home), ...opts });
 
 export const runCliAsync = promisify(execFile);
-export const runCliAsyncP = (home, args = []) =>
-  runCliAsync(process.execPath, [CLI, ...args], { env: hermeticEnv(home) }).then((r) => r.stdout);
+export const runCliAsyncP = (home, args = [], extraEnv = {}) =>
+  runCliAsync(process.execPath, [CLI, ...args], { env: hermeticEnv(home, extraEnv) }).then((r) => r.stdout);
 
 // column widths are a formatting choice, not part of any contract
 export const flat = (s) => s.replace(/[ \t]+/g, " ");
