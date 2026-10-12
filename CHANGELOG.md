@@ -2,6 +2,26 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- `add --key K` now stores the key in the provider entry of your own config
+  (`provider.<id>.options.apiKey`, or `providers.<id>.settings.apiKey` on a 2.x
+  config) instead of OpenCode's `auth.json` or database. Verified against the
+  OpenCode binary: the key arrives as the bearer token, on 1.x and 2.x, with no
+  interactive login — the database route is not scriptable (the TUI prompt needs
+  a terminal, `auth login --method key` rejects custom providers, and piping
+  stdin hangs).
+- `add` re-reads the config after writing and exits non-zero if the key is not
+  there, instead of reporting success for a key it never stored.
+- `--key-env VAR` stores `{env:VAR}` instead of a literal key, for configs that
+  live in version control.
+- `add` now says `rejected the supplied key (HTTP 401)` when the server refuses
+  the key you passed, instead of asking for `--key` you already gave.
+- A readable key in the config or `auth.json` is never hidden by the presence of a
+  2.x database; `list` labels where it came from.
+
+
 ## 1.1.0 — 2026-10-03
 
 Second harness (Hermes Agent) is now a first-class target, and the tool reports
@@ -55,12 +75,3 @@ exactly what it wrote and what it did not.
 First tagged release: `add`, `sync`, `set-ctx`, `list` for OpenCode providers
 with llama.cpp / LM Studio / Unsloth / OpenAI-compatible detection, ctx and
 modality synchronisation, atomic writes with rotating backups.
-- 2026-10-12
-
-### Fixed
-
-- `add --key K` now stores the key in the provider entry of your own config (`provider.<id>.options.apiKey`, or `providers.<id>.settings.apiKey` on a 2.x config) instead of OpenCode's `auth.json` or database. Verified against the OpenCode binary: the key arrives as the bearer token, on 1.x and 2.x, with no interactive login — the database route is not scriptable (the TUI prompt needs a terminal, `auth login --method key` rejects custom providers, and piping stdin hangs).
-- `add` re-reads the config after writing and exits non-zero if the key is not there, instead of reporting success for a key it never stored.
-- `--key-env VAR` stores `{env:VAR}` instead of a literal key, for configs that live in version control.
-- `add` now says `rejected the supplied key (HTTP 401)` when the server refuses the key you passed, instead of asking for `--key` you already gave.
-- A readable key in the config or `auth.json` is never hidden by the presence of a 2.x database; `list` labels where it came from.
