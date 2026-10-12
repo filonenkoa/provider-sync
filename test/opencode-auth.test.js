@@ -7,7 +7,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { detectBackend, parseCredentialList, defaultDbPath, loginCommand } from "../lib/opencode-auth.js";
+import { configApiKey, storeConfigApiKey } from "../bin/provider-sync.js";
 import { runCliAsyncP, flat } from "./helpers.js";
+const loadCfgIn = (home) => JSON.parse(readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8"));
 
 // ---------- pure units (run everywhere) ----------
 
@@ -119,17 +121,20 @@ const withFakeOpencode = async (home, args, extraEnv = {}) =>
     ...extraEnv,
   }));
 
-test("on 2.x, add --key does not write auth.json and names the real command", { skip: process.platform === "win32" }, async () => {
+test("on 2.x, add --key stores it in the config entry, never in auth.json", { skip: process.platform === "win32" }, async () => {
   const home = homeWith({
     ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url),
     ".local/share/opencode/opencode.db": "SQLite format 3\0",
   });
   const out = await withFakeOpencode(home, ["add", "v2prov", url, "--key", "SECRET"]);
-  assert.match(out, /keys \S*auth\.json not written by provider-sync — run: opencode auth login v2prov --method key/);
-  assert.match(out, /note: provider-sync did not store the key/);
+  assert.match(out, /keys \S*opencode\.jsonc api key for "v2prov"/);
   assert.equal(existsSync(path.join(home, ".local/share/opencode/auth.json")), false,
     "auth.json must not be created on 2.x");
-  assert.doesNotMatch(out, /auth\.json\s+api key for/);
+  assert.equal(configApiKey(loadCfgIn(home), "v2prov"), "SECRET");
+  // and list sees it as a usable credential, without printing the secret
+  const listed = await withFakeOpencode(home, ["list"]);
+  assert.match(listed, /v2prov .* key \(config\)/);
+  assert.doesNotMatch(listed, /SECRET/, "a secret must never be printed");
 });
 
 test("on 2.x, list shows that a credential exists but not its value", { skip: process.platform === "win32" }, async () => {
@@ -144,21 +149,27 @@ test("on 2.x, list shows that a credential exists but not its value", { skip: pr
   assert.doesNotMatch(out, /SECRET/, "a secret must never be printed");
 });
 
-test("on 1.x, auth.json is still written and reused", { skip: process.platform === "win32" }, async () => {
+test("on 1.x, the key goes to the same config entry and is reused", { skip: process.platform === "win32" }, async () => {
   const home = homeWith({ ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url) });
   const out = await withFakeOpencode(home, ["add", "v2prov", url, "--key", "SECRET"]);
-  assert.match(out, /auth\.json\s+api key for "v2prov"/);
-  const authPath = path.join(home, ".local/share/opencode/auth.json");
-  assert.equal(JSON.parse(readFileSync(authPath, "utf8")).v2prov.key, "SECRET");
-  // and a second run reuses it instead of asking again
-  assert.match(await withFakeOpencode(home, ["list"]), /v2prov .* key/);
+  assert.match(out, /keys \S*opencode\.jsonc api key for "v2prov"/);
+  assert.equal(configApiKey(loadCfgIn(home), "v2prov"), "SECRET");
+  assert.match(await withFakeOpencode(home, ["list"]), /v2prov .* key \(config\)/);
 });
 
-test("with no credential store at all, the legacy write still happens with a warning", { skip: process.platform === "win32" }, async () => {
+test("--key-env stores an env reference instead of the secret", { skip: process.platform === "win32" }, async () => {
   const home = homeWith({ ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url) });
-  const out = await withFakeOpencode(home, ["add", "v2prov", url, "--key", "SECRET"]);
-  assert.match(out, /note: no OpenCode credential store was found/);
-  assert.match(out, /opencode auth login v2prov --method key/, "still points at the 2.x way");
+  await withFakeOpencode(home, ["add", "v2prov", url, "--key-env", "V2PROV_KEY"]);
+  assert.equal(configApiKey(loadCfgIn(home), "v2prov"), "{env:V2PROV_KEY}");
+});
+
+test("both config schemas round-trip a key", () => {
+  const v1 = { provider: { a: { options: {} } } };
+  assert.deepEqual(storeConfigApiKey(v1, "a", "K"), ["provider.a.options.apiKey"]);
+  assert.equal(configApiKey(v1, "a"), "K");
+  const v2 = { providers: { b: { settings: {} } } };
+  assert.ok(storeConfigApiKey(v2, "b", "K").includes("providers.b.settings.apiKey"));
+  assert.equal(configApiKey(v2, "b"), "K");
 });
 
 test("a mixed install still uses the readable key and says it may be stale", { skip: process.platform === "win32" }, async () => {

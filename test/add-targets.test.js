@@ -44,7 +44,7 @@ test("hermes-only machine: only the hermes entry is written", async () => {
   const home = homeWith({ ".hermes/config.yaml": HERMES });
   const out = await add(home, ["--key", "K1"]);
   assert.match(out, /opencode \S*opencode\.jsonc skipped — opencode is not installed here/);
-  assert.match(out, /keys \S*auth\.json skipped — opencode is not installed here/);
+  assert.match(out, /keys \S*opencode\.jsonc skipped — opencode is not installed here/);
   assert.match(out, /hermes \S*config\.yaml custom_providers "mm" created \(2 models/);
   assert.match(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), /- name: mm/);
 });
@@ -69,7 +69,8 @@ test("both installed: both are written", async () => {
   const out = await add(home, ["--key", "K1"]);
   assert.match(out, /opencode \S* provider "mm" \(2 models\)/);
   assert.match(out, /hermes \S* custom_providers "mm" created \(2 models/);
-  assert.equal(existsSync(inHome(home, ".local/share/opencode/auth.json")), true);
+  const cfg = JSON.parse(readFileSync(inHome(home, ".config/opencode/opencode.jsonc"), "utf8"));
+  assert.equal(cfg.provider.mm.options.apiKey, "K1");
 });
 
 test("--target opencode creates the config even where opencode is absent", async () => {

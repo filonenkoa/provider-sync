@@ -119,11 +119,42 @@ export const loadCfg = () => cfgStore.load();
 //   stored   — present, but in OpenCode's database: we can see that it exists
 //              and nothing else, which is all the documentation allows
 //   absent   — no credential anywhere we know of
-export function credentialFor(id, auth = loadAuth()) {
-  // a readable value always wins: on a machine with both a 1.x-style file and a
-  // 2.x-style database (a mixed install), hiding the usable key would be worse
-  // than trusting it — the report below says which store it came from.
-  if (auth[id]?.key) return { state: "value", key: auth[id].key, where: AUTH };
+// The key OpenCode itself will use for this provider. Verified against the real
+// binary: a key in the provider entry is sent as the bearer token (1.x:
+// provider.<id>.options.apiKey; 2.x: providers.<id>.settings.apiKey). This is
+// also the only store that works without an interactive login, which is why
+// `add --key` writes here rather than into auth.json or the database.
+export function configApiKey(cfg, id) {
+  const v1 = cfg?.provider?.[id]?.options?.apiKey;
+  if (typeof v1 === "string" && v1) return v1;
+  const v2 = cfg?.providers?.[id]?.settings?.apiKey;
+  if (typeof v2 === "string" && v2) return v2;
+  return null;
+}
+export function storeConfigApiKey(cfg, id, key) {
+  const where = [];
+  // a config that only has `providers` is a 2.x config: write its shape, not 1.x's
+  const v2only = Boolean(cfg.providers) && !cfg.provider;
+  if (cfg.providers) {
+    cfg.providers[id] = cfg.providers[id] || {};
+    cfg.providers[id].settings = { ...(cfg.providers[id].settings || {}), apiKey: key };
+    where.push(`providers.${id}.settings.apiKey`);
+  }
+  if (!v2only) {
+    cfg.provider = cfg.provider || {};
+    cfg.provider[id] = cfg.provider[id] || {};
+    cfg.provider[id].options = { ...(cfg.provider[id].options || {}), apiKey: key };
+    where.push(`provider.${id}.options.apiKey`);
+  }
+  return where;
+}
+export function credentialFor(id, auth = loadAuth(), cfg = null) {
+  const ck = configApiKey(cfg, id);
+  if (ck) return { state: "value", key: ck, where: CFG, from: "config" };
+  // a readable value always wins over a store we cannot read: on a machine with
+  // both a 1.x-style file and a 2.x-style database, hiding the usable key would
+  // be worse than trusting it — the report says which store it came from.
+  if (auth[id]?.key) return { state: "value", key: auth[id].key, where: AUTH, from: "auth.json" };
   if (authInDb) {
     const creds = dbCredentials();
     if (creds === null) return { state: "unknown", key: null, where: authBackend.dbPath };
@@ -140,6 +171,7 @@ function dbCredentials() {
 }
 // short label for reports
 export function credentialLabel(c) {
+  if (c.state === "value" && c.from === "config") return "key (config)";
   if (c.state === "value") return authInDb ? "key (auth.json, may be stale)" : "key";
   if (c.state === "stored") return c.type && c.type !== "unknown" ? `key (${c.type}, in opencode db)` : "key (in opencode db)";
   if (c.state === "unknown") return "unknown (a database is present; the opencode CLI cannot list credentials)";
@@ -229,7 +261,10 @@ Files:
   config   $OPENCODE_CONFIG_DIR or ~/.config/opencode — first existing of
            opencode.jsonc, opencode.json, config.json (same discovery as
            OpenCode itself; override with PS_CONFIG=/path/to/file)
-  keys     ~/.local/share/opencode/auth.json   API keys, one per provider id
+  keys     provider.<id>.options.apiKey         API keys — written into the
+           provider entry of your own config; OpenCode sends it as the bearer
+           token. OpenCode's own stores (auth.json on 1.x, opencode.db on 2.x)
+           are read-only for provider-sync: presence is reported, never changed
   hermes   ~/.hermes/config.yaml               custom_providers (if installed)
            ~/.hermes/.env                      key source for Hermes providers
 
@@ -250,7 +285,8 @@ Commands:
       added, server-authoritative ctx/modalities applied; configured values
       are kept when the server reports nothing. Re-running add against a
       moved server re-points baseURL and reconciles the model list.
-      Key resolution: --key K > existing auth.json key for <id>. For an
+      Key resolution: --key K > the key already in the provider entry for <id>
+      > OpenCode's own store (auth.json / database). For an
       Unsloth UI with neither, pass --username U --password P: provider-sync logs in
       and creates (and stores) a persistent API key named after <id>.
       On a machine without an OpenCode config the file is created (first
@@ -264,8 +300,9 @@ Commands:
       what was skipped, and which of the two reasons it was.
       Options:
         --name N          display name (default: existing value, else <id>)
-        --key K           API key; stored to auth.json under <id>, and
-                          written into the hermes entry as a literal api_key
+        --key K           API key; stored into the provider entry in your
+                          config (apiKey), and written into the hermes entry as
+                          a literal api_key
                           (dummy when the server needs no auth)
         --username U      Unsloth UI login (together with --password P)
         --password P
@@ -341,7 +378,7 @@ thinking-style ids (qwen3.5+, qwen4, muse-glimmer, *thinking*).
 Hermes key resolution, first match wins:
   1. literal api_key in the entry (unless it is a placeholder like "dummy")
   2. \${ENV_VAR} in api_key or a key_env field — read from ~/.hermes/.env
-  3. borrowed from auth.json of an opencode provider pointing at the same
+  3. borrowed from an opencode provider whose config entry has the same
      server URL (localhost and 127.0.0.1 count as the same host)
 
 Safety:
@@ -624,7 +661,8 @@ function hermesKeySource(e, ocCfg, ocAuth) {
     return e.api_key.startsWith("${") && e.api_key.endsWith("}") ? "key (env)" : "key";
   if (e.key_env) return hermesEnv()[e.key_env] ? "key (env)" : `no-key (${e.key_env} is unset in ~/.hermes/.env)`;
   for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-    if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && ocAuth[pid]?.key) return `key (borrowed from ${pid})`;
+    if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && (configApiKey(ocCfg, pid) || ocAuth[pid]?.key))
+      return `key (borrowed from ${pid})`;
   if (authInDb) {
     for (const [pid, p] of Object.entries(ocCfg.provider || {}))
       if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && credentialFor(pid, ocAuth).state === "stored")
@@ -799,7 +837,7 @@ async function cmdSetCtx(pid) {
   const p = cfg.provider[pid];
   if (!p) die(`unknown provider "${pid}" (see provider-sync list)`);
   const base = p.options?.baseURL;
-  const own = credentialFor(pid);
+  const own = credentialFor(pid, loadAuth(), cfg);
   const key = own.key || flags.key || null;
   const pr = await probeCached(base, key);
   if (pr.kind === "auth" && own.state !== "value")
@@ -854,7 +892,7 @@ function cmdList() {
       for (const id of ids) {
         const p = cfg.provider[id];
         const n = Object.keys(p.models || {}).length;
-        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${credentialLabel(credentialFor(id, auth))}`);
+        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${credentialLabel(credentialFor(id, auth, cfg))}`);
       }
     }
   }
@@ -881,10 +919,12 @@ function cmdList() {
 async function cmdAdd(id, url) {
   const base = v1Of(url);
   const a = loadAuth();
-  let key = flags.key || a[id]?.key || null; // persisted key
+  let key = flags.key || configApiKey(existsSync(CFG) ? loadCfg() : null, id) || a[id]?.key || null; // stored key
   const pr = await probeCached(base, key);
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
-  if (pr.kind === "auth") die(`${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
+  if (pr.kind === "auth")
+    die(key ? `${base} rejected the supplied key (HTTP 401) — check the server's api key, nothing was written`
+            : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
   let runKey = key; // credential used for this run's requests
   if (pr.kind === "unsloth" && !runKey && flags.username && flags.password) {
     const r = await req(pr.root + "/api/auth/login", { method: "POST", body: { username: flags.username, password: flags.password } });
@@ -927,6 +967,11 @@ async function cmdAdd(id, url) {
   const oldProv = cfg.provider[id] || {};
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
   const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes });
+  // --key stores a literal secret; --key-env stores a {env:VAR} reference so the
+  // secret stays out of a file that people commit
+  const keyEnv = flags["key-env"];
+  const keyValue = key ? key : keyEnv ? `{env:${keyEnv}}` : null;
+  const keyWhere = keyValue ? [`provider.${id}.options.apiKey`] : [];
   const prov = {
     ...oldProv, // preserve any user-added provider-level fields
     name: flags.name || oldProv.name || id,
@@ -944,7 +989,7 @@ async function cmdAdd(id, url) {
   for (const nt of notes) console.log("  note: " + nt);
 
   const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
-  const hkey = key || a[id]?.key || null;
+  const hkey = key || configApiKey(cfg, id) || a[id]?.key || null;
   const hmodel = flags.model || hmodels[0]?.id || null;
   const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
   const nModels = Object.keys(prov.models).length;
@@ -954,10 +999,8 @@ async function cmdAdd(id, url) {
     : `skipped — ${ocWhy}`;
   const keysLine = (verb) => {
     if (!wantOc) return `skipped — ${ocWhy}`;
-    if (!key) return "no change (no --key)";
-    // 2.x writes credentials to sqlite through its own interactive flow only
-    if (authInDb) return `not written by provider-sync — run: ${loginCommand(id)}`;
-    return `api key for "${id}"${verb ? ", " + verb : ""}`;
+    if (!keyValue) return "no change (no --key)";
+    return `api key for "${id}" in ${disp(CFG)} ${keyWhere.join(" + ")}${verb ? ", " + verb : ""}`;
   };
   const hermesLine = (r, verb) => {
     if (!wantH) return `skipped — ${hWhy}`;
@@ -970,25 +1013,33 @@ async function cmdAdd(id, url) {
   if (flags["dry-run"]) {
     console.log("dry-run: nothing written. Would write:");
     console.log(`  opencode  ${disp(CFG)}  ${ocLine("would be written")}`);
-    console.log(`  keys      ${disp(AUTH)}  ${keysLine("would be written")}`);
+    console.log(`  keys      ${keyValue ? disp(CFG) : disp(AUTH)}  ${keysLine("would be written")}`);
     console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "would be ")}`);
     return;
   }
   if (wantOc) {
+    if (keyValue) storeConfigApiKey(cfg, id, keyValue); // before the write, not after
     saveCfg(cfg);
     if (fresh) console.log(`created ${CFG}`);
-    if (key && !authInDb && a[id]?.key !== key) { a[id] = { type: "api", key }; saveAuth(a); }
-    if (reportValidate(cfg)) console.log(`OK — ${nModels} models in ${id}`);
-    if (key && authInDb) console.log(`note: provider-sync did not store the key; OpenCode keeps credentials in ${disp(authBackend.dbPath || "its database")}`);
-    else if (key && !hadAuthFile)
-      console.log(`note: no OpenCode credential store was found (no database, no auth.json), so the key went to the legacy ${disp(AUTH)} — on OpenCode 2.x and newer, store it with \`${loginCommand(id)}\``);
+    if (!reportValidate(cfg)) process.exitCode = 1;
+    else console.log(`OK — ${nModels} models in ${id}`);
+    if (keyValue) {
+      // read the file back: a key we cannot see in the file is a key OpenCode
+      // cannot use, and claiming success would be a lie
+      const back = configApiKey(loadCfg(), id);
+      if (back !== keyValue) {
+        console.log(`ERROR: the key did not land in ${disp(CFG)} — provider-sync cannot claim it is stored`);
+        process.exitCode = 1;
+      } else if (authInDb)
+        console.log(`note: stored in the config instead of ${disp(authBackend.dbPath || "the database")}: OpenCode 2.x keeps its own credentials in that database and this build cannot write it without an interactive login`);
+    }
   }
   if (wantH)
     try { hres = hermesUpsert({ ...hargs, dryRun: false }); }
     catch (e) { hres = { status: "error", why: `cannot write ${disp(HERMES_CFG)}: ${e.message}` }; }
   console.log("written:");
   console.log(`  opencode  ${disp(CFG)}  ${ocLine("")}`);
-  console.log(`  keys      ${disp(AUTH)}  ${keysLine("")}`);
+  console.log(`  keys      ${keyValue ? disp(CFG) : disp(AUTH)}  ${keysLine("")}`);
   console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "")}`);
 }
 
@@ -1015,7 +1066,7 @@ async function cmdSync() {
     const rs = await Promise.all(ids.map(async (id) => {
       const base = cfg.provider[id].options?.baseURL;
       if (!base) return { id, err: "no baseURL in config" };
-      const own = credentialFor(id, auth);
+      const own = credentialFor(id, auth, cfg);
       const key = own.key || flags.key || null; // a readable key, or one passed for this run
       const pr = await probeCached(base, key);
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
