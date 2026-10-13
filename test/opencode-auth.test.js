@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { detectBackend, parseCredentialList, defaultDbPath, loginCommand } from "../lib/opencode-auth.js";
-import { configApiKey, storeConfigApiKey } from "../bin/provider-sync.js";
+import { configApiKey, configApiKeyPaths, storeConfigApiKey } from "../bin/provider-sync.js";
 import { runCliAsyncP, flat } from "./helpers.js";
 const loadCfgIn = (home) => JSON.parse(readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8"));
 
@@ -168,8 +168,14 @@ test("both config schemas round-trip a key", () => {
   assert.deepEqual(storeConfigApiKey(v1, "a", "K"), ["provider.a.options.apiKey"]);
   assert.equal(configApiKey(v1, "a"), "K");
   const v2 = { providers: { b: { settings: {} } } };
-  assert.ok(storeConfigApiKey(v2, "b", "K").includes("providers.b.settings.apiKey"));
+  assert.deepEqual(storeConfigApiKey(v2, "b", "K"), ["providers.b.settings.apiKey"],
+    "a 2.x-only config must get the 2.x path and no 1.x entry");
   assert.equal(configApiKey(v2, "b"), "K");
+  // the path shown in the report is the path actually written
+  assert.deepEqual(configApiKeyPaths(v2, "b"), storeConfigApiKey(v2, "b", "K"));
+  const mixed = { provider: {}, providers: { c: { settings: {} } } };
+  assert.deepEqual(configApiKeyPaths(mixed, "c"), ["providers.c.settings.apiKey", "provider.c.options.apiKey"]);
+  assert.deepEqual(storeConfigApiKey(mixed, "c", "K"), configApiKeyPaths(mixed, "c"));
 });
 
 test("a mixed install still uses the readable key and says it may be stale", { skip: process.platform === "win32" }, async () => {

@@ -7,7 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { detectBackend, listCredentials, loginCommand } from "../lib/opencode-auth.js";
+import { detectBackend, listCredentials } from "../lib/opencode-auth.js";
 import { createHash } from "node:crypto";
 
 // config file resolution mirrors OpenCode's own discovery (config.ts):
@@ -131,22 +131,26 @@ export function configApiKey(cfg, id) {
   if (typeof v2 === "string" && v2) return v2;
   return null;
 }
-export function storeConfigApiKey(cfg, id, key) {
-  const where = [];
+export function configApiKeyPaths(cfg, id) {
   // a config that only has `providers` is a 2.x config: write its shape, not 1.x's
   const v2only = Boolean(cfg.providers) && !cfg.provider;
-  if (cfg.providers) {
-    cfg.providers[id] = cfg.providers[id] || {};
-    cfg.providers[id].settings = { ...(cfg.providers[id].settings || {}), apiKey: key };
-    where.push(`providers.${id}.settings.apiKey`);
-  }
-  if (!v2only) {
-    cfg.provider = cfg.provider || {};
-    cfg.provider[id] = cfg.provider[id] || {};
-    cfg.provider[id].options = { ...(cfg.provider[id].options || {}), apiKey: key };
-    where.push(`provider.${id}.options.apiKey`);
-  }
+  const where = [];
+  if (cfg.providers) where.push(`providers.${id}.settings.apiKey`);
+  if (!v2only) where.push(`provider.${id}.options.apiKey`);
   return where;
+}
+export function storeConfigApiKey(cfg, id, key) {
+  for (const path of configApiKeyPaths(cfg, id)) {
+    if (path.startsWith("providers.")) {
+      cfg.providers[id] = cfg.providers[id] || {};
+      cfg.providers[id].settings = { ...(cfg.providers[id].settings || {}), apiKey: key };
+    } else {
+      cfg.provider = cfg.provider || {};
+      cfg.provider[id] = cfg.provider[id] || {};
+      cfg.provider[id].options = { ...(cfg.provider[id].options || {}), apiKey: key };
+    }
+  }
+  return configApiKeyPaths(cfg, id);
 }
 export function credentialFor(id, auth = loadAuth(), cfg = null) {
   const ck = configApiKey(cfg, id);
@@ -962,7 +966,6 @@ async function cmdAdd(id, url) {
     : target === "opencode" ? "not selected (--target opencode)"
     : wantH ? "" : "hermes is not installed here";
   const fresh = wantOc && !existsSync(CFG);
-  const hadAuthFile = existsSync(AUTH); // read before any write below
   const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
   const oldProv = cfg.provider[id] || {};
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
@@ -971,7 +974,7 @@ async function cmdAdd(id, url) {
   // secret stays out of a file that people commit
   const keyEnv = flags["key-env"];
   const keyValue = key ? key : keyEnv ? `{env:${keyEnv}}` : null;
-  const keyWhere = keyValue ? [`provider.${id}.options.apiKey`] : [];
+  const keyWhere = keyValue ? configApiKeyPaths(cfg, id) : [];
   const prov = {
     ...oldProv, // preserve any user-added provider-level fields
     name: flags.name || oldProv.name || id,
