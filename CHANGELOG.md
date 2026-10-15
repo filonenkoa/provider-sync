@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.1.1 — 2026-10-15
 
 ### Fixed
 - `add --key K` now stores the key in the provider entry of your own config
@@ -20,6 +20,12 @@ Format: [semver](https://semver.org). Dates are ISO.
   the key you passed, instead of asking for `--key` you already gave.
 - A readable key in the config or `auth.json` is never hidden by the presence of a
   2.x database; `list` labels where it came from.
+- OpenCode 2.x is detected from the filesystem (`OPENCODE_DB`, the documented
+  default, or any `*.db` in the data directory) instead of
+  `opencode debug paths db`, which itself creates `~/.cache`, `~/.config` and
+  `~/.local/share/opencode`. Presence is reported, stored values never are.
+- The `keys` line of `add` now names the config path the key is really written to,
+  including the 2.x `providers.<id>.settings.apiKey` shape.
 
 
 ## 1.1.0 — 2026-10-03
