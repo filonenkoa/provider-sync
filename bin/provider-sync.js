@@ -152,9 +152,29 @@ export function storeConfigApiKey(cfg, id, key) {
   }
   return configApiKeyPaths(cfg, id);
 }
+// `{env:VAR}` in an apiKey is resolved by OpenCode from its own environment at
+// startup; provider-sync probes servers directly, so it must resolve the same
+// reference itself — sending the literal string would fail with 401.
+export const envRef = (k) => {
+  const m = typeof k === "string" && /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(k);
+  return m ? m[1] : null;
+};
+// the key to actually send: a {env:VAR} reference becomes its value (null when
+// the variable is not set here); any other key passes through unchanged
+export const derefKey = (k) => {
+  const ref = envRef(k);
+  if (ref === null) return k ?? null;
+  return process.env[ref] || null;
+};
 export function credentialFor(id, auth = loadAuth(), cfg = null) {
   const ck = configApiKey(cfg, id);
-  if (ck) return { state: "value", key: ck, where: CFG, from: "config" };
+  if (ck) {
+    const usable = derefKey(ck);
+    // the config holds an {env:VAR} reference that is unset here: the key
+    // exists on paper only, and "no-key" would hide the real cause
+    if (!usable) return { state: "unresolved", key: null, where: CFG, from: "config", ref: ck };
+    return { state: "value", key: usable, where: CFG, from: "config" };
+  }
   // a readable value always wins over a store we cannot read: on a machine with
   // both a 1.x-style file and a 2.x-style database, hiding the usable key would
   // be worse than trusting it — the report says which store it came from.
@@ -179,6 +199,7 @@ export function credentialLabel(c) {
   if (c.state === "value") return authInDb ? "key (auth.json, may be stale)" : "key";
   if (c.state === "stored") return c.type && c.type !== "unknown" ? `key (${c.type}, in opencode db)` : "key (in opencode db)";
   if (c.state === "unknown") return "unknown (a database is present; the opencode CLI cannot list credentials)";
+  if (c.state === "unresolved") return `no-key (${c.ref} is unset in this environment)`;
   return "no-key";
 }
 export const loadAuth = () => {
@@ -308,6 +329,10 @@ Commands:
                           config (apiKey), and written into the hermes entry as
                           a literal api_key
                           (dummy when the server needs no auth)
+        --key-env VAR     store the key as an {env:VAR} reference instead of
+                          the literal secret, so a config that lives in version
+                          control stays clean; resolved from the environment
+                          when provider-sync probes the server
         --username U      Unsloth UI login (together with --password P)
         --password P
         --model M         model written into the hermes entry's model:
@@ -383,16 +408,18 @@ Hermes key resolution, first match wins:
   1. literal api_key in the entry (unless it is a placeholder like "dummy")
   2. \${ENV_VAR} in api_key or a key_env field — read from ~/.hermes/.env
   3. borrowed from an opencode provider whose config entry has the same
-     server URL (localhost and 127.0.0.1 count as the same host)
+     server URL (localhost and 127.0.0.1 count as the same host); a
+     {env:VAR} reference there is resolved from the environment, and
+     --key-env stores it as a hermes key_env instead of the literal key
 
 Safety:
   - every write is atomic (tmp file + fsync + rename) and preceded by a
     .bak-provider-sync-* backup; only the last 3 backups per file are kept
   - the config file is validated after each write; the hermes config is
     re-read and rolled back from its backup if it no longer parses
-  - writing commands (add, sync --apply, set-ctx) take an exclusive lock
-    (~/.config/opencode/.provider-sync.lock), so two runs cannot interleave;
-    read-only commands never take it
+  - writing commands (add, sync --apply, set-ctx) take an exclusive lock in
+    the system temp directory (keyed by the config directory), so two runs
+    cannot interleave; read-only commands never take it
   - on errors nothing is reported as written and provider-sync exits non-zero
 
 Examples:
@@ -502,7 +529,7 @@ export async function fetchModels(pr, base, key) {
   }
   if (pr.kind === "unsloth") {
     const r = await req(v1Of(base) + "/models", { key });
-    if (r.status === 401) throw new Error("401: no valid API key in auth.json (provider-sync add <id> <url> --username U --password P)");
+    if (r.status === 401) throw new Error("401: the server rejected the API key (provider-sync add <id> <url> --key K, or --username U --password P to create one)");
     if (r.status !== 200) throw new Error("/v1/models HTTP " + r.status);
     return (r.json?.data || []).map((m) => ({ id: m.id, ctx: nz(m.context_length), input: null }));
   }
@@ -646,16 +673,24 @@ const disp = (p) => (typeof p === "string" && p.startsWith(os.homedir()) ? "~" +
 
 
 // key for a hermes custom provider: literal api_key / ${ENV} / key_env from
-// ~/.hermes/.env, else borrow the opencode key of a provider on the same server
+// ~/.hermes/.env, else borrow the opencode key of a provider on the same
+// server — from the provider's config entry (where `add --key` stores it since
+// 1.1.1) or auth.json, with {env:VAR} references resolved. Returns { key } when
+// a usable key was found, { key: null, ref, from } when the only candidate is
+// an unset {env:VAR}, else { key: null }.
 function hermesKey(e, ocCfg, ocAuth) {
   if (e.api_key && e.api_key !== "dummy") {
-    if (e.api_key.startsWith("${") && e.api_key.endsWith("}")) return hermesEnv()[e.api_key.slice(2, -1)] || null;
-    return e.api_key;
+    if (e.api_key.startsWith("${") && e.api_key.endsWith("}")) return { key: hermesEnv()[e.api_key.slice(2, -1)] || null };
+    return { key: e.api_key };
   }
-  if (e.key_env) return hermesEnv()[e.key_env] || null;
+  if (e.key_env) return { key: hermesEnv()[e.key_env] || null };
   for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-    if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && ocAuth[pid]?.key) return ocAuth[pid].key;
-  return null;
+    if (normUrl(p.options?.baseURL) === normUrl(e.base_url)) {
+      const c = credentialFor(pid, ocAuth, ocCfg);
+      if (c.key) return { key: c.key };
+      if (c.state === "unresolved") return { key: null, ref: c.ref, from: pid };
+    }
+  return { key: null };
 }
 
 // where a hermes entry gets its key from; shown by `list` so that "no-key"
@@ -665,8 +700,11 @@ function hermesKeySource(e, ocCfg, ocAuth) {
     return e.api_key.startsWith("${") && e.api_key.endsWith("}") ? "key (env)" : "key";
   if (e.key_env) return hermesEnv()[e.key_env] ? "key (env)" : `no-key (${e.key_env} is unset in ~/.hermes/.env)`;
   for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-    if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && (configApiKey(ocCfg, pid) || ocAuth[pid]?.key))
-      return `key (borrowed from ${pid})`;
+    if (normUrl(p.options?.baseURL) === normUrl(e.base_url)) {
+      const c = credentialFor(pid, ocAuth, ocCfg);
+      if (c.state === "value") return `key (borrowed from ${pid})`;
+      if (c.state === "unresolved") return `no-key (${c.ref} from ${pid} is unset)`;
+    }
   if (authInDb) {
     for (const [pid, p] of Object.entries(ocCfg.provider || {}))
       if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && credentialFor(pid, ocAuth).state === "stored")
@@ -718,6 +756,9 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
   const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
   if (!h) return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };
   const n = models.length;
+  // `{env:VAR}` is OpenCode's syntax; Hermes reads `key_env` from
+  // ~/.hermes/.env, so an env reference is translated instead of copied
+  const ref = envRef(key);
   const found = h.entries.find((e) => normUrl(e.base_url) === normUrl(base));
   if (found) {
     if (found.flow)
@@ -725,7 +766,11 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
     if (dryRun) return { status: "updated", name: found.name, n };
     const lines = h.lines.slice();
     hermesSetModels(lines, found, models);
-    if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
+    if (ref) {
+      if (found.key_env !== ref) hermesSetField(lines, found, "key_env", ref);
+      // a live literal key would shadow key_env on Hermes' side
+      if (found.api_key && found.api_key !== "dummy") hermesSetField(lines, found, "api_key", "dummy");
+    } else if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
     writeHermesCfg(lines, h.eol, { entries: h.entries.length, models: [{ base, ids: models.map((m) => m.id) }] });
     return { status: "updated", name: found.name, n };
   }
@@ -739,7 +784,8 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
   const block = [
     `${ind(li)}- name: ${yq(name)}`,
     `${ind(fi)}base_url: ${yq(base)}`,
-    `${ind(fi)}api_key: ${key ? yq(key) : "dummy"}`,
+    `${ind(fi)}api_key: ${!ref && key ? yq(key) : "dummy"}`,
+    ...(ref ? [`${ind(fi)}key_env: ${ref}`] : []),
     ...(model ? [`${ind(fi)}model: ${yq(model)}`] : []),
     `${ind(fi)}models:`,
     ...renderModels(models, fi + 2, fi + 4),
@@ -767,10 +813,10 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   const rs = await Promise.all(h.entries.map(async (e) => {
     if (e.flow) return { e, skip: "flow-style entry (one line in braces) — listed, never rewritten" };
     if (!e.base_url) return { e, skip: "no base_url" };
-    const key = hermesKey(e, ocCfg, ocAuth);
+    const { key, ref, from } = hermesKey(e, ocCfg, ocAuth);
     const pr = await probeCached(e.base_url, key);
     if (pr.kind === "offline") return { e, offline: pr.error || "HTTP " + pr.status };
-    if (pr.kind === "auth") return { e, badauth: true };
+    if (pr.kind === "auth") return { e, badauth: true, unsetRef: ref, refFrom: from };
     try { return { e, kind: pr.kind, server: await fetchModels(pr, e.base_url, key) }; }
     catch (err) { return { e, err: err.message }; }
   }));
@@ -779,7 +825,12 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   for (const r of rs) {
     if (r.skip) { console.log(`  ${r.e.name}: ${r.skip} — skipped`); continue; }
     if (r.offline) { console.log(`  ${r.e.name} (${r.e.base_url}): OFFLINE (${r.offline}) — skipped`); continue; }
-    if (r.badauth) { console.log(`  ${r.e.name} (${r.e.base_url}): AUTH 401 — key missing or invalid`); continue; }
+    if (r.badauth) {
+      console.log(r.unsetRef
+        ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is ${r.unsetRef} (from ${r.refFrom}), which is not set in this environment`
+        : `  ${r.e.name} (${r.e.base_url}): AUTH 401 — key missing or invalid`);
+      continue;
+    }
     if (r.err) { console.log(`  ${r.e.name} (${r.e.base_url}): ERROR — ${r.err}`); continue; }
     const e = r.e;
     const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
@@ -845,7 +896,11 @@ async function cmdSetCtx(pid) {
   const key = own.key || flags.key || null;
   const pr = await probeCached(base, key);
   if (pr.kind === "auth" && own.state !== "value")
-    die(`${base} needs a key that provider-sync cannot read (OpenCode ${authInDb ? "keeps credentials in its database" : "has none for " + pid})
+    die(flags.key ? `${base} rejected the supplied key (HTTP 401) — check it, nothing has been written`
+      : own.state === "unresolved"
+        ? `${base} requires auth — the key in the config is ${own.ref}, which is not set in this environment
+export it or pass it for this run: provider-sync set-ctx ${pid} --key K`
+        : `${base} needs a key that provider-sync cannot read (OpenCode ${authInDb ? "keeps credentials in its database" : "has none for " + pid})
 pass it for this run: provider-sync set-ctx ${pid} --key K`);
   if (pr.kind === "offline" || pr.kind === "auth") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   let server;
@@ -923,13 +978,24 @@ function cmdList() {
 async function cmdAdd(id, url) {
   const base = v1Of(url);
   const a = loadAuth();
-  let key = flags.key || configApiKey(existsSync(CFG) ? loadCfg() : null, id) || a[id]?.key || null; // stored key
-  const pr = await probeCached(base, key);
+  // validate before anything is probed or stored: a bad name would become an
+  // {env:...} reference nothing can resolve
+  const keyEnv = flags["key-env"];
+  if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv))
+    die(`--key-env needs an environment variable name, got "${keyEnv}"`);
+  const storedCfg = existsSync(CFG) ? loadCfg() : null;
+  const storedKey = configApiKey(storedCfg, id); // raw: may be a {env:VAR} reference
+  let key = flags.key || storedKey || a[id]?.key || null; // the key to keep/store
+  // probe with the literal --key, the stored key with {env:VAR} resolved from
+  // this environment, or the value --key-env names when it is set here
+  const probeKey = derefKey(key) || (keyEnv ? derefKey(`{env:${keyEnv}}`) : null);
+  const pr = await probeCached(base, probeKey);
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   if (pr.kind === "auth")
-    die(key ? `${base} rejected the supplied key (HTTP 401) — check the server's api key, nothing was written`
-            : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
-  let runKey = key; // credential used for this run's requests
+    die(probeKey ? `${base} rejected the supplied key (HTTP 401) — check the server's api key, nothing was written`
+        : key ? `${base} requires auth — the stored key is ${key}, which is not set in this environment; export it or pass --key K`
+        : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
+  let runKey = probeKey; // credential used for this run's requests
   if (pr.kind === "unsloth" && !runKey && flags.username && flags.password) {
     const r = await req(pr.root + "/api/auth/login", { method: "POST", body: { username: flags.username, password: flags.password } });
     const tok = r.json?.access_token;
@@ -972,7 +1038,6 @@ async function cmdAdd(id, url) {
   const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes });
   // --key stores a literal secret; --key-env stores a {env:VAR} reference so the
   // secret stays out of a file that people commit
-  const keyEnv = flags["key-env"];
   const keyValue = key ? key : keyEnv ? `{env:${keyEnv}}` : null;
   const keyWhere = keyValue ? configApiKeyPaths(cfg, id) : [];
   const prov = {
@@ -992,7 +1057,9 @@ async function cmdAdd(id, url) {
   for (const nt of notes) console.log("  note: " + nt);
 
   const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
-  const hkey = key || configApiKey(cfg, id) || a[id]?.key || null;
+  // the raw value matters here: {env:VAR} stays a reference, which hermesUpsert
+  // turns into key_env instead of copying OpenCode's syntax
+  const hkey = key || configApiKey(cfg, id) || a[id]?.key || keyValue;
   const hmodel = flags.model || hmodels[0]?.id || null;
   const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
   const nModels = Object.keys(prov.models).length;
@@ -1074,7 +1141,8 @@ async function cmdSync() {
       const pr = await probeCached(base, key);
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
       if (pr.kind === "auth")
-        return { id, badauth: true, unreadable: own.state === "stored" || own.state === "unknown" };
+        return { id, badauth: true, unreadable: own.state === "stored" || own.state === "unknown",
+                 unsetRef: own.state === "unresolved" ? own.ref : null };
       try { return { id, kind: pr.kind, base, server: await fetchModels(pr, base, key) }; }
       catch (e) { return { id, err: e.message }; }
     }));
@@ -1082,9 +1150,11 @@ async function cmdSync() {
     for (const r of rs) {
       if (r.offline) { console.log(`${r.id}: OFFLINE (${r.offline}) — skipped`); continue; }
       if (r.badauth) {
-        console.log(r.unreadable
-          ? `${r.id}: AUTH 401 — its key is in OpenCode's database and cannot be read here; pass --key K to check this server`
-          : `${r.id}: AUTH 401 — key missing or invalid`);
+        console.log(r.unsetRef
+          ? `${r.id}: AUTH 401 — its key is ${r.unsetRef}, which is not set in this environment; export it or pass --key K`
+          : r.unreadable
+            ? `${r.id}: AUTH 401 — its key is in OpenCode's database and cannot be read here; pass --key K to check this server`
+            : `${r.id}: AUTH 401 — key missing or invalid`);
         continue;
       }
       if (r.err) { console.log(`${r.id}: ERROR — ${r.err}`); continue; }

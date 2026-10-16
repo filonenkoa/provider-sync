@@ -65,6 +65,27 @@ test("matches by base url so re-running updates instead of duplicating", () => {
   assert.doesNotMatch(out, /- name: Second/);
 });
 
+test("an {env:VAR} key becomes key_env, never the opencode reference", () => {
+  write(BASE);
+  const r = hermesUpsert({ name: "EnvRef", base: "http://10.0.0.11:64980/v1", key: "{env:MY_KEY}", model: "tiny", models: MODELS, dryRun: false });
+  assert.equal(r.status, "created");
+  const out = read();
+  assert.match(out, /key_env: MY_KEY/);
+  assert.match(out, /api_key: dummy/);
+  assert.doesNotMatch(out, /\{env:/, "the opencode-specific reference must not leak into hermes");
+});
+
+test("switching an entry to key_env clears the literal key that would shadow it", () => {
+  write(BASE);
+  hermesUpsert({ name: "Existing", base: "http://127.0.0.1:8080/v1", key: "old-secret", model: "tiny", models: MODELS, dryRun: false });
+  assert.match(read(), /api_key: old-secret/);
+  hermesUpsert({ name: "Existing", base: "http://127.0.0.1:8080/v1", key: "{env:MY_KEY}", model: "tiny", models: MODELS, dryRun: false });
+  const out = read();
+  assert.match(out, /key_env: MY_KEY/);
+  assert.match(out, /api_key: dummy/);
+  assert.doesNotMatch(out, /old-secret/);
+});
+
 test("localhost and 127.0.0.1 are the same server, so no duplicate appears", () => {
   write(BASE);
   hermesUpsert({ name: "Localhost", base: "http://localhost:8080/v1", key: null, model: "tiny", models: MODELS, dryRun: false });

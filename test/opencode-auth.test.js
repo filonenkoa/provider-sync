@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { detectBackend, parseCredentialList, defaultDbPath, loginCommand } from "../lib/opencode-auth.js";
-import { configApiKey, configApiKeyPaths, storeConfigApiKey } from "../bin/provider-sync.js";
+import { configApiKey, configApiKeyPaths, storeConfigApiKey, derefKey } from "../bin/provider-sync.js";
 import { runCliAsyncP, flat } from "./helpers.js";
 const loadCfgIn = (home) => JSON.parse(readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8"));
 
@@ -63,6 +63,17 @@ test("any *.db in the data directory means 2.x, whichever release channel", () =
 
 test("the documented store command is the one we tell users to run", () => {
   assert.equal(loginCommand("myprov"), "opencode auth login myprov --method key");
+});
+
+test("derefKey resolves {env:VAR} from the process environment", () => {
+  process.env.PS_TEST_DEREF = "v";
+  try {
+    assert.equal(derefKey("{env:PS_TEST_DEREF}"), "v");
+    assert.equal(derefKey("{env:PS_TEST_UNSET_XYZ}"), null, "an unset variable is not a key");
+    assert.equal(derefKey("literal"), "literal");
+    assert.equal(derefKey(null), null);
+    assert.equal(derefKey("{env:not a name}"), "{env:not a name}", "not a reference: passes through");
+  } finally { delete process.env.PS_TEST_DEREF; }
 });
 
 // ---------- end to end against a fake opencode 2.x ----------
@@ -207,4 +218,35 @@ test("detecting the backend must not create directories in the home", { skip: pr
   await withFakeOpencode(home, ["list"]);
   assert.equal(existsSync(path.join(home, ".local")), false, "no ~/.local created by detection");
   assert.equal(existsSync(path.join(home, ".cache")), false, "no ~/.cache created by detection");
+});
+
+test("an {env:VAR} config key is resolved from the environment when probing", async () => {
+  const srv = http.createServer((q, s) => {
+    if (q.url === "/v1/models" && q.headers.authorization === "Bearer SECRET") {
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ data: [{ id: "m1", context_length: 4096 }] }));
+    } else {
+      s.statusCode = 401;
+      s.end("{}");
+    }
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const u = `http://127.0.0.1:${srv.address().port}/v1`;
+    const home = homeWith({
+      ".config/opencode/opencode.jsonc": `{
+  "provider": {
+    "envp": { "options": { "baseURL": "${u}", "apiKey": "{env:PS_TEST_SYNC_KEY}" }, "models": { "m1": { "limit": { "context": 4096, "output": 1024 } } } }
+  }
+}
+`,
+    });
+    // with the variable set, sync authenticates and the provider is in sync
+    const ok = flat(await runCliAsyncP(home, ["sync", "--target", "opencode"], { PS_TEST_SYNC_KEY: "SECRET" }));
+    assert.match(ok, /in sync/);
+    assert.doesNotMatch(ok, /AUTH 401/);
+    // without it, the failure names the variable instead of misreporting the key
+    const miss = flat(await runCliAsyncP(home, ["sync", "--target", "opencode"]));
+    assert.match(miss, /AUTH 401 — its key is \{env:PS_TEST_SYNC_KEY\}, which is not set in this environment/);
+  } finally { srv.close(); }
 });

@@ -2,6 +2,28 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- `sync`/`add` borrow the OpenCode API key for a Hermes `custom_providers`
+  entry from the provider's **config entry** as well as `auth.json`. Since 1.1.1
+  that is where `add --key` stores it, but only `list` knew: a Hermes entry with
+  `api_key: dummy` was probed without a key and failed with `AUTH 401` while the
+  report claimed `key (borrowed from …)`.
+- `{env:VAR}` keys (stored by `--key-env`) are resolved from the environment
+  when provider-sync probes a server; previously the literal `{env:VAR}` went
+  out as the bearer token, so every check failed with `AUTH 401` even when the
+  variable was set. An unset variable is now reported as such instead of
+  "key missing or invalid".
+- `add --key-env` writes `key_env: VAR` into the Hermes entry instead of the
+  OpenCode-only `{env:VAR}` string, which Hermes cannot resolve; a live literal
+  `api_key` that would shadow the reference is replaced with `dummy`.
+- Docs: the writer lock lives in the system temp directory (keyed by the config
+  directory), not at `~/.config/opencode/.provider-sync.lock` (README and help);
+  the README install snippet shows the current version; `--key-env` is
+  documented in `help`; the Unsloth 401 message no longer points at `auth.json`
+  (keys live in the config entry since 1.1.1).
+
 ## 1.1.1 — 2026-10-15
 
 ### Fixed

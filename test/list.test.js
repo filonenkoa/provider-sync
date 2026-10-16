@@ -125,6 +125,27 @@ test("a key borrowed from opencode is labelled with its source", () => {
   assert.match(out, /Borrowed 1 models .* key \(borrowed from oc1\)/);
 });
 
+test("an unset {env:VAR} config key is not called a borrowable key", () => {
+  const out = list(homeWith({
+    ".config/opencode/opencode.jsonc": `{
+  "provider": { "oc1": { "options": { "baseURL": "http://10.0.0.1:1234/v1", "apiKey": "{env:PS_TEST_LIST_KEY}" }, "models": {} } }
+}
+`,
+    ".hermes/config.yaml": `custom_providers:
+  - name: Ref
+    base_url: http://10.0.0.1:1234/v1
+    api_key: dummy
+    models:
+      m:
+        context_length: 1
+`,
+  }));
+  // the opencode line and the hermes line must tell the same story: no usable key
+  assert.match(out, /oc1 0 models .* no-key \(\{env:PS_TEST_LIST_KEY\} is unset in this environment\)/);
+  assert.match(out, /Ref 1 models .* no-key \(\{env:PS_TEST_LIST_KEY\} from oc1 is unset\)/);
+  assert.doesNotMatch(out, /borrowed/);
+});
+
 test("an unset key_env is explained instead of a bare no-key", () => {
   const out = list(homeWith({
     ".hermes/config.yaml": `custom_providers:

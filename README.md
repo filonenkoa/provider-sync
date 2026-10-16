@@ -18,7 +18,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.0.0
+provider-sync --version   # 1.1.1
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:
@@ -46,7 +46,7 @@ provider-sync sync --apply    # apply drift: new/removed models, ctx, modalities
 | Command | What it does |
 | --- | --- |
 | `provider-sync list [--target all\|opencode\|hermes]` | Providers per harness — id/name, model count, base URL, key status (for Hermes also where the key comes from). A harness that is not installed is reported as `not found — skipped`, so Hermes-only and OpenCode-only machines both work |
-| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). A harness that is not installed is skipped, not created — `--target opencode` creates the OpenCode config anyway. Options: `--key`, `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--target`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
+| `provider-sync add <id> <baseURL>` | Register/update a provider (upsert) in **every installed harness**: OpenCode config + `custom_providers` in Hermes (matched by base URL, so re-running updates instead of duplicating). A harness that is not installed is skipped, not created — `--target opencode` creates the OpenCode config anyway. Options: `--key`, `--key-env VAR` (store `{env:VAR}` instead of the literal secret), `--username/--password` (Unsloth auto-login + API-key creation), `--model`, `--target`, `--no-hermes`, `--ctx N`, `--output N`, `--dry-run` |
 | `provider-sync sync [--apply] [--target all\|opencode\|hermes] [--provider ID]` | Check/apply drift between servers and config |
 | `provider-sync set-ctx <provider>` | Interactively re-ask context for models whose server reports none (needs a TTY) |
 | `provider-sync help` / `--version` | Full in-tool documentation / version |
@@ -78,7 +78,7 @@ Sync never clobbers already-configured values — re-ask them with `provider-syn
 
 Hermes entries written in **flow style** (one line inside `{...}`) are read and listed, but never rewritten — the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip such an entry and say so. Fields other than `name`/`base_url`/`api_key`/`key_env`/`model`/`models`/`models_discovered` (for example `discover_models` or `free_only`) are preserved untouched and not managed.
 
-Every write is atomic (tmp + fsync + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept); the Hermes config is re-read after writing and rolled back if it no longer parses. Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock at `~/.config/opencode/.provider-sync.lock`, so two runs can never interleave — read-only commands never take it. Writes report per target — file, what changed, and why anything was skipped:
+Every write is atomic (tmp + fsync + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept); the Hermes config is re-read after writing and rolled back if it no longer parses. Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock in the system temp directory (keyed by the config directory), so two runs can never interleave — read-only commands never take it. Writes report per target — file, what changed, and why anything was skipped:
 
 ```
 written:
