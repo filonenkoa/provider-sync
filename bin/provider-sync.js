@@ -33,6 +33,9 @@ const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 const die = (m) => { console.error("error: " + m); process.exit(1); };
 // parses ["--k","v"] and ["--k=v"]; boolean flags are the known no-value ones
 const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h", "version"]);
+// a typo must not be swallowed: `--targe=hermes` used to be ignored and the
+// default taken, which can write to a harness the user did not name
+const VALUE_FLAGS = new Set(["name", "key", "key-env", "username", "password", "model", "target", "ctx", "output", "provider"]);
 export function parseArgs(argv) {
   const flags = {};
   const pos = [];
@@ -41,9 +44,15 @@ export function parseArgs(argv) {
     if (a === "--") { pos.push(...argv.slice(i + 1)); break; }
     if (!a.startsWith("--")) { pos.push(a); continue; }
     const eq = a.indexOf("=");
-    if (eq > 2) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
-    const k = a.slice(2);
-    if (BOOL_FLAGS.has(k)) { flags[k] = true; continue; }
+    const k = eq > 2 ? a.slice(2, eq) : a.slice(2);
+    if (BOOL_FLAGS.has(k)) {
+      // `--apply=false` used to read as "apply": any non-empty string is truthy
+      if (eq > 2) die(`--${k} takes no value — drop the "=..."`);
+      flags[k] = true;
+      continue;
+    }
+    if (!VALUE_FLAGS.has(k)) die(`unknown flag "--${k}" — see provider-sync help`);
+    if (eq > 2) { flags[k] = a.slice(eq + 1); continue; }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) die(`--${k} needs a value`);
     flags[k] = argv[++i];
@@ -266,12 +275,14 @@ export const saveCfg = (c) => {
 };
 const saveAuth = (a) => saveJson(AUTH, a);
 
-// numeric flag: undefined stays undefined, anything non-numeric is an error
-const numFlag = (v) => {
+// numeric flag: undefined stays undefined; empty, non-numeric or below min is
+// an error instead of silently becoming 0 (which for --ctx means "omit")
+const numFlag = (v, min = 0) => {
   if (v === undefined) return undefined;
-  if (v === true) die("numeric flag needs a value");
+  if (v === true || v === "") die("numeric flag needs a value");
   const n = +v;
   if (!Number.isFinite(n)) die(`bad number "${v}"`);
+  if (n < min) die(`bad number "${v}" (must be >= ${min})`);
   return n;
 };
 
@@ -369,7 +380,9 @@ Commands:
       hermes-only and opencode-only machines work. Asking for a target
       explicitly (--target opencode / --provider ID) without an OpenCode
       config is still an error.
-      Options: --provider ID (opencode target only), --ctx N, --output N.
+      Options: --provider ID (opencode target only), --ctx N, --output N,
+      --key K (used for this run only — never stored), --dry-run (report
+      only; --dry-run always wins over --apply).
 
   provider-sync set-ctx <provider>
       Interactively re-ask the context window for every model whose server
@@ -377,7 +390,7 @@ Commands:
       best known value (trained window from server metadata when available,
       else a heuristic on the model id), number = use it, k = keep current,
       0 = omit the limit. Use this to fix guessed or stale values. Needs a
-      terminal. Options: --output N.
+      terminal. Options: --output N, --key K (this run only), --dry-run.
 
   provider-sync help
       Show this text (bare \`provider-sync\` prints it too and exits non-zero).
@@ -420,6 +433,9 @@ Safety:
   - writing commands (add, sync --apply, set-ctx) take an exclusive lock in
     the system temp directory (keyed by the config directory), so two runs
     cannot interleave; read-only commands never take it
+  - --dry-run never writes, in add, sync and set-ctx alike (with --apply on
+    the same line it still wins); an unknown flag or a value on a boolean flag
+    (--apply=false) is refused instead of guessed
   - on errors nothing is reported as written and provider-sync exits non-zero
 
 Examples:
@@ -676,21 +692,26 @@ const disp = (p) => (typeof p === "string" && p.startsWith(os.homedir()) ? "~" +
 // ~/.hermes/.env, else borrow the opencode key of a provider on the same
 // server — from the provider's config entry (where `add --key` stores it since
 // 1.1.1) or auth.json, with {env:VAR} references resolved. Returns { key } when
-// a usable key was found, { key: null, ref, from } when the only candidate is
-// an unset {env:VAR}, else { key: null }.
+// a usable key was found; when none is readable, the best explanation found on
+// the way: { key: null, ref, from } for an unset {env:VAR}, or
+// { key: null, dbKey: true, from } when it lives in OpenCode's database.
 function hermesKey(e, ocCfg, ocAuth) {
   if (e.api_key && e.api_key !== "dummy") {
     if (e.api_key.startsWith("${") && e.api_key.endsWith("}")) return { key: hermesEnv()[e.api_key.slice(2, -1)] || null };
     return { key: e.api_key };
   }
   if (e.key_env) return { key: hermesEnv()[e.key_env] || null };
+  let miss = null;
   for (const [pid, p] of Object.entries(ocCfg.provider || {}))
     if (normUrl(p.options?.baseURL) === normUrl(e.base_url)) {
       const c = credentialFor(pid, ocAuth, ocCfg);
-      if (c.key) return { key: c.key };
-      if (c.state === "unresolved") return { key: null, ref: c.ref, from: pid };
+      if (c.key) return { key: c.key }; // the first readable key wins
+      if (!miss) {
+        if (c.state === "unresolved") miss = { key: null, ref: c.ref, from: pid };
+        else if (c.state === "stored" || c.state === "unknown") miss = { key: null, dbKey: true, from: pid };
+      }
     }
-  return { key: null };
+  return miss || { key: null };
 }
 
 // where a hermes entry gets its key from; shown by `list` so that "no-key"
@@ -813,11 +834,15 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   const rs = await Promise.all(h.entries.map(async (e) => {
     if (e.flow) return { e, skip: "flow-style entry (one line in braces) — listed, never rewritten" };
     if (!e.base_url) return { e, skip: "no base_url" };
-    const { key, ref, from } = hermesKey(e, ocCfg, ocAuth);
-    const pr = await probeCached(e.base_url, key);
+    const { key, ref, from, dbKey } = hermesKey(e, ocCfg, ocAuth);
+    // --key stands in for this run when the stored key is unreadable (e.g. it
+    // lives in OpenCode's database) and is never stored
+    const runKey = key || flags.key || null;
+    const pr = await probeCached(e.base_url, runKey);
     if (pr.kind === "offline") return { e, offline: pr.error || "HTTP " + pr.status };
-    if (pr.kind === "auth") return { e, badauth: true, unsetRef: ref, refFrom: from };
-    try { return { e, kind: pr.kind, server: await fetchModels(pr, e.base_url, key) }; }
+    if (pr.kind === "auth")
+      return { e, badauth: true, unsetRef: ref, refFrom: from, dbKey, supplied: !key && !!flags.key };
+    try { return { e, kind: pr.kind, server: await fetchModels(pr, e.base_url, runKey) }; }
     catch (err) { return { e, err: err.message }; }
   }));
   const edits = [];
@@ -826,9 +851,13 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
     if (r.skip) { console.log(`  ${r.e.name}: ${r.skip} — skipped`); continue; }
     if (r.offline) { console.log(`  ${r.e.name} (${r.e.base_url}): OFFLINE (${r.offline}) — skipped`); continue; }
     if (r.badauth) {
-      console.log(r.unsetRef
-        ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is ${r.unsetRef} (from ${r.refFrom}), which is not set in this environment`
-        : `  ${r.e.name} (${r.e.base_url}): AUTH 401 — key missing or invalid`);
+      console.log(r.supplied
+        ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — the key passed with --key was rejected — check it`
+        : r.unsetRef
+          ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is ${r.unsetRef} (from ${r.refFrom}), which is not set in this environment`
+          : r.dbKey
+            ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is in OpenCode's database (from ${r.refFrom}) and cannot be read here; pass --key K to check this server`
+            : `  ${r.e.name} (${r.e.base_url}): AUTH 401 — key missing or invalid`);
       continue;
     }
     if (r.err) { console.log(`  ${r.e.name} (${r.e.base_url}): ERROR — ${r.err}`); continue; }
@@ -888,6 +917,7 @@ function reportValidate(cfg) {
 // interactively re-ask ctx for models the server doesn't report
 async function cmdSetCtx(pid) {
   if (!process.stdin.isTTY) die("set-ctx needs an interactive terminal");
+  const out = numFlag(flags.output, 1) ?? 65536;
   const cfg = loadCfg();
   const p = cfg.provider[pid];
   if (!p) die(`unknown provider "${pid}" (see provider-sync list)`);
@@ -906,7 +936,6 @@ pass it for this run: provider-sync set-ctx ${pid} --key K`);
   let server;
   try { server = await fetchModels(pr, base, key); } catch (e) { die(e.message); }
   const byId = Object.fromEntries(server.map((m) => [m.id, m]));
-  const out = numFlag(flags.output) ?? 65536;
   let changed = 0;
   for (const [mid, m] of Object.entries(p.models || {})) {
     const spec = byId[mid];
@@ -931,7 +960,10 @@ pass it for this run: provider-sync set-ctx ${pid} --key K`);
     else if (/^\d+$/.test(ans)) { m.limit = { context: parseInt(ans), output: m.limit?.output || out }; changed++; }
     else console.log(`  invalid "${ans}" — kept`);
   }
-  if (changed) { saveCfg(cfg); reportValidate(cfg); console.log(`updated ${changed} ctx value(s)`); }
+  if (changed) {
+    if (flags["dry-run"]) console.log(`dry-run: ${changed} ctx value(s) would be updated (nothing written)`);
+    else { saveCfg(cfg); reportValidate(cfg); console.log(`updated ${changed} ctx value(s)`); }
+  }
   else console.log("no changes");
 }
 
@@ -955,7 +987,7 @@ function cmdList() {
       }
     }
   }
-  if (authInDb) console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync never writes it and never shows a stored value${existsSync(AUTH) ? ", and an auth.json found here was imported at migration and may be stale" : ""}`);
+  if (authInDb && target !== "hermes") console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync never writes it and never shows a stored value${existsSync(AUTH) ? ", and an auth.json found here was imported at migration and may be stale" : ""}`);
   if (target !== "opencode") {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
@@ -983,6 +1015,9 @@ async function cmdAdd(id, url) {
   const keyEnv = flags["key-env"];
   if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv))
     die(`--key-env needs an environment variable name, got "${keyEnv}"`);
+  // validate numeric flags before anything is probed or stored
+  const out = numFlag(flags.output, 1) ?? 65536;
+  const ctxFlag = numFlag(flags.ctx);
   const storedCfg = existsSync(CFG) ? loadCfg() : null;
   const storedKey = configApiKey(storedCfg, id); // raw: may be a {env:VAR} reference
   let key = flags.key || storedKey || a[id]?.key || null; // the key to keep/store
@@ -1013,8 +1048,6 @@ async function cmdAdd(id, url) {
   try { server = await fetchModels(pr, base, runKey); } catch (e) { die(e.message); }
   if (!server.length) die("server returned 0 models");
 
-  const out = numFlag(flags.output) ?? 65536;
-  const ctxFlag = numFlag(flags.ctx);
   const notes = [];
   const mode = flags["dry-run"] ? "report" : "write";
   // a harness is written only if it is installed on this machine; --target
@@ -1117,6 +1150,10 @@ async function cmdSync() {
   const target = flags.target || "all";
   const written = [];
   if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  // --dry-run always wins: a "report what would change" run must never write,
+  // even when --apply is also on the line
+  const apply = !!flags.apply && !flags["dry-run"];
+  if (flags.apply && flags["dry-run"]) console.error("note: --dry-run — ignoring --apply, nothing will be written");
   // harnesses are independent: a missing config only skips its own target, so a
   // hermes-only (or opencode-only) machine still syncs what it has. The opencode
   // config is optional for hermes anyway — it is only used to borrow API keys.
@@ -1128,9 +1165,9 @@ async function cmdSync() {
   if (wantOc && !haveOc) console.log(`opencode (${CFG}): not found — skipped`);
   if (wantOc && haveOc) {
     const disabled = new Set(cfg.disabled_providers || []);
-    const out = numFlag(flags.output) ?? 65536;
+    const out = numFlag(flags.output, 1) ?? 65536;
     const ctxFlag = numFlag(flags.ctx);
-    const mode = flags.apply ? "write" : "report";
+    const mode = apply ? "write" : "report";
     const ids = Object.keys(cfg.provider || {}).filter((id) => !disabled.has(id) && (!flags.provider || flags.provider === id));
     if (!ids.length) console.log("opencode: no providers to check");
     const rs = await Promise.all(ids.map(async (id) => {
@@ -1142,7 +1179,7 @@ async function cmdSync() {
       if (pr.kind === "offline") return { id, offline: pr.error || "HTTP " + pr.status };
       if (pr.kind === "auth")
         return { id, badauth: true, unreadable: own.state === "stored" || own.state === "unknown",
-                 unsetRef: own.state === "unresolved" ? own.ref : null };
+                 unsetRef: own.state === "unresolved" ? own.ref : null, supplied: !own.key && !!flags.key };
       try { return { id, kind: pr.kind, base, server: await fetchModels(pr, base, key) }; }
       catch (e) { return { id, err: e.message }; }
     }));
@@ -1150,11 +1187,13 @@ async function cmdSync() {
     for (const r of rs) {
       if (r.offline) { console.log(`${r.id}: OFFLINE (${r.offline}) — skipped`); continue; }
       if (r.badauth) {
-        console.log(r.unsetRef
-          ? `${r.id}: AUTH 401 — its key is ${r.unsetRef}, which is not set in this environment; export it or pass --key K`
-          : r.unreadable
-            ? `${r.id}: AUTH 401 — its key is in OpenCode's database and cannot be read here; pass --key K to check this server`
-            : `${r.id}: AUTH 401 — key missing or invalid`);
+        console.log(r.supplied
+          ? `${r.id}: AUTH 401 — the key passed with --key was rejected — check it`
+          : r.unsetRef
+            ? `${r.id}: AUTH 401 — its key is ${r.unsetRef}, which is not set in this environment; export it or pass --key K`
+            : r.unreadable
+              ? `${r.id}: AUTH 401 — its key is in OpenCode's database and cannot be read here; pass --key K to check this server`
+              : `${r.id}: AUTH 401 — key missing or invalid`);
         continue;
       }
       if (r.err) { console.log(`${r.id}: ERROR — ${r.err}`); continue; }
@@ -1172,9 +1211,9 @@ async function cmdSync() {
       const total = res.added.length + res.ctx.length + res.mods.length + res.removed.length;
       if (!total) { console.log("  in sync"); continue; }
       changes += total;
-      if (flags.apply) { cfg.provider[r.id].models = res.models; console.log(`  APPLIED ${total} change(s)`); }
+      if (apply) { cfg.provider[r.id].models = res.models; console.log(`  APPLIED ${total} change(s)`); }
     }
-    if (flags.apply && changes) {
+    if (apply && changes) {
       try {
         saveCfg(cfg);
         reportValidate(cfg);
@@ -1184,11 +1223,11 @@ async function cmdSync() {
         process.exitCode = 1;
       }
     }
-    if (!flags.apply && changes) console.log(`${changes} change(s) pending — re-run with --apply to write`);
+    if (!apply && changes) console.log(`${changes} change(s) pending — re-run with --apply to write`);
   }
   if (target === "all" || target === "hermes") {
     let hr = null;
-    try { hr = await syncHermes({ apply: !!flags.apply, ocCfg: cfg, ocAuth: auth }); }
+    try { hr = await syncHermes({ apply, ocCfg: cfg, ocAuth: auth }); }
     catch (e) {
       // e.g. an unwritable config.yaml: report it, keep going, fail the exit code
       console.error(`error: ${e.message}`);
@@ -1265,12 +1304,14 @@ try {
     if (!flags["dry-run"]) { acquireLock(); try { await cmdAdd(pos[1], pos[2]); } finally { releaseLock(); } }
     else await cmdAdd(pos[1], pos[2]);
   } else if (cmd === "sync") {
-    if (flags.apply) { acquireLock(); try { await cmdSync(); } finally { releaseLock(); } }
+    // a --dry-run run writes nothing, so it needs no lock
+    if (flags.apply && !flags["dry-run"]) { acquireLock(); try { await cmdSync(); } finally { releaseLock(); } }
     else await cmdSync();
   } else if (cmd === "set-ctx") {
     if (!pos[1]) die("usage: provider-sync set-ctx <provider> — see provider-sync help");
-    acquireLock();
-    try { await cmdSetCtx(pos[1]); } finally { releaseLock(); }
+    const locked = !flags["dry-run"]; // same: a preview takes no lock
+    if (locked) acquireLock();
+    try { await cmdSetCtx(pos[1]); } finally { if (locked) releaseLock(); }
   } else if (cmd === "--version" || cmd === "-v" || (!pos.length && flags.version)) console.log(VERSION);
   else if (cmd === "help" || cmd === "-h" || (!pos.length && (flags.help || flags.h))) console.log(HELP);
   else if (!cmd) { console.error(HELP); process.exit(1); }

@@ -5,7 +5,7 @@
 // exactly the lie this file guards against.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -121,4 +121,37 @@ test("--key-env with a value that is not a variable name is refused", async () =
     () => runCliAsyncP(home, ["add", "mm", url, "--key-env", "not a name"]),
     /--key-env needs an environment variable name/,
   );
+});
+
+test("sync --apply --dry-run reports the plan and writes nothing, anywhere", async () => {
+  // regression: --dry-run was ignored when --apply was also on the line
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"), // models {}: m1 is new
+    ".hermes/config.yaml": HERMES().replace("context_length: 4096", "context_length: 1"),
+  });
+  const ocFile = inHome(home, ".config/opencode/opencode.jsonc");
+  const hFile = inHome(home, ".hermes/config.yaml");
+  const before = [readFileSync(ocFile, "utf8"), readFileSync(hFile, "utf8")];
+  const out = flat(await runCliAsyncP(home, ["sync", "--apply", "--dry-run"]));
+  assert.match(out, /change\(s\) pending/);
+  assert.doesNotMatch(out, /APPLIED/);
+  assert.equal(readFileSync(ocFile, "utf8"), before[0], "opencode config untouched");
+  assert.equal(readFileSync(hFile, "utf8"), before[1], "hermes config untouched");
+  assert.equal(readdirSync(path.join(home, ".hermes")).some((f) => f.includes("bak-provider-sync")), false,
+    "no backup was made for a write that never happened");
+});
+
+test("sync --key stands in for a stored key that cannot be read, and is not stored", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", null), // no key anywhere
+    ".hermes/config.yaml": HERMES(),
+  });
+  const miss = flat(await runCliAsyncP(home, ["sync", "--target", "hermes"]));
+  assert.match(miss, /AUTH 401 — key missing or invalid/);
+  const wrong = flat(await runCliAsyncP(home, ["sync", "--target", "hermes", "--key", "WRONG"]));
+  assert.match(wrong, /AUTH 401 — the key passed with --key was rejected/);
+  const out = flat(await runCliAsyncP(home, ["sync", "--target", "hermes", "--key", "SECRET"]));
+  assert.match(out, /in sync/);
+  assert.doesNotMatch(out, /AUTH 401/);
+  assert.doesNotMatch(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), /SECRET/, "--key must never be stored");
 });

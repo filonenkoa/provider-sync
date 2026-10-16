@@ -18,11 +18,26 @@ Format: [semver](https://semver.org). Dates are ISO.
 - `add --key-env` writes `key_env: VAR` into the Hermes entry instead of the
   OpenCode-only `{env:VAR}` string, which Hermes cannot resolve; a live literal
   `api_key` that would shadow the reference is replaced with `dummy`.
+- `--dry-run` now means "write nothing" in every command: `sync --apply --dry-run`
+  applied the changes anyway, and `set-ctx --dry-run` wrote. It also wins over
+  `--apply` on the same line.
+- Flag typos can no longer change what a command does: an unknown flag
+  (`--targe=hermes`) was silently dropped and the default target written to, and
+  `--apply=false` read as "apply" because any non-empty string is truthy. Both
+  are refused now, as are an empty or negative `--ctx`/`--output` (`--ctx=`
+  silently meant "omit the limit").
+- `sync --key K` now also covers the hermes target (documented as single-run,
+  never stored, but it was only consulted for opencode providers), and a hermes
+  entry whose key lives in OpenCode's database is reported as such — with the
+  `--key K` hint — instead of "key missing or invalid".
+- `list --target hermes` no longer prints the OpenCode database/keys line,
+  which belongs to the opencode target.
 - Docs: the writer lock lives in the system temp directory (keyed by the config
   directory), not at `~/.config/opencode/.provider-sync.lock` (README and help);
   the README install snippet shows the current version; `--key-env` is
   documented in `help`; the Unsloth 401 message no longer points at `auth.json`
-  (keys live in the config entry since 1.1.1).
+  (keys live in the config entry since 1.1.1); `help` lists `--key`/`--dry-run`
+  for `sync` and `set-ctx` and the flag-strictness rule under Safety.
 
 ## 1.1.1 — 2026-10-15
 

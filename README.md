@@ -78,7 +78,7 @@ Sync never clobbers already-configured values — re-ask them with `provider-syn
 
 Hermes entries written in **flow style** (one line inside `{...}`) are read and listed, but never rewritten — the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip such an entry and say so. Fields other than `name`/`base_url`/`api_key`/`key_env`/`model`/`models`/`models_discovered` (for example `discover_models` or `free_only`) are preserved untouched and not managed.
 
-Every write is atomic (tmp + fsync + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept); the Hermes config is re-read after writing and rolled back if it no longer parses. Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock in the system temp directory (keyed by the config directory), so two runs can never interleave — read-only commands never take it. Writes report per target — file, what changed, and why anything was skipped:
+Every write is atomic (tmp + fsync + rename) and preceded by a `.bak-provider-sync-*` backup (last 3 kept); the Hermes config is re-read after writing and rolled back if it no longer parses. Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock in the system temp directory (keyed by the config directory), so two runs can never interleave — read-only commands never take it. `--dry-run` never writes, in `add`, `sync` and `set-ctx` alike (it wins over `--apply` on the same line); an unknown flag or a value on a boolean flag (`--apply=false`) is refused instead of guessed. Writes report per target — file, what changed, and why anything was skipped:
 
 ```
 written:

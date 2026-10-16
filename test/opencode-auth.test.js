@@ -248,5 +248,52 @@ test("an {env:VAR} config key is resolved from the environment when probing", as
     // without it, the failure names the variable instead of misreporting the key
     const miss = flat(await runCliAsyncP(home, ["sync", "--target", "opencode"]));
     assert.match(miss, /AUTH 401 — its key is \{env:PS_TEST_SYNC_KEY\}, which is not set in this environment/);
+    // a --key that is rejected is reported as the rejected key, not as "missing"
+    const wrong = flat(await runCliAsyncP(home, ["sync", "--target", "opencode", "--key", "WRONG"]));
+    assert.match(wrong, /AUTH 401 — the key passed with --key was rejected/);
   } finally { srv.close(); }
+});
+
+test("hermes sync explains a key stored in the opencode database, and --key still checks the server", { skip: process.platform === "win32" }, async () => {
+  const srv = http.createServer((q, s) => {
+    if (q.url === "/v1/models" && q.headers.authorization === "Bearer SECRET") {
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ data: [{ id: "m1", context_length: 4096 }] }));
+    } else {
+      s.statusCode = 401;
+      s.end("{}");
+    }
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const u = `http://127.0.0.1:${srv.address().port}/v1`;
+    const home = homeWith({
+      ".config/opencode/opencode.jsonc": `{\n  "provider": {\n    "v2prov": { "options": { "baseURL": "${u}" }, "models": {} }\n  }\n}\n`,
+      ".local/share/opencode/opencode.db": "SQLite format 3\0",
+      ".hermes/config.yaml": `custom_providers:\n  - name: H\n    base_url: ${u}\n    api_key: dummy\n    models:\n      m1:\n        context_length: 4096\n`,
+    });
+    // the fake opencode CLI says v2prov's credential lives in the database:
+    // the failure must say where the key is, not that it is missing
+    const miss = await withFakeOpencode(home, ["sync", "--target", "hermes"]);
+    assert.match(miss, /AUTH 401 — its key is in OpenCode's database \(from v2prov\) and cannot be read here; pass --key K/);
+    // and --key turns that into a working check without storing anything
+    const ok = await withFakeOpencode(home, ["sync", "--target", "hermes", "--key", "SECRET"]);
+    assert.match(ok, /in sync/);
+    assert.doesNotMatch(ok, /AUTH 401/);
+    assert.doesNotMatch(readFileSync(path.join(home, ".hermes/config.yaml"), "utf8"), /SECRET/);
+  } finally { srv.close(); }
+});
+
+test("list --target hermes does not print the opencode key-store line", { skip: process.platform === "win32" }, async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG.replace("__URL__", url),
+    ".local/share/opencode/opencode.db": "SQLite format 3\0",
+    ".hermes/config.yaml": `custom_providers:\n  - name: H\n    base_url: ${url}\n    api_key: dummy\n    models:\n      m1:\n        context_length: 4096\n`,
+  });
+  const onlyH = await withFakeOpencode(home, ["list", "--target", "hermes"]);
+  assert.match(onlyH, /hermes \S*config\.yaml/);
+  assert.doesNotMatch(onlyH, /credentials live in OpenCode's database/, "an opencode-only store line is not hermes output");
+  // a run that does show opencode still names its store
+  const full = await withFakeOpencode(home, ["list"]);
+  assert.match(full, /credentials live in OpenCode's database/);
 });
