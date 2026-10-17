@@ -4,6 +4,35 @@ Format: [semver](https://semver.org). Dates are ISO.
 
 ## Unreleased
 
+### Added
+- **DeepSeek Harness (`dsh`) is a first-class target**: `list`, `sync` and
+  `add` now cover `dsh` alongside OpenCode and Hermes. provider-sync edits the
+  live profile patch (`~/.dsh/profiles/<name>/cordis.patch.yml`, the
+  `config.providers` of the `- id: llm-pi-ai` item; `--profile NAME`, default
+  `web`) or `~/.dsh/settings.yaml` while dsh has not imported it yet (pre-0.2
+  document; re-created files are imported at the next boot). Only the providers
+  subtree is ever regenerated — the rest of the file survives byte for byte.
+- `add --key` stores the value in `~/.dsh/.credentials.yaml` (mode `600`) under
+  the entry's reference — a new provider gets `<ID>_API_KEY`, the same
+  convention dsh's own UI uses; the key is resolved like dsh does (launch
+  environment, store, `~/.dsh/.env`), `--key-env VAR` sets `apiKeyEnv: VAR`
+  and stores nothing, and a server with no key at all gets the placeholder
+  `dummy` so requests do not fail with `MISSING_CREDENTIAL`. Stored values are
+  never printed.
+- `sync --target dsh` treats model lists as server-authoritative (adds/removes
+  models, updates server-reported `contextWindow` values, leaves `api`,
+  `displayName` and everything else alone) and only writes server-reported
+  context, like the hermes target.
+- Refusals instead of mangling: a providers block containing comments,
+  anchors, aliases, tags (`!!js`), block scalars, flow mappings or tab
+  indentation — as well as an `insert:` list, a second `llm-pi-ai` item, or a
+  home-level `~/.dsh/cordis.patch.yml` that also targets `llm-pi-ai` (which
+  wins over the profile's) — is reported as `skipped — <reason>`. Every dsh
+  write is re-read and compared provider-by-provider, with rollback from the
+  backup on a mismatch. Verified against the real 0.2.0-rc binary: accepted
+  patch output from both surfaces (`--dump-config`, and a boot that imports
+  `settings.yaml` into the profile).
+
 ### Fixed
 - Dropped the dead `loginCommand` export in `lib/opencode-auth.js`. It was
   added for the "run: opencode auth login …" hint, but `add --key` stores keys

@@ -2,7 +2,7 @@
 // provider-sync — manage local model providers for OpenCode and Hermes Agent.
 // Zero dependencies, Node >= 18. Run `provider-sync help` for full documentation.
 
-import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync, realpathSync, chmodSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
@@ -31,6 +31,22 @@ const authBackend = detectBackend();
 const authInDb = authBackend.mode === "db";
 export const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
+// DeepSeek Harness: the home mirrors what dsh itself resolves — a non-blank
+// $DSH_HOME (bare or ~/ tilde expanded) else ~/.dsh. Provider state lives in
+// the active profile's cordis.patch.yml; a settings.yaml is the pre-0.2
+// document dsh imports into that profile at its next boot.
+const DSH_HOME = (() => {
+  let p = (process.env.DSH_HOME || "").trim();
+  if (!p) p = path.join(os.homedir(), ".dsh");
+  else if (p === "~") p = os.homedir();
+  else if (p.startsWith("~/")) p = path.join(os.homedir(), p.slice(2));
+  return path.resolve(p);
+})();
+const DSH_SETTINGS = path.join(DSH_HOME, "settings.yaml");
+const DSH_IMPORTED = path.join(DSH_HOME, "settings.yaml.imported");
+const DSH_STORE = path.join(DSH_HOME, ".credentials.yaml");
+const DSH_HOME_PATCH = path.join(DSH_HOME, "cordis.patch.yml");
+const DSH_PROFILES = path.join(DSH_HOME, "profiles");
 
 // ---------- cli ----------
 const die = (m) => { console.error("error: " + m); process.exit(1); };
@@ -38,7 +54,7 @@ const die = (m) => { console.error("error: " + m); process.exit(1); };
 const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h", "version"]);
 // a typo must not be swallowed: `--targe=hermes` used to be ignored and the
 // default taken, which can write to a harness the user did not name
-const VALUE_FLAGS = new Set(["name", "key", "key-env", "username", "password", "model", "target", "ctx", "output", "provider"]);
+const VALUE_FLAGS = new Set(["name", "key", "key-env", "username", "password", "model", "target", "profile", "ctx", "output", "provider"]);
 export function parseArgs(argv) {
   const flags = {};
   const pos = [];
@@ -271,7 +287,7 @@ function pruneBackups(file, keep = 3) {
 // write via a temp file in the same directory, flush it to disk, then rename.
 // fsync on the file makes the content durable; fsync on the directory makes the
 // rename durable. without both, a power cut can leave a truncated config.
-export function atomicWrite(file, data) {
+export function atomicWrite(file, data, mode = null) {
   const dir = path.dirname(file);
   mkdirSync(dir, { recursive: true });
   const tmp = file + ".tmp-provider-sync";
@@ -283,6 +299,9 @@ export function atomicWrite(file, data) {
   } finally {
     if (fd !== null) closeSync(fd);
   }
+  // owner-only for credential stores: set the mode before the rename, so the
+  // file is never group/other-readable even for a moment
+  if (mode !== null) { try { chmodSync(tmp, mode); } catch {} }
   try {
     renameSync(tmp, file);
   } catch (e) {
@@ -322,7 +341,7 @@ const numFlag = (v, min = 0) => {
 };
 
 // ---------- help ----------
-const HELP = `provider-sync — manage local model providers for OpenCode (and Hermes Agent)
+const HELP = `provider-sync — manage local model providers for OpenCode, Hermes Agent and DeepSeek Harness
 
 Zero dependencies; requires Node >= 18 (built-in fetch).
 Run \`provider-sync\`, \`provider-sync help\`, \`-h\` or \`--help\` to see this text again;
@@ -341,12 +360,20 @@ Files:
            reported, never changed
   hermes   ~/.hermes/config.yaml               custom_providers (if installed)
            ~/.hermes/.env                      key source for Hermes providers
+  dsh      ~/.dsh/profiles/<name>/cordis.patch.yml  the live llm-pi-ai providers
+                                               (the dsh home honors $DSH_HOME)
+           ~/.dsh/settings.yaml                pre-0.2 document — dsh imports it
+                                               at the next boot, so provider-sync
+                                               writes there while it exists
+           ~/.dsh/.credentials.yaml            key store; provider-sync writes
+                                               refs but never prints a value
 
 Commands:
-  provider-sync list [--target all|opencode|hermes]
+  provider-sync list [--target all|opencode|hermes|dsh] [--profile NAME]
       List configured providers per harness — id/name, model count, base URL
       and key status (for Hermes also where the key comes from: literal,
-      ~/.hermes/.env, or borrowed from a matching OpenCode provider). Entries
+      ~/.hermes/.env, or borrowed from a matching OpenCode provider; for dsh
+      from the environment, ~/.dsh/.credentials.yaml or ~/.dsh/.env). Entries
       living in the 2.x \`providers\` section are marked (2.x). A harness that
       is not installed is reported as "not found — skipped" instead of
       failing, so a Hermes-only or OpenCode-only machine is fine.
@@ -368,9 +395,17 @@ Commands:
       provider bootstraps it); --dry-run writes nothing.
       Reaches every installed harness: the same provider is also created or
       updated under custom_providers in ~/.hermes/config.yaml (matched by
-      base URL, so re-running updates instead of duplicating). A harness that
+      base URL, so re-running updates instead of duplicating) and in the dsh
+      llm-pi-ai config (matched by base URL, then by id). A harness that
       is not installed is left alone — no config file is created for it — and
       --target opencode is how you ask for one to be created anyway.
+      dsh specifics: the provider is written where dsh reads now — into
+      settings.yaml while it still exists (dsh imports it at the next boot),
+      else into the active profile's cordis.patch.yml (--profile NAME picks
+      one; the default is web). The key goes to ~/.dsh/.credentials.yaml as a
+      reference (<ID>_API_KEY, like dsh's own UI); without --key the existing
+      reference is kept, and a keyless server gets "dummy" so requests do not
+      fail with MISSING_CREDENTIAL.
       Entry shapes: a provider whose entry lives in the 2.x \`providers\`
       section is updated in that shape (package/settings/models); a legacy
       provider.<id> entry stays legacy (2.x migrates it at load). A config
@@ -382,19 +417,23 @@ Commands:
       Options:
         --name N          display name (default: existing value, else <id>)
         --key K           API key; stored into the provider entry in your
-                          config (apiKey), and written into the hermes entry as
-                          a literal api_key
-                          (dummy when the server needs no auth)
+                          config (apiKey), written into the hermes entry as
+                          a literal api_key, and stored in
+                          ~/.dsh/.credentials.yaml behind the entry's key
+                          reference (dummy when the server needs no auth)
         --key-env VAR     store the key as an {env:VAR} reference instead of
                           the literal secret, so a config that lives in version
                           control stays clean; resolved from the environment
-                          when provider-sync probes the server
+                          when provider-sync probes the server (for dsh this
+                          becomes the entry's apiKeyEnv, and nothing is stored)
         --username U      Unsloth UI login; both flags must be passed together,
         --password P      and only an Unsloth UI server accepts the login
         --model M         model written into the hermes entry's model:
                           field (default: first model the server reports)
-        --target T        all|opencode|hermes (default all); only the chosen
-                          harnesses are written
+        --target T        all|opencode|hermes|dsh (default all); only the
+                          chosen harnesses are written
+        --profile NAME    dsh profile whose cordis.patch.yml is edited
+                          (default: web, else the only profile there is)
         --no-hermes       shortcut for --target opencode
         --ctx N           ctx for models whose server reports none
                           (0 = omit the limit). Without it, provider-sync asks
@@ -405,7 +444,8 @@ Commands:
         --dry-run         report what would change; writes nothing and
                           creates no API key
 
-  provider-sync sync [--apply] [--target all|opencode|hermes] [--provider ID]
+  provider-sync sync [--apply] [--target all|opencode|hermes|dsh] [--provider ID]
+                      [--profile NAME]
       Check configured providers against their servers: new/removed models,
       ctx changes, modality corrections. Offline or auth-failing servers are
       reported and skipped; disabled_providers in the config are ignored.
@@ -419,14 +459,23 @@ Commands:
                   server-reported context lengths are written; guesses never
                   go into Hermes. Model entries keep only context_length —
                   any other fields are dropped (with a warning).
-        all       both (default)
+        dsh       llm-pi-ai providers — the live profile patch, or
+                  settings.yaml while dsh has not imported it yet. Model
+                  lists are server-authoritative (added/removed models and
+                  server-reported contextWindow values are written; entries
+                  dsh owns — api, displayName, other fields — survive).
+                  Refuses to touch a providers block it cannot rewrite
+                  losslessly, and reports why instead.
+        all       all three (default)
       Harnesses are independent — a target whose config file is missing is
-      reported as "not found — skipped" and the other one still runs, so
-      hermes-only and opencode-only machines work. Asking for a target
-      explicitly (--target opencode / --provider ID) without an OpenCode
-      config is still an error.
+      reported as "not found — skipped" and the other ones still run, so
+      hermes-only, opencode-only and dsh-only machines work. Asking for a
+      target explicitly (--target opencode / --provider ID) without an
+      OpenCode config is still an error.
       Options: --provider ID (opencode target only; asks for an unknown or
-      disabled provider are refused, not silently empty), --ctx N, --output N,
+      disabled provider are refused, not silently empty), --profile NAME
+      (dsh target: which profile patch to edit — default web, else the only
+      profile there is), --ctx N, --output N,
       --key K (used for this run only — never stored), --dry-run (report
       only; --dry-run always wins over --apply). Providers in the 2.x
       \`providers\` shape are checked and updated in place.
@@ -472,11 +521,30 @@ Hermes key resolution, first match wins:
      {env:VAR} reference there is resolved from the environment, and
      --key-env stores it as a hermes key_env instead of the literal key
 
+DeepSeek Harness key resolution, first match wins:
+  1. the launch environment (a provider's apiKeyEnv variable)
+  2. the stored reference in ~/.dsh/.credentials.yaml (values are never
+     printed; a multi-line value is reported as unreadable, not guessed)
+  3. ~/.dsh/.env
+  --key K is stored in that file under the entry's reference (a new
+  provider gets <ID>_API_KEY, dsh's own convention); --key-env VAR sets
+  apiKeyEnv: VAR and stores nothing. A keyless OpenAI-compatible server
+  gets the placeholder "dummy" so its requests do not fail with
+  MISSING_CREDENTIAL.
+
 Safety:
   - every write is atomic (tmp file + fsync + rename) and preceded by a
     .bak-provider-sync-* backup; only the last 3 backups per file are kept
   - the config file is validated after each write; the hermes config is
-    re-read and rolled back from its backup if it no longer parses
+    re-read and rolled back from its backup if it no longer parses, and the
+    dsh configs are re-read and compared provider-by-provider, with the
+    same rollback on a mismatch
+  - dsh writes touch only the llm-pi-ai providers block: everything else in
+    settings.yaml / cordis.patch.yml survives byte for byte, and a block
+    with comments, anchors, tags or flow mappings inside is refused (with
+    the reason) rather than rewritten
+  - ~/.dsh/.credentials.yaml is written owner-only (mode 600) — dsh refuses
+    to load a store others can read — and a stored secret is never printed
   - writing commands (add, sync --apply, set-ctx) take an exclusive lock in
     the system temp directory (keyed by the config directory), so two runs
     cannot interleave; read-only commands never take it
@@ -493,10 +561,11 @@ Examples:
   provider-sync add 3090-lan http://192.168.9.50:64980/v1 --key 4117...
   provider-sync add helen http://100.64.0.6:8888/v1 --username unsloth --password ***
   provider-sync add local http://127.0.0.1:8080/v1 --dry-run
-  provider-sync sync                      # status check, opencode + hermes, nothing written
+  provider-sync sync                      # status check, opencode + hermes + dsh, nothing written
   provider-sync sync --apply              # apply all pending changes
   provider-sync sync --apply --provider 3090
   provider-sync sync --target hermes      # only the Hermes fallback catalogs
+  provider-sync sync --target dsh         # only the dsh llm-pi-ai providers
   provider-sync add new http://10.0.0.5:64980/v1 --key ... --ctx 32768
   provider-sync set-ctx 3090
 `;
@@ -962,6 +1031,356 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   return { status: "applied", changes, providers: edits.length };
 }
 
+// ---------- deepseek harness (dsh) ----------
+// dsh keeps provider state in the active profile's cordis.patch.yml (the
+// `- id: llm-pi-ai` loader patch item). Before the first 0.2 boot it still
+// lives in settings.yaml, which dsh imports into the profile once and renames
+// to settings.yaml.imported. provider-sync edits whichever document is live:
+// settings.yaml while it exists, the profile patch after dsh consumed it.
+
+import { parseDshSettings, writeDshSettings, parseDshPatch, writeDshPatch, parseDshStore, setDshStoreRef, dshRefName, PATCH_HEADER } from "../lib/dsh-yaml.js";
+
+function dshProfiles() {
+  try {
+    return readdirSync(DSH_PROFILES, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  } catch { return []; }
+}
+// the profile whose patch provider-sync edits: --profile wins; else web (the
+// shipped appliance); else the only profile there is. several profiles and no
+// settings.yaml (which would be profile-agnostic) is refused for writes.
+function dshProfile() {
+  const names = dshProfiles();
+  if (flags.profile !== undefined) {
+    if (!names.includes(flags.profile))
+      die(`no dsh profile "${flags.profile}" under ${disp(DSH_PROFILES)}${names.length ? ` (found: ${names.join(", ")})` : " (no profiles yet)"}`);
+    return { name: flags.profile, note: null, names };
+  }
+  if (names.includes("web")) return { name: "web", note: null, names };
+  if (names.length === 1) return { name: names[0], note: `dsh profile "${names[0]}" is the only one — using it`, names };
+  return { name: null, note: names.length ? `several dsh profiles (${names.join(", ")}) — name one with --profile` : null, names };
+}
+const dshPatchPath = (name) => path.join(DSH_PROFILES, name, "cordis.patch.yml");
+
+// which document is live; `create` is for add --target dsh on a home that has
+// no profile yet — then settings.yaml is the right surface regardless of
+// profile, because dsh imports it into whichever profile boots next
+function dshSurface({ create = false } = {}) {
+  const prof = dshProfile();
+  if (existsSync(DSH_SETTINGS))
+    return { kind: "legacy", file: DSH_SETTINGS, profile: prof.name, note: "settings.yaml is the pre-0.2 document — dsh imports it into its profile at the next boot" };
+  if (prof.name) {
+    const file = dshPatchPath(prof.name);
+    return { kind: "patch", file, profile: prof.name, note: prof.note, fresh: !existsSync(file) };
+  }
+  if (prof.names.length > 1 && !create)
+    return { kind: "empty", note: prof.note };
+  return { kind: "legacy", file: DSH_SETTINGS, profile: null, fresh: true, note: "no dsh profile yet — writing settings.yaml, which dsh imports on its first boot" };
+}
+
+function dshState({ create = false } = {}) {
+  const s = dshSurface({ create });
+  if (s.kind === "empty") return { kind: "empty", note: s.note };
+  const text = existsSync(s.file) ? readFileSync(s.file, "utf8") : "";
+  const parsed = s.kind === "legacy" ? parseDshSettings(text) : parseDshPatch(text);
+  return { ...s, text, parsed, error: parsed.error, providers: parsed.providers };
+}
+
+// a home-level cordis.patch.yml applies after every profile patch and would
+// shadow what provider-sync edits; never fight it, report it
+function dshHomeOverride() {
+  if (!existsSync(DSH_HOME_PATCH)) return null;
+  const p = parseDshPatch(readFileSync(DSH_HOME_PATCH, "utf8"));
+  if (p.error) return { file: DSH_HOME_PATCH, why: `cannot read ${disp(DSH_HOME_PATCH)} (${p.error})` };
+  if (p.present) return { file: DSH_HOME_PATCH, why: `${disp(DSH_HOME_PATCH)} targets llm-pi-ai too, and a home-level patch wins over the profile's` };
+  return null;
+}
+
+function dshNotes(st) {
+  const notes = [];
+  if (st.note) notes.push(st.note);
+  if (st.fresh) notes.push("cordis.patch.yml does not exist yet — it appears on the first dsh boot, or on the next provider-sync write");
+  if (st.parsed?.disabled) notes.push("the llm-pi-ai patch item is disabled: true — configuration has no effect until it is enabled");
+  const ov = dshHomeOverride();
+  if (ov) notes.push(`${ov.why}${ov.why.startsWith("cannot read") ? "" : " — it is the live config, not this file"}`);
+  if (existsSync(DSH_IMPORTED))
+    notes.push("settings.yaml.imported exists — the one-time import already ran, and a section left in it was rejected by dsh at boot (it is not live)");
+  return notes;
+}
+
+// dsh key resolution, in dsh's own order: the launch environment wins, then
+// the stored .credentials.yaml, then ~/.dsh/.env. Values are never printed.
+const dshStore = once(() => {
+  if (!existsSync(DSH_STORE)) return { refs: new Map(), error: null };
+  try { return parseDshStore(readFileSync(DSH_STORE, "utf8")); }
+  catch (e) { return { refs: new Map(), error: e.message }; }
+});
+const dshHomeEnv = once(() => {
+  const env = {};
+  const f = path.join(DSH_HOME, ".env");
+  if (existsSync(f))
+    for (const line of readFileSync(f, "utf8").split("\n")) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+      if (m) env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
+    }
+  return env;
+});
+function dshKeyOf(p) {
+  const ref = typeof p?.apiKeyEnv === "string" && p.apiKeyEnv ? p.apiKeyEnv : null;
+  if (!ref) return { state: "none" };
+  if (process.env[ref]) return { state: "env", ref, key: process.env[ref] };
+  const hit = dshStore().refs.get(ref);
+  if (hit?.value) return { state: "stored", ref, key: hit.value };
+  if (hit?.opaque) return { state: "opaque", ref };
+  const home = dshHomeEnv()[ref];
+  if (home) return { state: "envfile", ref, key: home };
+  return { state: "unset", ref };
+}
+function dshKeyLabel(p) {
+  const k = dshKeyOf(p);
+  if (k.state === "env") return `key (env ${k.ref})`;
+  if (k.state === "stored") return "key (stored)";
+  if (k.state === "envfile") return "key (.dsh/.env)";
+  if (k.state === "unset") return `no-key (${k.ref} unset here)`;
+  if (k.state === "opaque") return `key (${k.ref} is multi-line — cannot read)`;
+  if (k.state === "none") return "no-key (no apiKeyEnv)";
+  return "key";
+}
+
+// the credentials store: only ever add or replace single-line refs; dsh
+// refuses to load a store that is not owner-only, so the file is chmod 600
+function dshStoreSet(name, value) {
+  const existed = existsSync(DSH_STORE);
+  const text = existed ? readFileSync(DSH_STORE, "utf8") : "";
+  const out = setDshStoreRef(text, name, value);
+  const bak = DSH_STORE + ".bak-provider-sync-" + stamp();
+  try {
+    if (existed) {
+      copyFileSync(DSH_STORE, bak);
+      try { pruneBackups(DSH_STORE); } catch {}
+    }
+    atomicWrite(DSH_STORE, out.text, 0o600);
+  } catch (e) {
+    throw new Error(`cannot write ${disp(DSH_STORE)}: ${e.message}`);
+  }
+  const back = parseDshStore(readFileSync(DSH_STORE, "utf8"));
+  if (back.refs.get(name)?.value !== value) {
+    if (existed) copyFileSync(bak, DSH_STORE);
+    throw new Error(`the key did not land in ${disp(DSH_STORE)} — provider-sync cannot claim it is stored`);
+  }
+  return existed ? path.basename(bak) : null;
+}
+
+// re-read what was written and compare provider-by-provider; a mismatch means
+// the surgical edit produced something we do not understand, so the backup is
+// put back and the caller is told
+function verifyDshWrite(file, kind, want) {
+  if (!existsSync(file)) return "the file disappeared after the write";
+  const p = kind === "legacy" ? parseDshSettings(readFileSync(file, "utf8")) : parseDshPatch(readFileSync(file, "utf8"));
+  if (p.error) return `the written file no longer parses (${p.error})`;
+  const got = p.providers ?? {};
+  const sig = (m) => JSON.stringify(Object.fromEntries(Object.entries(m).map(([id, v]) => [id, (Array.isArray(v?.models) ? v.models : []).map((x) => [x?.id ?? null, x?.contextWindow ?? null])])));
+  if (Object.keys(got).length !== Object.keys(want).length)
+    return `provider count changed (${Object.keys(want).length} -> ${Object.keys(got).length})`;
+  if (sig(got) !== sig(want)) return "the providers did not land as written";
+  return null;
+}
+function writeDshFile(file, text, kind, want) {
+  const existed = existsSync(file);
+  const bak = file + ".bak-provider-sync-" + stamp();
+  try {
+    if (existed) {
+      copyFileSync(file, bak);
+      try { pruneBackups(file); } catch {}
+    }
+    atomicWrite(file, text);
+  } catch (e) {
+    throw new Error(`cannot write ${disp(file)}: ${e.message}`);
+  }
+  const bad = verifyDshWrite(file, kind, want);
+  if (bad) {
+    if (existed) copyFileSync(bak, file);
+    else { try { unlinkSync(file); } catch {} }
+    throw new Error(`${bad} — ${disp(file)} was ${existed ? `restored from ${path.basename(bak)}` : "left as it was"}`);
+  }
+  return existed ? path.basename(bak) : null;
+}
+// provider entries as dsh parses them must be mappings; models must be a list
+function dshProvidersOf(st) {
+  if (st.error) throw new Error(st.error);
+  return st.providers && typeof st.providers === "object" && !Array.isArray(st.providers) ? { ...st.providers } : {};
+}
+const dshWrite = (st, providers) => {
+  const text = st.kind === "patch" && st.fresh ? PATCH_HEADER.join("\n") + "\n" : st.text;
+  return st.kind === "legacy" ? writeDshSettings(text, providers) : writeDshPatch(text, providers);
+};
+
+// create or update an llm-pi-ai provider so `add` reaches every installed
+// harness. Matched by base URL first (re-running updates instead of
+// duplicating), then by id (a moved server re-points its entry).
+export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models, dryRun, create }) {
+  if (!existsSync(DSH_HOME) && !create)
+    return { status: "absent", why: `dsh not installed (${disp(DSH_HOME)} not found)` };
+  const st = dshState({ create: !!create });
+  if (st.kind === "empty") return { status: "empty", why: st.note || `nothing configured under ${disp(DSH_HOME)}` };
+  if (st.error) return { status: "refused", why: st.error, file: st.file };
+  const ov = dshHomeOverride();
+  if (ov) return { status: "overridden", why: ov.why };
+  const providers = dshProvidersOf(st);
+  const nb = normUrl(base);
+  let pid = Object.keys(providers).find((k) => providers[k]?.baseURL && normUrl(providers[k].baseURL) === nb);
+  let note = null;
+  if (pid && pid !== id) note = `matched the existing entry "${pid}" by base URL — updating it`;
+  else if (!pid) pid = id;
+  const old = providers[pid] && typeof providers[pid] === "object" ? providers[pid] : {};
+  const existed = !!providers[pid];
+  const n = models.length;
+  // the key: keep the entry's existing reference when there is one; a new
+  // provider follows dsh's own UI convention <ID_UPPER>_API_KEY. --key-env
+  // wins, an {env:VAR} reference borrowed from OpenCode is kept as a ref too.
+  let ref = keyEnvFlag || (typeof old.apiKeyEnv === "string" && old.apiKeyEnv) || dshRefName(pid);
+  let storeValue = null;
+  let storeNote = null;
+  if (keyFlag) storeValue = keyFlag;
+  else if (!keyEnvFlag && keyRaw) {
+    const er = envRef(keyRaw);
+    if (er) ref = er;
+    else storeValue = keyRaw;
+  }
+  if (!storeValue && !keyEnvFlag && !envRef(keyRaw)) {
+    // an OpenAI-compatible route with no resolvable key fails every request
+    // (MISSING_CREDENTIAL), so a keyless server gets the conventional
+    // placeholder — but never over a value the store already holds
+    const src = dshKeyOf({ apiKeyEnv: ref });
+    if (src.state === "unset") {
+      storeValue = "dummy";
+      storeNote = `no key known for ${ref} — storing "dummy" (an OpenAI-compatible route needs one)`;
+    }
+  }
+  const curModels = Array.isArray(old.models) ? old.models : [];
+  const curById = new Map(curModels.map((m) => [m?.id, m]));
+  let added = 0, changed = 0;
+  const newModels = [];
+  for (const m of models) {
+    const c = curById.get(m.id);
+    if (!c) { newModels.push({ id: m.id, ...(m.ctx != null ? { contextWindow: m.ctx } : {}) }); added++; continue; }
+    curById.delete(m.id);
+    if (m.ctx != null && c.contextWindow !== m.ctx) { newModels.push({ ...c, contextWindow: m.ctx }); changed++; }
+    else newModels.push(c);
+  }
+  const removed = curById.size;
+  const entry = {
+    ...old,
+    api: old.api || "openai-completions",
+    baseURL: base,
+    apiKeyEnv: ref,
+    displayName: flags.name ? name : old.displayName || name,
+    models: newModels,
+  };
+  providers[pid] = entry;
+  const res = {
+    status: existed ? "updated" : "created",
+    pid, n, ref,
+    store: storeValue ? (storeValue === "dummy" ? "dummy" : "key") : null,
+    file: st.file, kind: st.kind,
+    added, changed, removed,
+    note: note || storeNote || null,
+  };
+  if (dryRun) return res;
+  try {
+    if (storeValue) dshStoreSet(ref, storeValue); // before the config: a ref must never dangle
+    const out = dshWrite(st, providers);
+    writeDshFile(st.file, out.text, st.kind, providers);
+  } catch (e) {
+    return { status: "error", why: e.message, pid, ref, file: st.file };
+  }
+  return res;
+}
+
+async function syncDsh({ apply }) {
+  if (!existsSync(DSH_HOME)) { console.log(`dsh (${disp(DSH_HOME)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
+  const st = dshState();
+  if (st.kind === "empty") { console.log(`dsh (${disp(DSH_HOME)}): ${st.note || "no profile and no settings.yaml — nothing configured"} — skipped`); return { status: "empty", why: st.note || "nothing configured" }; }
+  const label = st.kind === "legacy" ? `${disp(st.file)} (pre-0.2 document)` : `${disp(st.file)} (profile ${st.profile})`;
+  if (st.error) { console.log(`dsh (${label}): ${st.error} — skipped`); return { status: "refused", why: st.error }; }
+  const ov = dshHomeOverride();
+  if (ov) { console.log(`dsh (${label}): ${ov.why} — skipped`); return { status: "overridden", why: ov.why }; }
+  const providers = dshProvidersOf(st);
+  const ids = Object.keys(providers);
+  console.log(`dsh (${label}): ${ids.length} provider(s)`);
+  for (const nt of dshNotes(st)) console.log(`  note: ${nt}`);
+  if (!ids.length) return { status: "empty", why: "no providers configured" };
+  if (st.parsed?.disabled) console.log("  note: llm-pi-ai is disabled — writing through is still possible, but dsh will not apply it");
+  const DEFAULT_CTX = 262144; // dsh's provider default when contextWindow is unset
+  // probe all providers in parallel, then report in config order
+  const rs = await Promise.all(ids.map(async (id) => {
+    const p = providers[id];
+    if (!p || typeof p !== "object") return { id, skip: "the entry is not a mapping" };
+    if (!p.baseURL) return { id, skip: "no baseURL (catalog provider)" };
+    const k = dshKeyOf(p);
+    const runKey = k.key || flags.key || null; // --key stands in for this run only
+    const pr = await probeCached(p.baseURL, runKey);
+    if (pr.kind === "offline") return { id, base: p.baseURL, offline: pr.error || "HTTP " + pr.status };
+    if (pr.kind === "auth") return { id, base: p.baseURL, badauth: true, k, supplied: !k.key && !!flags.key };
+    try { return { id, base: p.baseURL, kind: pr.kind, server: await fetchModels(pr, p.baseURL, runKey) }; }
+    catch (e) { return { id, base: p.baseURL, err: e.message }; }
+  }));
+  let changes = 0;
+  const edits = [];
+  for (const r of rs) {
+    if (r.skip) { console.log(`  ${r.id}: ${r.skip} — skipped`); continue; }
+    if (r.offline) { console.log(`  ${r.id} (${r.base}): OFFLINE (${r.offline}) — skipped`); continue; }
+    if (r.badauth) {
+      console.log(r.supplied
+        ? `  ${r.id} (${r.base}): AUTH 401 — the key passed with --key was rejected — check it`
+        : r.k.state === "unset"
+          ? `  ${r.id} (${r.base}): AUTH 401 — its key is ${r.k.ref}, which is not set here (checked the environment, ${disp(DSH_STORE)} and ~/.dsh/.env); export it or pass --key K`
+          : r.k.state === "opaque"
+            ? `  ${r.id} (${r.base}): AUTH 401 — ${r.k.ref} is stored as a multi-line value provider-sync cannot read; pass --key K to check this server`
+            : `  ${r.id} (${r.base}): AUTH 401 — key missing or invalid`);
+      continue;
+    }
+    if (r.err) { console.log(`  ${r.id} (${r.base}): ERROR — ${r.err}`); continue; }
+    const p = providers[r.id];
+    const cur = Array.isArray(p.models) ? p.models : [];
+    const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
+    const curById = new Map(cur.map((m) => [m?.id, m]));
+    const liveIds = new Set(live.map((m) => m.id));
+    const added = live.filter((m) => !curById.has(m.id));
+    const removed = cur.filter((m) => !liveIds.has(m?.id));
+    // a missing contextWindow means dsh's provider default applies, so compare
+    // against the effective value — that is what pinning would change
+    const eff = (c) => c.contextWindow ?? p.defaultContextWindow ?? DEFAULT_CTX;
+    const ctxCh = live.filter((m) => { const c = curById.get(m.id); return c && m.ctx != null && eff(c) !== m.ctx; });
+    console.log(`  ${r.id} (${r.kind}, ${r.base}): ${live.length} on server, ${cur.length} in config`);
+    for (const a of added) console.log(`    + ${a.id}`);
+    for (const a of removed) console.log(`    - ${a.id} (no longer on server)`);
+    for (const c of ctxCh) console.log(`    ~ ctx ${c.id}: ${curById.get(c.id).contextWindow ?? `default ${eff(curById.get(c.id))}`} -> ${c.ctx}`);
+    if (!added.length && !removed.length && !ctxCh.length) { console.log("    in sync"); continue; }
+    changes += added.length + removed.length + ctxCh.length;
+    edits.push({ id: r.id, live });
+  }
+  if (!edits.length) return { status: "in-sync", n: ids.length };
+  if (!apply) { console.log(`  ${changes} change(s) pending — re-run with --apply to write`); return { status: "pending", changes }; }
+  const next = { ...providers };
+  for (const ed of edits) {
+    const p = next[ed.id];
+    const cur = Array.isArray(p.models) ? p.models : [];
+    const curById = new Map(cur.map((m) => [m?.id, m]));
+    const models = [];
+    for (const m of ed.live) {
+      const c = curById.get(m.id);
+      if (!c) models.push({ id: m.id, ...(m.ctx != null ? { contextWindow: m.ctx } : {}) });
+      else if (m.ctx != null) models.push({ ...c, contextWindow: m.ctx });
+      else models.push(c);
+    }
+    next[ed.id] = { ...p, models };
+  }
+  const out = dshWrite(st, next);
+  const bak = writeDshFile(st.file, out.text, st.kind, next);
+  console.log(`  APPLIED ${changes} change(s)${bak ? ` — backup at ${bak}` : ""}`);
+  return { status: "applied", changes, providers: edits.length, file: st.file };
+}
+
 // ---------- validation ----------
 const MODS = new Set(["text", "image", "audio", "video", "pdf"]);
 // keys provider-sync itself writes into a legacy model entry; native 2.x
@@ -1047,11 +1466,13 @@ pass it for this run: provider-sync set-ctx ${pid} --key K`);
 // ---------- commands ----------
 function cmdList() {
   const target = flags.target || "all";
-  if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  if (!["all", "opencode", "hermes", "dsh"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes|dsh)`);
+  if (flags.profile !== undefined && target !== "all" && target !== "dsh")
+    die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
   const haveOc = existsSync(CFG);
   const cfg = haveOc ? loadCfg() : {}; // absent config is not an error here
   const auth = loadAuth();
-  if (target !== "hermes") {
+  if (target === "all" || target === "opencode") {
     if (!haveOc) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
     else {
       console.log(`opencode  ${disp(CFG)}`);
@@ -1066,8 +1487,8 @@ function cmdList() {
       }
     }
   }
-  if (authInDb && target !== "hermes") console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync never writes it and never shows a stored value${existsSync(AUTH) ? ", and an auth.json found here was imported at migration and may be stale" : ""}`);
-  if (target !== "opencode") {
+  if (authInDb && (target === "all" || target === "opencode")) console.log(`keys      ${disp(authBackend.dbPath || "opencode database")}  credentials live in OpenCode's database (${authBackend.via}); provider-sync never writes it and never shows a stored value${existsSync(AUTH) ? ", and an auth.json found here was imported at migration and may be stale" : ""}`);
+  if (target === "all" || target === "hermes") {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
       const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
@@ -1081,6 +1502,28 @@ function cmdList() {
           const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
           console.log(`  ${e.name.padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}  ${hermesKeySource(e, cfg, auth)}`);
         }
+      }
+    }
+  }
+  if (target === "all" || target === "dsh") {
+    if (!existsSync(DSH_HOME)) console.log(`dsh       ${disp(DSH_HOME)}: not found — skipped`);
+    else {
+      const st = dshState();
+      if (st.kind === "empty") console.log(`dsh       ${disp(DSH_HOME)}: no profile and no settings.yaml — nothing configured`);
+      else {
+        const label = st.kind === "legacy" ? `${disp(st.file)} (pre-0.2 document)` : `${disp(st.file)} (profile ${st.profile})`;
+        console.log(`dsh       ${label}`);
+        if (st.error) console.log(`  note: ${st.error}`);
+        else {
+          const ids = Object.keys(st.providers || {});
+          if (!ids.length) console.log("  (no providers)");
+          for (const id of ids) {
+            const p = st.providers[id] && typeof st.providers[id] === "object" ? st.providers[id] : {};
+            const n = Array.isArray(p.models) ? p.models.length : 0;
+            console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${p.baseURL || "-"}  ${dshKeyLabel(p)}`);
+          }
+        }
+        for (const nt of dshNotes(st)) console.log(`  note: ${nt}`);
       }
     }
   }
@@ -1142,19 +1585,28 @@ async function cmdAdd(id, url) {
   // a harness is written only if it is installed on this machine; --target
   // opencode is the explicit way to create an OpenCode config where there is none
   const target = flags.target || "all";
-  if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
-  if (flags["no-hermes"] && target === "hermes")
-    die("--no-hermes conflicts with --target hermes — pick one");
+  if (!["all", "opencode", "hermes", "dsh"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes|dsh)`);
+  if (flags["no-hermes"] && (target === "hermes" || target === "dsh"))
+    die(`--no-hermes conflicts with --target ${target} — pick one`);
+  if (flags.profile !== undefined && target !== "all" && target !== "dsh")
+    die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
   const haveOcFile = existsSync(CFG);
-  const skipHermes = !!flags["no-hermes"] || target === "opencode";
-  const wantOc = target !== "hermes" && (haveOcFile || target === "opencode");
+  // --no-hermes keeps its documented meaning (--target opencode), so dsh is
+  // not selected either; --target names exactly what is written
+  const skipHermes = !!flags["no-hermes"] || target === "opencode" || target === "dsh";
+  const skipDsh = !!flags["no-hermes"] || target === "opencode" || target === "hermes";
+  const wantOc = (target === "all" || target === "opencode") && (haveOcFile || target === "opencode");
   const wantH = !skipHermes && existsSync(HERMES_CFG);
+  const wantD = !skipDsh && (target === "dsh" || existsSync(DSH_HOME));
   // why a target was skipped: "not chosen" and "not installed" are different problems
-  const ocWhy = target === "hermes" ? "not selected (--target hermes)"
-    : !haveOcFile ? "opencode is not installed here" : "";
+  const ocWhy = target === "opencode" || target === "all" ? (haveOcFile ? "" : "opencode is not installed here")
+    : `not selected (--target ${target})`;
   const hWhy = flags["no-hermes"] ? "disabled with --no-hermes"
-    : target === "opencode" ? "not selected (--target opencode)"
+    : target === "opencode" || target === "dsh" ? `not selected (--target ${target})`
     : wantH ? "" : "hermes is not installed here";
+  const dWhy = flags["no-hermes"] ? "disabled with --no-hermes"
+    : target === "opencode" || target === "hermes" ? `not selected (--target ${target})`
+    : wantD ? "" : "dsh is not installed here";
   const fresh = wantOc && !existsSync(CFG);
   const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
   // the provider is updated in the shape its entry already uses; a new one
@@ -1200,6 +1652,10 @@ async function cmdAdd(id, url) {
   const hkey = key || configApiKey(cfg, id) || a[id]?.key || keyValue;
   const hmodel = flags.model || hmodels[0]?.id || null;
   const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
+  // dsh has its own credential store; the same raw key value is passed so an
+  // {env:VAR} reference stays a reference (apiKeyEnv) instead of becoming a
+  // literal secret in .credentials.yaml
+  const dargs = { id, name: prov.name, base, keyRaw: hkey, keyFlag: flags.key || null, keyEnvFlag: keyEnv || null, models: hmodels, create: wantD };
   const nModels = Object.keys(prov.models).length;
   // every target is reported afterwards: what was written and what was skipped, and why
   const ocLine = (verb) => wantOc
@@ -1215,14 +1671,35 @@ async function cmdAdd(id, url) {
     if (["absent", "no-section", "unparsed", "layout", "flow", "error"].includes(r.status)) return `skipped — ${r.why}`;
     return `custom_providers "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
   };
+  const dshSkip = (r) => !wantD || !r || ["absent", "empty", "refused", "overridden", "error"].includes(r.status);
+  const dshLine = (r, verb) => {
+    if (!wantD) return `skipped — ${dWhy}`;
+    if (dshSkip(r)) return `skipped — ${r.why}`;
+    return `provider "${r.pid}" ${verb}${r.status} (${r.n} models, key ref ${r.ref})`;
+  };
+  const dshKeysLine = (r, dry) => {
+    if (!wantD) return `skipped — ${dWhy}`;
+    if (dshSkip(r)) return "skipped — dsh was not written";
+    if (!r.store) return "no change (no key to store)";
+    const what = r.store === "dummy" ? `set to "dummy" (the server needs no auth)` : "stored";
+    return `key "${r.ref}" ${dry ? "would be " + what : what}`;
+  };
   let hres = { status: "off", why: hWhy };
   if (wantH) hres = hermesUpsert({ ...hargs, dryRun: true });
+  let ddres = { status: "off", why: dWhy };
+  if (wantD) {
+    try { ddres = dshUpsert({ ...dargs, dryRun: true }); }
+    catch (e) { ddres = { status: "error", why: e.message }; }
+  }
 
   if (flags["dry-run"]) {
     console.log("dry-run: nothing written. Would write:");
     console.log(`  opencode  ${disp(CFG)}  ${ocLine("would be written")}`);
     console.log(`  keys      ${keyValue ? disp(CFG) : disp(AUTH)}  ${keysLine("would be written")}`);
     console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "would be ")}`);
+    console.log(`  dsh       ${disp(ddres.file || DSH_HOME)}  ${dshLine(ddres, "would be ")}`);
+    console.log(`  dsh-keys  ${disp(DSH_STORE)}  ${dshKeysLine(ddres, true)}`);
+    if (ddres.note) console.log("      note: " + ddres.note);
     return;
   }
   if (wantOc) {
@@ -1245,18 +1722,28 @@ async function cmdAdd(id, url) {
   if (wantH)
     try { hres = hermesUpsert({ ...hargs, dryRun: false }); }
     catch (e) { hres = { status: "error", why: `cannot write ${disp(HERMES_CFG)}: ${e.message}` }; }
+  let dres = { status: "off", why: dWhy };
+  if (wantD) {
+    try { dres = dshUpsert({ ...dargs, dryRun: false }); }
+    catch (e) { dres = { status: "error", why: e.message }; }
+  }
+  if (dres.note) console.log("  note: " + dres.note);
   console.log("written:");
   console.log(`  opencode  ${disp(CFG)}  ${ocLine("")}`);
   console.log(`  keys      ${keyValue ? disp(CFG) : disp(AUTH)}  ${keysLine("")}`);
   console.log(`  hermes    ${disp(HERMES_CFG)}  ${hermesLine(hres, "")}`);
+  console.log(`  dsh       ${disp(dres.file || DSH_HOME)}  ${dshLine(dres, "")}`);
+  console.log(`  dsh-keys  ${disp(DSH_STORE)}  ${dshKeysLine(dres, false)}`);
 }
 
 async function cmdSync() {
   const target = flags.target || "all";
   const written = [];
-  if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
-  if (flags.provider && target === "hermes")
-    die("--provider is only for the opencode target — use --target all|opencode");
+  if (!["all", "opencode", "hermes", "dsh"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes|dsh)`);
+  if (flags.provider && target !== "all" && target !== "opencode")
+    die(`--provider is only for the opencode target — use --target all|opencode`);
+  if (flags.profile !== undefined && target !== "all" && target !== "dsh")
+    die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
   // --dry-run always wins: a "report what would change" run must never write,
   // even when --apply is also on the line
   const apply = !!flags.apply && !flags["dry-run"];
@@ -1353,6 +1840,18 @@ async function cmdSync() {
     if (hr?.status === "applied") written.push(`  hermes    ${disp(HERMES_CFG)}  ${hr.changes} change(s) in ${hr.providers} provider(s)`);
     else if (hr && ["absent", "no-section", "empty"].includes(hr.status)) written.push(`  hermes    ${disp(HERMES_CFG)}  skipped — ${hr.why}`);
   }
+  if (target === "all" || target === "dsh") {
+    let dr = null;
+    try { dr = await syncDsh({ apply }); }
+    catch (e) {
+      // e.g. an unwritable patch file: report it, keep going, fail the exit code
+      console.error(`error: ${e.message}`);
+      process.exitCode = 1;
+      written.push(`  dsh       ${disp(DSH_HOME)}  FAILED — nothing changed for this target`);
+    }
+    if (dr?.status === "applied") written.push(`  dsh       ${disp(dr.file)}  ${dr.changes} change(s) in ${dr.providers} provider(s)`);
+    else if (dr && ["absent", "empty", "refused", "overridden"].includes(dr.status)) written.push(`  dsh       ${disp(DSH_HOME)}  skipped — ${dr.why}`);
+  }
   if (written.length) { console.log("written:"); for (const w of written) console.log(w); }
 }
 
@@ -1407,16 +1906,16 @@ const VERSION = (() => {
 // `list --key K` used to ignore the key. Each command lists what it accepts;
 // everything else is refused with the right alternative when there is one.
 const CMD_SPEC = {
-  list: { flags: ["target"], args: 0, usage: "provider-sync list [--target all|opencode|hermes]" },
+  list: { flags: ["target", "profile"], args: 0, usage: "provider-sync list [--target all|opencode|hermes|dsh] [--profile NAME]" },
   add: {
-    flags: ["name", "key", "key-env", "username", "password", "model", "target", "no-hermes", "ctx", "output", "dry-run"],
+    flags: ["name", "key", "key-env", "username", "password", "model", "target", "profile", "no-hermes", "ctx", "output", "dry-run"],
     args: 2,
     usage: "provider-sync add <id> <baseURL> [options]",
   },
   sync: {
-    flags: ["apply", "dry-run", "target", "provider", "ctx", "output", "key"],
+    flags: ["apply", "dry-run", "target", "profile", "provider", "ctx", "output", "key"],
     args: 0,
-    usage: "provider-sync sync [--apply] [--target all|opencode|hermes] [--provider ID]",
+    usage: "provider-sync sync [--apply] [--target all|opencode|hermes|dsh] [--provider ID] [--profile NAME]",
   },
   "set-ctx": { flags: ["output", "key", "dry-run"], args: 1, usage: "provider-sync set-ctx <provider>" },
 };
@@ -1427,7 +1926,10 @@ const FLAG_HINTS = {
     key: "is not used by list — keys are never printed",
   },
   add: { apply: "is for sync — add always writes (use --dry-run to preview)" },
-  "set-ctx": { target: "is not used by set-ctx — it edits one OpenCode provider in place" },
+  "set-ctx": {
+    target: "is not used by set-ctx — it edits one OpenCode provider in place",
+    profile: "is for the dsh target — set-ctx edits one OpenCode provider in place",
+  },
 };
 function checkCommandArgs() {
   const spec = CMD_SPEC[cmd];
