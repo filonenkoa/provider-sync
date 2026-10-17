@@ -2,6 +2,14 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- Dropped the dead `loginCommand` export in `lib/opencode-auth.js`. It was
+  added for the "run: opencode auth login …" hint, but `add --key` stores keys
+  in the provider's config entry now and nothing printed the command any more;
+  only a unit test kept it alive.
+
 ## 1.1.2 — 2026-10-17
 
 ### Fixed

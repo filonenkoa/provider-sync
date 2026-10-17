@@ -1,12 +1,13 @@
 // OpenCode 2.x keeps credentials in SQLite, not in auth.json. provider-sync
-// must notice, never write the legacy file there, and say what to run instead.
+// must notice and never write the legacy file there; keys it stores itself go
+// into the provider's config entry.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { detectBackend, parseCredentialList, defaultDbPath, loginCommand } from "../lib/opencode-auth.js";
+import { detectBackend, parseCredentialList, defaultDbPath } from "../lib/opencode-auth.js";
 import { configApiKey, configApiKeyPaths, storeConfigApiKey, derefKey } from "../bin/provider-sync.js";
 import { runCliAsyncP, flat } from "./helpers.js";
 const loadCfgIn = (home) => JSON.parse(readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8"));
@@ -59,10 +60,6 @@ test("any *.db in the data directory means 2.x, whichever release channel", () =
     assert.equal(b.mode, "db");
     assert.match(b.dbPath, /opencode-beta\.db$/);
   } finally { rmSync(home, { recursive: true, force: true }); }
-});
-
-test("the documented store command is the one we tell users to run", () => {
-  assert.equal(loginCommand("myprov"), "opencode auth login myprov --method key");
 });
 
 test("derefKey resolves {env:VAR} from the process environment", () => {
