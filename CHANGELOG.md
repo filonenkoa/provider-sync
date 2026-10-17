@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.2.0 — 2026-10-17
 
 ### Added
 - **DeepSeek Harness (`dsh`) is a first-class target**: `list`, `sync` and
