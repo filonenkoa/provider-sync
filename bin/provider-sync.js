@@ -389,8 +389,8 @@ Commands:
                           the literal secret, so a config that lives in version
                           control stays clean; resolved from the environment
                           when provider-sync probes the server
-        --username U      Unsloth UI login (together with --password P)
-        --password P
+        --username U      Unsloth UI login; both flags must be passed together,
+        --password P      and only an Unsloth UI server accepts the login
         --model M         model written into the hermes entry's model:
                           field (default: first model the server reports)
         --target T        all|opencode|hermes (default all); only the chosen
@@ -1094,6 +1094,10 @@ async function cmdAdd(id, url) {
   const keyEnv = flags["key-env"];
   if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv))
     die(`--key-env needs an environment variable name, got "${keyEnv}"`);
+  // --username/--password are one Unsloth UI login: half a pair cannot log in,
+  // so it is refused up front instead of being dropped without a word
+  if (!!flags.username !== !!flags.password)
+    die("--username and --password must be given together (Unsloth UI login)");
   // validate numeric flags before anything is probed or stored
   const out = numFlag(flags.output, 1) ?? 65536;
   const ctxFlag = numFlag(flags.ctx);
@@ -1110,7 +1114,12 @@ async function cmdAdd(id, url) {
         : key ? `${base} requires auth — the stored key is ${key}, which is not set in this environment; export it or pass --key K`
         : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
   let runKey = probeKey; // credential used for this run's requests
-  if (pr.kind === "unsloth" && !runKey && flags.username && flags.password) {
+  // the pair is never a silent no-op: when it cannot be used, the report says why
+  const loginGiven = !!flags.username && !!flags.password; // both, or neither (checked above)
+  const loginSkip = loginGiven && pr.kind !== "unsloth"
+    ? `--username/--password not used — the server was detected as ${pr.kind}, not Unsloth UI, so no login was attempted`
+    : loginGiven && runKey ? "--username/--password not used — an API key is already available" : null;
+  if (loginGiven && pr.kind === "unsloth" && !runKey) {
     const r = await req(pr.root + "/api/auth/login", { method: "POST", body: { username: flags.username, password: flags.password } });
     const tok = r.json?.access_token;
     if (!tok) die(`Unsloth login failed: HTTP ${r.status} ${r.text?.slice(0, 120)}`);
@@ -1128,6 +1137,7 @@ async function cmdAdd(id, url) {
   if (!server.length) die("server returned 0 models");
 
   const notes = [];
+  if (loginSkip) notes.push(loginSkip);
   const mode = flags["dry-run"] ? "report" : "write";
   // a harness is written only if it is installed on this machine; --target
   // opencode is the explicit way to create an OpenCode config where there is none

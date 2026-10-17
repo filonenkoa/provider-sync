@@ -9,6 +9,10 @@ Format: [semver](https://semver.org). Dates are ISO.
   added for the "run: opencode auth login …" hint, but `add --key` stores keys
   in the provider's config entry now and nothing printed the command any more;
   only a unit test kept it alive.
+- `add --username`/`--password` must be given together: half a pair used to be
+  dropped without a word. A full pair that cannot be used — the server is not
+  an Unsloth UI, or an API key is already available — is now reported as a
+  note instead of being ignored.
 
 ## 1.1.2 — 2026-10-17
 
