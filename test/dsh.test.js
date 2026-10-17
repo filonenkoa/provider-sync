@@ -181,7 +181,8 @@ test("add: creates the llm-pi-ai item in the profile patch and stores the key", 
   assert.match(cfg, /apiKeyEnv: MM_API_KEY/);
   assert.match(cfg, /- id: qwen3\.8-27b\n\s+contextWindow: 262144\n/);
   assert.equal(read(home, STORE), "version: 1\nrefs:\n  MM_API_KEY: K1\n");
-  assert.equal(statSync(inHome(home, STORE)).mode & 0o777, 0o600, "the store is owner-only");
+  if (process.platform !== "win32") // process mode bits are POSIX-only
+    assert.equal(statSync(inHome(home, STORE)).mode & 0o777, 0o600, "the store is owner-only");
 });
 
 test("add: re-running updates instead of duplicating and keeps the key", async () => {
@@ -263,7 +264,7 @@ test("a home-level cordis.patch.yml targeting llm-pi-ai wins and is never fought
 test("flags: --profile picks the profile, conflicts and typos are refused", async () => {
   const home = homeWith({ [WEB]: "# h\n[]\n", ".dsh/profiles/other/cordis.patch.yml": "# other\n[]\n" });
   const out = await add(home, ["--key", "K1", "--target", "dsh", "--profile", "other"]);
-  assert.match(out, /dsh \S*profiles\/other\/cordis\.patch\.yml provider "mm" created/);
+  assert.match(out, /dsh \S*profiles[\\/]other[\\/]cordis\.patch\.yml provider "mm" created/);
   assert.equal(read(home, WEB), "# h\n[]\n", "web was not touched");
   await assert.rejects(() => add(home, ["--target", "dsh", "--profile", "nope"]), /no dsh profile "nope"/);
   await assert.rejects(() => add(home, ["--target", "opencode", "--profile", "other"]),
