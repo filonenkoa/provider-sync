@@ -184,9 +184,17 @@ test("both config schemas round-trip a key", () => {
   assert.equal(configApiKey(v2, "b"), "K");
   // the path shown in the report is the path actually written
   assert.deepEqual(configApiKeyPaths(v2, "b"), storeConfigApiKey(v2, "b", "K"));
-  const mixed = { provider: {}, providers: { c: { settings: {} } } };
-  assert.deepEqual(configApiKeyPaths(mixed, "c"), ["providers.c.settings.apiKey", "provider.c.options.apiKey"]);
-  assert.deepEqual(storeConfigApiKey(mixed, "c", "K"), configApiKeyPaths(mixed, "c"));
+  // the key goes to the entry's own shape only: OpenCode 2.x lets a native
+  // entry shadow a legacy one wholesale, so a duplicate is not harmless
+  const mixed = { provider: { d: { options: {} } }, providers: { c: { settings: {} } } };
+  assert.deepEqual(configApiKeyPaths(mixed, "c"), ["providers.c.settings.apiKey"]);
+  assert.deepEqual(storeConfigApiKey(mixed, "c", "K"), ["providers.c.settings.apiKey"]);
+  assert.deepEqual(configApiKeyPaths(mixed, "d"), ["provider.d.options.apiKey"]);
+  assert.deepEqual(storeConfigApiKey(mixed, "d", "K"), ["provider.d.options.apiKey"]);
+  assert.equal("d" in mixed.providers, false, "no partial native entry for a legacy provider");
+  // a brand-new id in a providers-only config follows the 2.x dialect
+  const v2only = { providers: {} };
+  assert.deepEqual(configApiKeyPaths(v2only, "e"), ["providers.e.settings.apiKey"]);
 });
 
 test("a mixed install still uses the readable key and says it may be stale", { skip: process.platform === "win32" }, async () => {

@@ -32,12 +32,46 @@ Format: [semver](https://semver.org). Dates are ISO.
   `--key K` hint — instead of "key missing or invalid".
 - `list --target hermes` no longer prints the OpenCode database/keys line,
   which belongs to the opencode target.
+- OpenCode 2.x's native config shape (`providers.<id>`) is handled in place:
+  `add`/`sync`/`list` read `settings.baseURL`/`settings.apiKey`/`models`
+  (limits, capabilities) from it and write updates back into that shape, where
+  they used to go to a legacy `provider.<id>` entry that 2.x silently ignores
+  when a native entry exists. A new provider in a `providers`-only config is
+  written in 2.x shape (package/settings/models); `list` marks such entries
+  `(2.x)`. Verified end-to-end against OpenCode 2.0.30: the key arrives as the
+  bearer token for native, legacy and mixed configs.
+- API keys are written into the entry's own shape only —
+  `provider.<id>.options.apiKey` or `providers.<id>.settings.apiKey`. The old
+  "write both paths whenever the config has a `providers` section" could plant
+  a native entry holding nothing but a key, and OpenCode 2.x serves a native
+  entry whole in place of the legacy one — shadowing and breaking the provider
+  with "Model unavailable".
+- Config discovery honors `$OPENCODE_CONFIG`: OpenCode loads that explicit file
+  after the global config, so provider-sync edits the file that wins instead of
+  one whose provider entries are overridden.
+- A `config.json` setup on a machine with a 2.x database gets a note:
+  `config.json` is a 1.x name and OpenCode 2.x reads only `opencode.json` /
+  `opencode.jsonc`, so edits there change nothing.
+- `loadCfg` no longer injects an empty `provider` section into the parsed
+  config — that made a 2.x-only config look like a mixed one and fed the
+  key-path bug above.
+- Flags that mean nothing for the command are refused like unknown ones
+  (`sync --no-hermes` points at `--target opencode`; same for `list --key`,
+  `add --apply`, `set-ctx --target`), positional arguments are checked per
+  command (`list extra`, `sync oops`), `sync --provider` refuses unknown or
+  disabled ids instead of reporting "no providers to check" and rejects
+  `--provider` together with `--target hermes`; `add --no-hermes` together with
+  `--target hermes` is a conflict. `--help`/`-h`/`--version`/`-v` work on any
+  command (`add --help` prints help instead of complaining about a missing
+  baseURL).
 - Docs: the writer lock lives in the system temp directory (keyed by the config
   directory), not at `~/.config/opencode/.provider-sync.lock` (README and help);
   the README install snippet shows the current version; `--key-env` is
   documented in `help`; the Unsloth 401 message no longer points at `auth.json`
   (keys live in the config entry since 1.1.1); `help` lists `--key`/`--dry-run`
-  for `sync` and `set-ctx` and the flag-strictness rule under Safety.
+  for `sync` and `set-ctx` and the flag-strictness rule under Safety. README,
+  AGENTS.md and `help` also document the 2.x `providers` shape, the
+  one-entry-per-provider rule and `$OPENCODE_CONFIG`.
 
 ## 1.1.1 — 2026-10-15
 

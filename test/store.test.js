@@ -27,9 +27,11 @@ const captureErrors = (fn) => {
 before(() => writeCfg('{\n  "provider": {}\n}\n'));
 after(() => rmSync(home, { recursive: true, force: true }));
 
-test("a missing provider section is created on load, not on write", () => {
+test("load does not invent a provider section — the write creates it", () => {
+  // injecting `provider: {}` at load used to make the 2.x `providers`-only
+  // shape unreachable and hid that a config has no legacy section at all
   writeCfg('{\n  "plugin": ["x"]\n}\n');
-  assert.deepEqual(loadCfg(), { plugin: ["x"], provider: {} });
+  assert.deepEqual(loadCfg(), { plugin: ["x"] });
 });
 
 test("existing keys survive a load/save round trip", () => {

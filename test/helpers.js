@@ -14,7 +14,10 @@ export const CLI = fileURLToPath(new URL("../bin/provider-sync.js", import.meta.
 // tests at the runner's real config directory.
 export function hermeticEnv(home, extra = {}) {
   const env = { ...process.env, ...extra };
-  for (const k of ["OPENCODE_CONFIG_DIR", "PS_CONFIG", "OCP_CONFIG"]) delete env[k];
+  // pin every variable that can move the paths, but let a test re-set one on
+  // purpose by passing it in `extra`
+  for (const k of ["OPENCODE_CONFIG_DIR", "PS_CONFIG", "OCP_CONFIG", "OPENCODE_CONFIG", "OPENCODE_DB"])
+    if (!(k in extra)) delete env[k];
   env.HOME = home;
   env.USERPROFILE = home;
   env.XDG_CONFIG_HOME = path.join(home, ".config");
@@ -29,6 +32,8 @@ export function pinHomeForImport(home) {
   delete process.env.OPENCODE_CONFIG_DIR;
   delete process.env.PS_CONFIG;
   delete process.env.OCP_CONFIG;
+  delete process.env.OPENCODE_CONFIG;
+  delete process.env.OPENCODE_DB;
 }
 
 export const runCli = (home, args = [], opts = {}) =>

@@ -10,16 +10,19 @@ import { fileURLToPath } from "node:url";
 import { detectBackend, listCredentials } from "../lib/opencode-auth.js";
 import { createHash } from "node:crypto";
 
-// config file resolution mirrors OpenCode's own discovery (config.ts):
-// PS_CONFIG override (legacy: OCP_CONFIG) > first existing of opencode.jsonc / opencode.json /
-// config.json in $OPENCODE_CONFIG_DIR or $XDG_CONFIG_HOME/opencode (~/.config/opencode)
+// config file resolution mirrors OpenCode's own discovery: PS_CONFIG override
+// (legacy: OCP_CONFIG), else the explicit file OpenCode loads after the global
+// config ($OPENCODE_CONFIG), else the first existing of opencode.jsonc /
+// opencode.json / config.json in $OPENCODE_CONFIG_DIR or
+// $XDG_CONFIG_HOME/opencode (~/.config/opencode). jsonc wins over json on both
+// 1.x and 2.x; config.json only exists on 1.x (2.x reads the first two names).
 const CFG_DIR = process.env.OPENCODE_CONFIG_DIR || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "opencode");
 const CFG_CANDIDATES = ["opencode.jsonc", "opencode.json", "config.json"];
 function detectCfg() {
   const hit = CFG_CANDIDATES.find((f) => existsSync(path.join(CFG_DIR, f)));
   return path.join(CFG_DIR, hit || CFG_CANDIDATES[0]);
 }
-const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || null;
+const CFG_ENV = process.env.PS_CONFIG || process.env.OCP_CONFIG || process.env.OPENCODE_CONFIG || null;
 export const CFG = CFG_ENV || detectCfg();
 const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
 // OpenCode 1.x keeps credentials in that file; 2.x keeps them in SQLite and
@@ -105,6 +108,7 @@ const cfgStore = {
   hadComments: false, // the loaded file had comments, which a rewrite would drop
   warnedMulti: false, // the "several config files" note was already printed
   warnedComments: false,
+  warnedLegacyName: false, // the "config.json is a 1.x name" note was already printed
   load() {
     if (!existsSync(CFG)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
     if (!this.warnedMulti && !CFG_ENV) {
@@ -112,52 +116,83 @@ const cfgStore = {
       const present = CFG_CANDIDATES.filter((f) => existsSync(path.join(CFG_DIR, f)));
       if (present.length > 1) console.error(`note: multiple config files in ${CFG_DIR} (${present.join(", ")}); OpenCode deep-merges them — provider-sync edits ${path.basename(CFG)}`);
     }
+    // editing a file OpenCode 2.x does not read would "work" but change nothing
+    if (!this.warnedLegacyName && !CFG_ENV && path.basename(CFG) === "config.json" && authInDb) {
+      this.warnedLegacyName = true;
+      console.error("note: config.json is an OpenCode 1.x config name — 2.x reads opencode.json / opencode.jsonc and will ignore edits made here");
+    }
     const { text, hadComments } = parseJsonc(readFileSync(CFG, "utf8"));
     this.hadComments = hadComments;
     try {
       const p = JSON.parse(text);
-      if (!p.provider) p.provider = {}; // fresh configs have no provider section
+      if (!p || typeof p !== "object" || Array.isArray(p)) die(`${CFG} must contain a JSON object`);
       return p;
     }
     catch (e) { die(`cannot parse ${CFG}: ${e.message}`); }
   },
 };
 export const loadCfg = () => cfgStore.load();
+// ---------- provider shapes (1.x vs 2.x) ----------
+// OpenCode 1.x wrote provider.<id> entries (`npm`, `options.baseURL/apiKey`,
+// `models`). OpenCode 2.x reads that legacy shape by migrating it at load, but
+// writes its own native shape providers.<id> (`package`, `settings.baseURL` /
+// `settings.apiKey`, `models`). When both sections name the same id, 2.x lets
+// the native entry REPLACE the legacy one wholesale — so a native entry that
+// holds only a key would shadow (and break) a complete legacy definition.
+// provider-sync therefore keeps each provider in a single shape: the one its
+// entry already uses. A brand-new provider follows the file's dialect — native
+// only in a config that has `providers` and no `provider` (a 2.x file), legacy
+// everywhere else (1.x, and mixed files, where legacy also works on 2.x).
+export function providerShape(cfg, id) {
+  const native = cfg?.providers?.[id];
+  if (native && typeof native === "object") return { shape: "native", entry: native };
+  const legacy = cfg?.provider?.[id];
+  if (legacy && typeof legacy === "object") return { shape: "legacy", entry: legacy };
+  return { shape: cfg?.providers && !cfg?.provider ? "native" : "legacy", entry: null };
+}
+export const entryBaseURL = (shape, entry) => (shape === "native" ? entry?.settings?.baseURL : entry?.options?.baseURL);
+export const entryApiKey = (shape, entry) => (shape === "native" ? entry?.settings?.apiKey : entry?.options?.apiKey);
+// every provider id, legacy section first; a shadowed legacy id appears once
+// and resolves to the native entry (which is what OpenCode 2.x will use)
+export function providerIds(cfg) {
+  const seen = new Set();
+  const ids = [];
+  for (const id of [...Object.keys(cfg?.provider || {}), ...Object.keys(cfg?.providers || {})])
+    if (!seen.has(id)) { seen.add(id); ids.push(id); }
+  return ids;
+}
 // What we know about a provider's credential, without pretending to more.
 //   value    — readable, usable for probing
 //   stored   — present, but in OpenCode's database: we can see that it exists
 //              and nothing else, which is all the documentation allows
 //   absent   — no credential anywhere we know of
-// The key OpenCode itself will use for this provider. Verified against the real
-// binary: a key in the provider entry is sent as the bearer token (1.x:
+// The key OpenCode itself will use for this provider: the entry's own shape
+// wins, exactly like OpenCode's own load order. Verified against the real
+// binary: a key in the provider entry arrives as the bearer token (1.x:
 // provider.<id>.options.apiKey; 2.x: providers.<id>.settings.apiKey). This is
 // also the only store that works without an interactive login, which is why
 // `add --key` writes here rather than into auth.json or the database.
 export function configApiKey(cfg, id) {
-  const v1 = cfg?.provider?.[id]?.options?.apiKey;
-  if (typeof v1 === "string" && v1) return v1;
-  const v2 = cfg?.providers?.[id]?.settings?.apiKey;
-  if (typeof v2 === "string" && v2) return v2;
-  return null;
+  const { shape, entry } = providerShape(cfg, id);
+  const v = entry ? entryApiKey(shape, entry) : null;
+  return typeof v === "string" && v ? v : null;
 }
 export function configApiKeyPaths(cfg, id) {
-  // a config that only has `providers` is a 2.x config: write its shape, not 1.x's
-  const v2only = Boolean(cfg.providers) && !cfg.provider;
-  const where = [];
-  if (cfg.providers) where.push(`providers.${id}.settings.apiKey`);
-  if (!v2only) where.push(`provider.${id}.options.apiKey`);
-  return where;
+  return [providerShape(cfg, id).shape === "native" ? `providers.${id}.settings.apiKey` : `provider.${id}.options.apiKey`];
 }
+// Call with the provider entry itself already present (cmdAdd writes the full
+// entry first): for a native provider this must not be the only thing written,
+// because a native entry without `package`/`models` shadows the legacy one.
 export function storeConfigApiKey(cfg, id, key) {
-  for (const path of configApiKeyPaths(cfg, id)) {
-    if (path.startsWith("providers.")) {
-      cfg.providers[id] = cfg.providers[id] || {};
-      cfg.providers[id].settings = { ...(cfg.providers[id].settings || {}), apiKey: key };
-    } else {
-      cfg.provider = cfg.provider || {};
-      cfg.provider[id] = cfg.provider[id] || {};
-      cfg.provider[id].options = { ...(cfg.provider[id].options || {}), apiKey: key };
-    }
+  const { shape } = providerShape(cfg, id);
+  if (shape === "native") {
+    cfg.providers = cfg.providers || {};
+    cfg.providers[id] = cfg.providers[id] || {};
+    cfg.providers[id].settings = { ...(cfg.providers[id].settings || {}), apiKey: key };
+  } else {
+    cfg.provider = cfg.provider || {};
+    cfg.provider[id] = cfg.provider[id] || {};
+    cfg.provider[id].options = { ...(cfg.provider[id].options || {}), apiKey: key };
   }
   return configApiKeyPaths(cfg, id);
 }
@@ -294,13 +329,16 @@ Run \`provider-sync\`, \`provider-sync help\`, \`-h\` or \`--help\` to see this 
 \`--version\` prints the version.
 
 Files:
-  config   $OPENCODE_CONFIG_DIR or ~/.config/opencode — first existing of
-           opencode.jsonc, opencode.json, config.json (same discovery as
-           OpenCode itself; override with PS_CONFIG=/path/to/file)
-  keys     provider.<id>.options.apiKey         API keys — written into the
-           provider entry of your own config; OpenCode sends it as the bearer
-           token. OpenCode's own stores (auth.json on 1.x, opencode.db on 2.x)
-           are read-only for provider-sync: presence is reported, never changed
+  config   $OPENCODE_CONFIG (an explicit config file) else the first existing
+           of opencode.jsonc, opencode.json, config.json in $OPENCODE_CONFIG_DIR
+           or ~/.config/opencode — the same choice OpenCode itself makes
+           (override with PS_CONFIG=/path/to/file; 2.x ignores config.json)
+  keys     provider.<id>.options.apiKey (1.x entry) or
+           providers.<id>.settings.apiKey (2.x entry) — API keys are written
+           into the shape the provider entry already uses, and OpenCode sends
+           it as the bearer token. OpenCode's own stores (auth.json on 1.x,
+           opencode.db on 2.x) are read-only for provider-sync: presence is
+           reported, never changed
   hermes   ~/.hermes/config.yaml               custom_providers (if installed)
            ~/.hermes/.env                      key source for Hermes providers
 
@@ -308,9 +346,10 @@ Commands:
   provider-sync list [--target all|opencode|hermes]
       List configured providers per harness — id/name, model count, base URL
       and key status (for Hermes also where the key comes from: literal,
-      ~/.hermes/.env, or borrowed from a matching OpenCode provider). A
-      harness that is not installed is reported as "not found — skipped"
-      instead of failing, so a Hermes-only or OpenCode-only machine is fine.
+      ~/.hermes/.env, or borrowed from a matching OpenCode provider). Entries
+      living in the 2.x \`providers\` section are marked (2.x). A harness that
+      is not installed is reported as "not found — skipped" instead of
+      failing, so a Hermes-only or OpenCode-only machine is fine.
 
   provider-sync add <id> <baseURL> [options]
       Register or update a provider. The server type is auto-detected:
@@ -332,6 +371,12 @@ Commands:
       base URL, so re-running updates instead of duplicating). A harness that
       is not installed is left alone — no config file is created for it — and
       --target opencode is how you ask for one to be created anyway.
+      Entry shapes: a provider whose entry lives in the 2.x \`providers\`
+      section is updated in that shape (package/settings/models); a legacy
+      provider.<id> entry stays legacy (2.x migrates it at load). A config
+      with only \`providers\` — a 2.x file — gets new providers in 2.x shape.
+      provider-sync never writes a second entry for the same id: OpenCode 2.x
+      would let the partial one shadow and break the real entry.
       Whatever happens, the last lines report per target: what was written,
       what was skipped, and which of the two reasons it was.
       Options:
@@ -380,9 +425,11 @@ Commands:
       hermes-only and opencode-only machines work. Asking for a target
       explicitly (--target opencode / --provider ID) without an OpenCode
       config is still an error.
-      Options: --provider ID (opencode target only), --ctx N, --output N,
+      Options: --provider ID (opencode target only; asks for an unknown or
+      disabled provider are refused, not silently empty), --ctx N, --output N,
       --key K (used for this run only — never stored), --dry-run (report
-      only; --dry-run always wins over --apply).
+      only; --dry-run always wins over --apply). Providers in the 2.x
+      \`providers\` shape are checked and updated in place.
 
   provider-sync set-ctx <provider>
       Interactively re-ask the context window for every model whose server
@@ -435,7 +482,11 @@ Safety:
     cannot interleave; read-only commands never take it
   - --dry-run never writes, in add, sync and set-ctx alike (with --apply on
     the same line it still wins); an unknown flag or a value on a boolean flag
-    (--apply=false) is refused instead of guessed
+    (--apply=false) is refused instead of guessed, and so is a known flag that
+    means nothing for the command it sits on (sync --no-hermes, list --key)
+  - each provider is kept in exactly one entry shape — the one it already
+    uses — because a second, partial entry for the same id would shadow and
+    break the real one on OpenCode 2.x
   - on errors nothing is reported as written and provider-sync exits non-zero
 
 Examples:
@@ -623,28 +674,44 @@ async function resolveCtxs(server, { ctxFlag, mode, notes, existing = [] }) {
   return map;
 }
 
-function freshEntry(id, m, { out, ctxMap }) {
+// Model fields differ per shape: legacy entries use modalities / attachment /
+// tool_call / reasoning; native 2.x entries use capabilities (input / output /
+// tools / reasoning). The information maps 1:1, only the field names change.
+function freshEntry(id, m, { out, ctxMap, shape = "legacy" }) {
   const inp = m.input || MOD_BY_ID(id);
   const raw = m.ctx ?? ctxMap?.[id] ?? null;
   const c = typeof raw === "number" && raw > 0 ? raw : null; // ctx 0 means "omit the limit"
   const e = { name: id };
-  if (inp.length > 1) e.attachment = true;
-  e.modalities = { input: inp, output: ["text"] };
+  if (shape === "native") {
+    e.capabilities = { tools: TOOL_BY_ID(id), input: inp, output: ["text"] };
+    if (REASON_BY_ID(id)) e.capabilities.reasoning = { supported: true };
+  } else {
+    // `attachment` is implied by the input modalities in the 2.x shape
+    if (inp.length > 1) e.attachment = true;
+    e.modalities = { input: inp, output: ["text"] };
+    e.tool_call = TOOL_BY_ID(id);
+    if (REASON_BY_ID(id)) e.reasoning = true;
+  }
   if (c != null) e.limit = { context: c, output: out };
-  e.tool_call = TOOL_BY_ID(id);
-  if (REASON_BY_ID(id)) e.reasoning = true;
   return e;
 }
 export function upsertEntry(old, m, opts) {
+  const shape = opts.shape || "legacy";
   if (!old) return freshEntry(m.id, m, opts);
   const e = structuredClone(old);
-  if (m.input) e.modalities = { input: m.input, output: e.modalities?.output || ["text"] };
+  if (m.input) {
+    if (shape === "native")
+      e.capabilities = { ...(e.capabilities || {}), input: m.input, output: e.capabilities?.output || ["text"] };
+    else e.modalities = { input: m.input, output: e.modalities?.output || ["text"] };
+  }
   if (m.ctx != null) e.limit = { context: m.ctx, output: e.limit?.output || opts.out };
   return e;
 }
+// the input modalities an entry declares, whichever shape it is written in
+export const entryInputMods = (shape, m) => ((shape === "native" ? m?.capabilities?.input : m?.modalities?.input) || []);
 
 // existing models object + server specs -> merged + diff
-export function reconcile(models, server, { out, ctxMap }) {
+export function reconcile(models, server, { out, ctxMap, shape = "legacy" }) {
   const res = { added: [], removed: [], ctx: [], mods: [] };
   const next = {};
   const seen = new Set();
@@ -652,12 +719,12 @@ export function reconcile(models, server, { out, ctxMap }) {
     seen.add(m.id);
     if (m.skip) { if (models[m.id]) next[m.id] = models[m.id]; continue; }
     const old = models[m.id];
-    next[m.id] = upsertEntry(old, m, { out, ctxMap });
+    next[m.id] = upsertEntry(old, m, { out, ctxMap, shape });
     if (!old) res.added.push(m.id);
     else {
       if (m.ctx != null && old.limit?.context !== m.ctx) res.ctx.push([m.id, old.limit?.context, m.ctx]);
-      if (m.input && JSON.stringify(old.modalities?.input || []) !== JSON.stringify(m.input))
-        res.mods.push([m.id, old.modalities?.input || [], m.input]);
+      if (m.input && JSON.stringify(entryInputMods(shape, old)) !== JSON.stringify(m.input))
+        res.mods.push([m.id, entryInputMods(shape, old), m.input]);
     }
   }
   for (const id of Object.keys(models)) if (!seen.has(id)) { res.removed.push(id); delete next[id]; }
@@ -702,15 +769,16 @@ function hermesKey(e, ocCfg, ocAuth) {
   }
   if (e.key_env) return { key: hermesEnv()[e.key_env] || null };
   let miss = null;
-  for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-    if (normUrl(p.options?.baseURL) === normUrl(e.base_url)) {
-      const c = credentialFor(pid, ocAuth, ocCfg);
-      if (c.key) return { key: c.key }; // the first readable key wins
-      if (!miss) {
-        if (c.state === "unresolved") miss = { key: null, ref: c.ref, from: pid };
-        else if (c.state === "stored" || c.state === "unknown") miss = { key: null, dbKey: true, from: pid };
-      }
+  for (const pid of providerIds(ocCfg)) {
+    const { shape, entry } = providerShape(ocCfg, pid);
+    if (normUrl(entryBaseURL(shape, entry)) !== normUrl(e.base_url)) continue;
+    const c = credentialFor(pid, ocAuth, ocCfg);
+    if (c.key) return { key: c.key }; // the first readable key wins
+    if (!miss) {
+      if (c.state === "unresolved") miss = { key: null, ref: c.ref, from: pid };
+      else if (c.state === "stored" || c.state === "unknown") miss = { key: null, dbKey: true, from: pid };
     }
+  }
   return miss || { key: null };
 }
 
@@ -720,16 +788,19 @@ function hermesKeySource(e, ocCfg, ocAuth) {
   if (e.api_key && e.api_key !== "dummy")
     return e.api_key.startsWith("${") && e.api_key.endsWith("}") ? "key (env)" : "key";
   if (e.key_env) return hermesEnv()[e.key_env] ? "key (env)" : `no-key (${e.key_env} is unset in ~/.hermes/.env)`;
-  for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-    if (normUrl(p.options?.baseURL) === normUrl(e.base_url)) {
-      const c = credentialFor(pid, ocAuth, ocCfg);
-      if (c.state === "value") return `key (borrowed from ${pid})`;
-      if (c.state === "unresolved") return `no-key (${c.ref} from ${pid} is unset)`;
-    }
+  for (const pid of providerIds(ocCfg)) {
+    const { shape, entry } = providerShape(ocCfg, pid);
+    if (normUrl(entryBaseURL(shape, entry)) !== normUrl(e.base_url)) continue;
+    const c = credentialFor(pid, ocAuth, ocCfg);
+    if (c.state === "value") return `key (borrowed from ${pid})`;
+    if (c.state === "unresolved") return `no-key (${c.ref} from ${pid} is unset)`;
+  }
   if (authInDb) {
-    for (const [pid, p] of Object.entries(ocCfg.provider || {}))
-      if (normUrl(p.options?.baseURL) === normUrl(e.base_url) && credentialFor(pid, ocAuth).state === "stored")
+    for (const pid of providerIds(ocCfg)) {
+      const { shape, entry } = providerShape(ocCfg, pid);
+      if (normUrl(entryBaseURL(shape, entry)) === normUrl(e.base_url) && credentialFor(pid, ocAuth).state === "stored")
         return "no-key (opencode has a key for this server, stored in its database)";
+    }
   }
   return "no-key";
 }
@@ -893,17 +964,23 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
 
 // ---------- validation ----------
 const MODS = new Set(["text", "image", "audio", "video", "pdf"]);
+// keys provider-sync itself writes into a legacy model entry; native 2.x
+// entries have OpenCode's own (larger) schema, so the unknown-key check is
+// legacy-only
 const MODEL_KEYS = new Set(["name", "attachment", "modalities", "limit", "tool_call", "reasoning", "options"]);
 function validate(cfg) {
   const errs = [];
-  for (const [pid, p] of Object.entries(cfg.provider || {})) {
-    for (const k of Object.keys(p.models || {})) {
-      const m = p.models[k];
-      for (const key of Object.keys(m)) if (!MODEL_KEYS.has(key)) errs.push(`${pid}/${k}: unknown model key "${key}"`);
+  for (const pid of providerIds(cfg)) {
+    const { shape, entry } = providerShape(cfg, pid);
+    const boxes = (m) => (shape === "native" ? m.capabilities : m.modalities);
+    for (const k of Object.keys(entry?.models || {})) {
+      const m = entry.models[k];
+      if (shape === "legacy")
+        for (const key of Object.keys(m)) if (!MODEL_KEYS.has(key)) errs.push(`${pid}/${k}: unknown model key "${key}"`);
       if (m.limit && (!m.limit.context || !m.limit.output)) errs.push(`${pid}/${k}: limit needs context+output`);
       for (const side of ["input", "output"])
-        for (const v of m.modalities?.[side] || []) if (!MODS.has(v)) errs.push(`${pid}/${k}: bad modality "${v}"`);
-      if (m.modalities?.input && !m.modalities.input.includes("text")) errs.push(`${pid}/${k}: input must include "text"`);
+        for (const v of boxes(m)?.[side] || []) if (!MODS.has(v)) errs.push(`${pid}/${k}: bad modality "${v}"`);
+      if (boxes(m)?.input && !boxes(m).input.includes("text")) errs.push(`${pid}/${k}: input must include "text"`);
     }
   }
   return errs;
@@ -919,9 +996,9 @@ async function cmdSetCtx(pid) {
   if (!process.stdin.isTTY) die("set-ctx needs an interactive terminal");
   const out = numFlag(flags.output, 1) ?? 65536;
   const cfg = loadCfg();
-  const p = cfg.provider[pid];
+  const { shape, entry: p } = providerShape(cfg, pid);
   if (!p) die(`unknown provider "${pid}" (see provider-sync list)`);
-  const base = p.options?.baseURL;
+  const base = entryBaseURL(shape, p);
   const own = credentialFor(pid, loadAuth(), cfg);
   const key = own.key || flags.key || null;
   const pr = await probeCached(base, key);
@@ -978,12 +1055,14 @@ function cmdList() {
     if (!haveOc) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
     else {
       console.log(`opencode  ${disp(CFG)}`);
-      const ids = Object.keys(cfg.provider || {});
+      const ids = providerIds(cfg);
       if (!ids.length) console.log("  (no providers)");
       for (const id of ids) {
-        const p = cfg.provider[id];
-        const n = Object.keys(p.models || {}).length;
-        console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${(p.options?.baseURL || "-")}  ${credentialLabel(credentialFor(id, auth, cfg))}`);
+        const { shape, entry } = providerShape(cfg, id);
+        const n = Object.keys(entry?.models || {}).length;
+        // `providers` entries are the 2.x-native shape (provider-sync edits them in place)
+        const mark = shape === "native" ? " (2.x)" : "";
+        console.log(`  ${(id + mark).padEnd(20)} ${String(n).padStart(3)} models  ${(entryBaseURL(shape, entry) || "-")}  ${credentialLabel(credentialFor(id, auth, cfg))}`);
       }
     }
   }
@@ -1054,6 +1133,8 @@ async function cmdAdd(id, url) {
   // opencode is the explicit way to create an OpenCode config where there is none
   const target = flags.target || "all";
   if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  if (flags["no-hermes"] && target === "hermes")
+    die("--no-hermes conflicts with --target hermes — pick one");
   const haveOcFile = existsSync(CFG);
   const skipHermes = !!flags["no-hermes"] || target === "opencode";
   const wantOc = target !== "hermes" && (haveOcFile || target === "opencode");
@@ -1066,21 +1147,35 @@ async function cmdAdd(id, url) {
     : wantH ? "" : "hermes is not installed here";
   const fresh = wantOc && !existsSync(CFG);
   const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
-  const oldProv = cfg.provider[id] || {};
+  // the provider is updated in the shape its entry already uses; a new one
+  // follows the file's dialect (see providerShape)
+  const { shape, entry } = providerShape(cfg, id);
+  const oldProv = entry || {};
+  if (cfg.providers?.[id] && cfg.provider?.[id])
+    notes.push(`${id} exists in both "provider" and "providers" — OpenCode 2.x uses providers.${id}; updating that entry`);
   const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
-  const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes });
+  const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes, shape });
   // --key stores a literal secret; --key-env stores a {env:VAR} reference so the
   // secret stays out of a file that people commit
   const keyValue = key ? key : keyEnv ? `{env:${keyEnv}}` : null;
   const keyWhere = keyValue ? configApiKeyPaths(cfg, id) : [];
-  const prov = {
-    ...oldProv, // preserve any user-added provider-level fields
-    name: flags.name || oldProv.name || id,
-    npm: oldProv.npm || "@ai-sdk/openai-compatible",
-    options: { ...(oldProv.options || {}), baseURL: base },
-    models: res.models,
-  };
-  cfg.provider[id] = prov;
+  const prov = shape === "native"
+    ? {
+        ...oldProv, // preserve any user-added fields (env, canonical, headers, ...)
+        name: flags.name || oldProv.name || id,
+        package: oldProv.package || "@opencode/ai/providers/openai-compatible",
+        settings: { ...(oldProv.settings || {}), baseURL: base },
+        models: res.models,
+      }
+    : {
+        ...oldProv, // preserve any user-added provider-level fields
+        name: flags.name || oldProv.name || id,
+        npm: oldProv.npm || "@ai-sdk/openai-compatible",
+        options: { ...(oldProv.options || {}), baseURL: base },
+        models: res.models,
+      };
+  if (shape === "native") { cfg.providers = cfg.providers || {}; cfg.providers[id] = prov; }
+  else { cfg.provider = cfg.provider || {}; cfg.provider[id] = prov; }
   console.log(`${id} (${pr.kind}, ${base}): ${Object.keys(prov.models).length} models`);
   for (const a of res.added) console.log(`  + ${a}`);
   for (const a of res.removed) console.log(`  - ${a} (no longer on server)`);
@@ -1150,6 +1245,8 @@ async function cmdSync() {
   const target = flags.target || "all";
   const written = [];
   if (!["all", "opencode", "hermes"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes)`);
+  if (flags.provider && target === "hermes")
+    die("--provider is only for the opencode target — use --target all|opencode");
   // --dry-run always wins: a "report what would change" run must never write,
   // even when --apply is also on the line
   const apply = !!flags.apply && !flags["dry-run"];
@@ -1168,10 +1265,18 @@ async function cmdSync() {
     const out = numFlag(flags.output, 1) ?? 65536;
     const ctxFlag = numFlag(flags.ctx);
     const mode = apply ? "write" : "report";
-    const ids = Object.keys(cfg.provider || {}).filter((id) => !disabled.has(id) && (!flags.provider || flags.provider === id));
+    const allIds = providerIds(cfg);
+    // a named provider that is not there is a mistake, not "nothing to check"
+    if (flags.provider && !allIds.includes(flags.provider))
+      die(`unknown provider "${flags.provider}" (see provider-sync list)`);
+    const ids = allIds.filter((id) => !disabled.has(id) && (!flags.provider || flags.provider === id));
+    if (!ids.length && flags.provider)
+      die(`${flags.provider} is disabled (disabled_providers in the config) — nothing to check`);
     if (!ids.length) console.log("opencode: no providers to check");
     const rs = await Promise.all(ids.map(async (id) => {
-      const base = cfg.provider[id].options?.baseURL;
+      const { shape, entry } = providerShape(cfg, id);
+      if (!entry) return { id, err: "provider entry is not an object" };
+      const base = entryBaseURL(shape, entry);
       if (!base) return { id, err: "no baseURL in config" };
       const own = credentialFor(id, auth, cfg);
       const key = own.key || flags.key || null; // a readable key, or one passed for this run
@@ -1198,9 +1303,10 @@ async function cmdSync() {
       }
       if (r.err) { console.log(`${r.id}: ERROR — ${r.err}`); continue; }
       const notes = [];
-      const cur = cfg.provider[r.id].models || {};
+      const { shape: pshape, entry: pentry } = providerShape(cfg, r.id);
+      const cur = pentry?.models || {};
       const ctxMap = await resolveCtxs(r.server, { ctxFlag, mode, notes, existing: Object.keys(cur) });
-      const res = reconcile(cur, r.server, { out, ctxMap, notes });
+      const res = reconcile(cur, r.server, { out, ctxMap, notes, shape: pshape });
       const n = r.server.filter((m) => !m.skip).length;
       console.log(`${r.id} (${r.kind}, ${r.base}): ${n} on server, ${Object.keys(cur).length} in config`);
       for (const a of res.added) console.log(`  + ${a}`);
@@ -1211,7 +1317,7 @@ async function cmdSync() {
       const total = res.added.length + res.ctx.length + res.mods.length + res.removed.length;
       if (!total) { console.log("  in sync"); continue; }
       changes += total;
-      if (apply) { cfg.provider[r.id].models = res.models; console.log(`  APPLIED ${total} change(s)`); }
+      if (apply) { pentry.models = res.models; console.log(`  APPLIED ${total} change(s)`); }
     }
     if (apply && changes) {
       try {
@@ -1285,6 +1391,47 @@ const VERSION = (() => {
   catch { return "unknown"; }
 })();
 
+// ---------- per-command argument check ----------
+// A flag that parses but means nothing for the command it is attached to must
+// not silently do nothing: `sync --no-hermes` used to sync both harnesses and
+// `list --key K` used to ignore the key. Each command lists what it accepts;
+// everything else is refused with the right alternative when there is one.
+const CMD_SPEC = {
+  list: { flags: ["target"], args: 0, usage: "provider-sync list [--target all|opencode|hermes]" },
+  add: {
+    flags: ["name", "key", "key-env", "username", "password", "model", "target", "no-hermes", "ctx", "output", "dry-run"],
+    args: 2,
+    usage: "provider-sync add <id> <baseURL> [options]",
+  },
+  sync: {
+    flags: ["apply", "dry-run", "target", "provider", "ctx", "output", "key"],
+    args: 0,
+    usage: "provider-sync sync [--apply] [--target all|opencode|hermes] [--provider ID]",
+  },
+  "set-ctx": { flags: ["output", "key", "dry-run"], args: 1, usage: "provider-sync set-ctx <provider>" },
+};
+const FLAG_HINTS = {
+  sync: { "no-hermes": "is for add — sync narrows harnesses with --target opencode" },
+  list: {
+    provider: "is for sync/add — list shows every provider; use --target to narrow harnesses",
+    key: "is not used by list — keys are never printed",
+  },
+  add: { apply: "is for sync — add always writes (use --dry-run to preview)" },
+  "set-ctx": { target: "is not used by set-ctx — it edits one OpenCode provider in place" },
+};
+function checkCommandArgs() {
+  const spec = CMD_SPEC[cmd];
+  if (!spec) return; // unknown commands are refused by the dispatcher
+  for (const k of Object.keys(flags)) {
+    if (spec.flags.includes(k)) continue;
+    const hint = FLAG_HINTS[cmd]?.[k];
+    die(`--${k} ${hint || `is not an option of "provider-sync ${cmd}"`} — see provider-sync help`);
+  }
+  const extra = pos.length - 1 - spec.args;
+  if (extra > 0) die(`unexpected argument "${pos[spec.args + 1]}" — ${spec.usage}`);
+  if (extra < 0) die(`usage: ${spec.usage} — see provider-sync help`);
+}
+
 // ---------- main ----------
 // run only when executed directly; importing the module (tests) must not exit
 // argv[1] is however the user spelled the command: a symlink in ~/.local/bin,
@@ -1298,23 +1445,28 @@ const isMain = (() => {
 })();
 if (isMain)
 try {
-  if (cmd === "list") cmdList();
-  else if (cmd === "add") {
-    if (!pos[1] || !pos[2]) die("usage: provider-sync add <id> <baseURL> [options] — see provider-sync help");
-    if (!flags["dry-run"]) { acquireLock(); try { await cmdAdd(pos[1], pos[2]); } finally { releaseLock(); } }
-    else await cmdAdd(pos[1], pos[2]);
-  } else if (cmd === "sync") {
-    // a --dry-run run writes nothing, so it needs no lock
-    if (flags.apply && !flags["dry-run"]) { acquireLock(); try { await cmdSync(); } finally { releaseLock(); } }
-    else await cmdSync();
-  } else if (cmd === "set-ctx") {
-    if (!pos[1]) die("usage: provider-sync set-ctx <provider> — see provider-sync help");
-    const locked = !flags["dry-run"]; // same: a preview takes no lock
-    if (locked) acquireLock();
-    try { await cmdSetCtx(pos[1]); } finally { if (locked) releaseLock(); }
-  } else if (cmd === "--version" || cmd === "-v" || (!pos.length && flags.version)) console.log(VERSION);
-  else if (cmd === "help" || cmd === "-h" || (!pos.length && (flags.help || flags.h))) console.log(HELP);
+  // --help / -h and --version / -v win anywhere on the line: `add --help` must
+  // print help, not complain about a missing baseURL
+  const wantsHelp = cmd === "help" || pos.includes("-h") || flags.help || flags.h;
+  const wantsVersion = pos.includes("-v") || flags.version;
+  if (wantsHelp) console.log(HELP);
+  else if (wantsVersion) console.log(VERSION);
   else if (!cmd) { console.error(HELP); process.exit(1); }
-  else die(`unknown command "${cmd}" — see provider-sync help`);
+  else {
+    checkCommandArgs();
+    if (cmd === "list") cmdList();
+    else if (cmd === "add") {
+      if (!flags["dry-run"]) { acquireLock(); try { await cmdAdd(pos[1], pos[2]); } finally { releaseLock(); } }
+      else await cmdAdd(pos[1], pos[2]);
+    } else if (cmd === "sync") {
+      // a --dry-run run writes nothing, so it needs no lock
+      if (flags.apply && !flags["dry-run"]) { acquireLock(); try { await cmdSync(); } finally { releaseLock(); } }
+      else await cmdSync();
+    } else if (cmd === "set-ctx") {
+      const locked = !flags["dry-run"]; // same: a preview takes no lock
+      if (locked) acquireLock();
+      try { await cmdSetCtx(pos[1]); } finally { if (locked) releaseLock(); }
+    } else die(`unknown command "${cmd}" — see provider-sync help`);
+  }
 } catch (e) { die(e.stack || e.message); }
 if (isMain) process.exit(process.exitCode ?? 0);
