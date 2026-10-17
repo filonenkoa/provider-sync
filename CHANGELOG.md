@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.1.2 — 2026-10-17
 
 ### Fixed
 - `sync`/`add` borrow the OpenCode API key for a Hermes `custom_providers`
