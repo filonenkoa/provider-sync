@@ -5,6 +5,18 @@ Format: [semver](https://semver.org). Dates are ISO.
 ## Unreleased
 
 ### Added
+- **dsh routes are interrogated the way dsh interrogates them.** A route's
+  `api:` field decides the listing endpoint and the auth header, exactly as
+  llm-pi-ai's discovery does: the OpenAI protocols list at `{baseURL}/models`
+  with a bearer token, `anthropic-messages` at `{root}/v1/models` with
+  `x-api-key` and an `anthropic-version` header. An Anthropic-compatible
+  endpoint used to be probed as if it were OpenAI and reported `OFFLINE` or a
+  misleading `AUTH 401` on a server dsh serves perfectly well. `add` now detects
+  such an endpoint (when the OpenAI probe fails or is refused) and writes
+  `api: anthropic-messages` for the dsh route; context is read from every field
+  dsh reads it from (`contextWindow`, `context_window`, `context_length`,
+  `max_input_tokens`, `limit.context`). A route naming a protocol this build
+  cannot serve is reported as such instead of being probed.
 - **Hermes' `providers:` mapping is now managed, not just the legacy
   `custom_providers:` list.** Hermes' config migration (v11 → v12) moves every
   `custom_providers` entry into a root `providers:` mapping and deletes the
@@ -21,6 +33,9 @@ Format: [semver](https://semver.org). Dates are ISO.
   model) is read back unchanged.
 
 ### Fixed
+- `add --key-env VAR` against a server that requires auth said "pass --key K"
+  even though the user had named the variable; it now says the variable is not
+  set in this environment.
 - The post-write validation no longer calls a valid OpenCode model entry
   broken. It knew only the keys provider-sync itself writes, so a config that
   also carried `cost`, `family`, `variants`, `headers`, `interleaved`,

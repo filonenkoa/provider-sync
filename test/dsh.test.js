@@ -9,7 +9,7 @@ import path from "node:path";
 import http from "node:http";
 import { runCliAsyncP, runCli, flat, hermeticEnv } from "./helpers.js";
 
-let server, url, authServer, authUrl;
+let server, url, authServer, authUrl, anthServer, anthUrl;
 const homes = [];
 before(async () => {
   server = http.createServer((q, s) => {
@@ -29,8 +29,24 @@ before(async () => {
   });
   await new Promise((r) => authServer.listen(0, "127.0.0.1", r));
   authUrl = `http://127.0.0.1:${authServer.address().port}/v1`;
+  // an Anthropic-Messages endpoint: x-api-key + anthropic-version, and it
+  // answers nothing to a bearer-token request
+  anthServer = http.createServer((q, s) => {
+    if (q.url.startsWith("/v1/models")) {
+      if (q.headers["x-api-key"] !== "sk-ant" || !q.headers["anthropic-version"]) { s.statusCode = 401; s.end("{}"); return; }
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ data: [
+        { id: "claude-local", display_name: "Claude", context_window: 200000 },
+        { id: "claude-haiku", max_input_tokens: 100000 },
+      ] }));
+      return;
+    }
+    s.statusCode = 404; s.end("{}");
+  });
+  await new Promise((r) => anthServer.listen(0, "127.0.0.1", r));
+  anthUrl = `http://127.0.0.1:${anthServer.address().port}`;
 });
-after(() => { server.close(); authServer.close(); for (const h of homes) rmSync(h, { recursive: true, force: true }); });
+after(() => { server.close(); authServer.close(); anthServer.close(); for (const h of homes) rmSync(h, { recursive: true, force: true }); });
 
 const homeWith = (files) => {
   const home = mkdtempSync(path.join(tmpdir(), "ps-dsh-"));
@@ -99,6 +115,52 @@ test("an entry dsh already serves from a models list is still synced", async () 
   const out = await sync(home, ["--target", "dsh", "--apply"]);
   assert.match(out, /APPLIED 3 change\(s\)/);
   assert.match(read(home, WEB), /- id: qwen3\.8-27b/);
+});
+
+test("sync: an anthropic-messages route is interrogated the way dsh does", async () => {
+  const home = homeWith({ [WEB]: patchWith(
+    `      anth:\n        api: anthropic-messages\n        baseURL: ${anthUrl}\n        apiKeyEnv: ANTH_API_KEY\n        models:\n          - id: old-model\n`) , [STORE]: "version: 1\nrefs:\n  ANTH_API_KEY: sk-ant\n" });
+  const out = await sync(home, ["--target", "dsh", "--apply"]);
+  assert.match(out, /anth \(anthropic, http:\/\/127\.0\.0\.1:\d+\): 2 on server, 1 in config/);
+  assert.match(out, /APPLIED 3 change\(s\)/);
+  const cfg = read(home, WEB);
+  assert.match(cfg, /- id: claude-local\n\s+contextWindow: 200000\n/, "context_window is read");
+  assert.match(cfg, /- id: claude-haiku\n\s+contextWindow: 100000\n/, "max_input_tokens is read");
+  assert.doesNotMatch(cfg, /old-model/);
+  assert.match(cfg, /api: anthropic-messages/, "the protocol is preserved");
+});
+
+test("sync: a route whose key cannot be read is not mistaken for an OpenAI 401", async () => {
+  const home = homeWith({ [WEB]: patchWith(`      anth:\n        api: anthropic-messages\n        baseURL: ${anthUrl}\n        apiKeyEnv: ANTH_API_KEY\n        models: []\n`) });
+  const out = await sync(home, ["--target", "dsh"]);
+  assert.match(out, /AUTH 401 — its key is ANTH_API_KEY, which is not set here/);
+});
+
+test("sync: a protocol this build cannot interrogate is reported, not probed", async () => {
+  const home = homeWith({ [WEB]: patchWith(`      odd:\n        api: aws-bedrock\n        baseURL: ${url}\n        models: []\n`) });
+  const out = await sync(home, ["--target", "dsh"]);
+  assert.match(out, /odd: dsh protocol "aws-bedrock" is not one this build can serve/);
+});
+
+test("add: an Anthropic-compatible endpoint is detected and gets api: anthropic-messages", async () => {
+  const home = homeWith({ [WEB]: "# h\n[]\n" });
+  const out = flat(await runCliAsyncP(home, ["add", "anth", anthUrl, "--key", "sk-ant", "--target", "dsh"]));
+  assert.match(out, /note: the server answers the Anthropic Messages listing/);
+  assert.match(out, /provider "anth" created \(2 models, key ref ANTH_API_KEY\)/);
+  const cfg = read(home, WEB);
+  assert.match(cfg, /api: anthropic-messages/);
+  assert.match(cfg, /baseURL: http:\/\/127\.0\.0\.1:\d+\/v1\n/, "the /v1 the Anthropic wire protocol needs");
+  assert.match(cfg, /- id: claude-local\n\s+contextWindow: 200000\n/);
+  // and the entry it wrote is one dsh can serve: re-syncing finds no drift
+  assert.match(await sync(home, ["--target", "dsh"]), /in sync/);
+});
+
+test("add: --key-env with an unset variable names the variable, not a bad key", async () => {
+  const home = homeWith({ [WEB]: "# h\n[]\n" });
+  await assert.rejects(
+    () => runCliAsyncP(home, ["add", "anth", anthUrl, "--key-env", "PS_UNSET_VAR"]),
+    /--key-env PS_UNSET_VAR is not set in this environment/,
+  );
 });
 
 test("list: dsh providers, key states and notes", () => {

@@ -404,7 +404,9 @@ Commands:
       dsh specifics: the provider is written where dsh reads now — into
       settings.yaml while it still exists (dsh imports it at the next boot),
       else into the active profile's cordis.patch.yml (--profile NAME picks
-      one; the default is web). The key goes to ~/.dsh/.credentials.yaml as a
+      one; the default is web). A new route gets api: openai-completions, or
+      api: anthropic-messages when the endpoint answers that protocol's
+      listing. The key goes to ~/.dsh/.credentials.yaml as a
       reference (<ID>_API_KEY, like dsh's own UI); without --key the existing
       reference is kept, and a keyless server gets "dummy" so requests do not
       fail with MISSING_CREDENTIAL.
@@ -466,9 +468,11 @@ Commands:
                   settings.yaml while dsh has not imported it yet. Model
                   lists are server-authoritative (added/removed models and
                   server-reported contextWindow values are written; entries
-                  dsh owns — api, displayName, other fields — survive).
-                  Refuses to touch a providers block it cannot rewrite
-                  losslessly, and reports why instead.
+                  dsh owns — api, displayName, other fields — survive). A
+                  route is interrogated the way its api: field says dsh
+                  interrogates it (OpenAI listing + bearer, or Anthropic
+                  x-api-key listing). Refuses to touch a providers block it
+                  cannot rewrite losslessly, and reports why instead.
         all       all three (default)
       Harnesses are independent — a target whose config file is missing is
       reported as "not found — skipped" and the other ones still run, so
@@ -599,7 +603,7 @@ async function readCapped(r, cap) {
   return out;
 }
 
-export async function req(url, { method = "GET", key, body, timeout = 6000, cap = 0 } = {}) {
+export async function req(url, { method = "GET", key, body, timeout = 6000, cap = 0, headers: extra } = {}) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try {
@@ -609,6 +613,7 @@ export async function req(url, { method = "GET", key, body, timeout = 6000, cap 
         Accept: "application/json",
         ...(key ? { Authorization: "Bearer " + key } : {}),
         ...(body ? { "Content-Type": "application/json" } : {}),
+        ...extra,
       },
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -659,6 +664,9 @@ export async function probe(base, key) {
 
 // ---------- model specs ----------
 export async function fetchModels(pr, base, key) {
+  // a dsh probe already read the listing the way dsh reads it
+  if (pr.specs) return pr.specs;
+  if (pr.kind === "anthropic") return pr.models.map((m) => ({ id: m.id, ctx: m.ctx, input: null }));
   if (pr.kind === "llamacpp" || pr.kind === "openai") return pr.models.map(specAny);
   if (pr.kind === "lmstudio") {
     // probe() already fetched /api/v0/models and handed the payload over
@@ -696,6 +704,77 @@ function specAny(m) {
     };
   }
   return { id: m.id, ctx: nz(m.context_length), input: null };
+}
+
+// ---------- dsh wire protocols ----------
+// dsh names the protocol of a route in its `api:` field and interrogates each
+// one its own way (llm-pi-ai/discovery): the OpenAI protocols list at
+// `{baseURL}/models` with a bearer token, Anthropic Messages at `{root}/v1/
+// models` with `x-api-key` and a version header. Probing an anthropic-messages
+// route as if it were OpenAI reports a working server as offline.
+const DSH_PROTOCOLS = new Set(["openai-completions", "openai-responses", "anthropic-messages"]);
+const ANTHROPIC_VERSION = "2023-06-01";
+const dshListingUrl = (base, api) => {
+  const b = String(base).replace(/\/+$/, "");
+  return api === "anthropic-messages"
+    ? `${b.endsWith("/v1") ? b.slice(0, -3) : b}/v1/models?limit=1000`
+    : `${b}/models`;
+};
+// the listing request dsh itself would make for this protocol
+function dshListingReq(base, api, key) {
+  return api === "anthropic-messages"
+    ? { url: dshListingUrl(base, api), key: null, headers: { "anthropic-version": ANTHROPIC_VERSION, ...(key ? { "x-api-key": key } : {}) } }
+    : { url: dshListingUrl(base, api), key, headers: null };
+}
+// the model ids (and context) of a listing reply, in dsh's reading of it
+function dshReadListing(json) {
+  const listed = Array.isArray(json?.data)
+    ? json.data
+    : json?.models && typeof json.models === "object" && !Array.isArray(json.models)
+      ? Object.entries(json.models).filter(([, v]) => v && typeof v === "object").map(([k, v]) => ({ id: k, ...v }))
+      : null;
+  if (!listed) return [];
+  const pos = (...c) => {
+    for (const v of c) if (typeof v === "number" && Number.isInteger(v) && v > 0) return v;
+    return null;
+  };
+  return listed
+    .map((m) => ({ id: typeof m?.id === "string" && m.id ? m.id : null, ctx: pos(m?.contextWindow, m?.context_window, m?.context_length, m?.max_input_tokens, m?.limit?.context) }))
+    .filter((m) => m.id);
+}
+const _dshProbes = new Map();
+export function probeDshCached(base, api, key) {
+  const k = normUrl(base) + "|" + api + "|" + (key || "");
+  if (!_dshProbes.has(k)) _dshProbes.set(k, probeDsh(base, api, key));
+  return _dshProbes.get(k);
+}
+export const clearDshProbeCache = () => _dshProbes.clear();
+export async function probeDsh(base, api, key) {
+  if (!DSH_PROTOCOLS.has(api)) return { kind: "unsupported", api };
+  if (api !== "anthropic-messages") {
+    // the OpenAI protocols keep the shared detection chain (and its run-wide
+    // cache), so a llama.cpp or LM Studio route still gets its richer listing
+    // (allocated ctx from --ctx-size, loaded context, input modalities)
+    const p = await probeCached(base, key);
+    if (p.kind !== "offline") return { ...p, api };
+    // dsh lists at {baseURL}/models, which differs from the /v1 guess when the
+    // configured baseURL carries no /v1
+    const alt = await req(String(base).replace(/\/+$/, "") + "/models", { key });
+    if (alt.status === 200 && alt.json) {
+      const models = dshReadListing(alt.json);
+      if (models.length) return { kind: "openai", api, root: rootOf(base), specs: models.map((m) => ({ id: m.id, ctx: m.ctx, input: null })) };
+    }
+    return { ...p, api };
+  }
+  const { url, key: bearer, headers } = dshListingReq(base, api, key);
+  const r = await req(url, { key: bearer, headers });
+  if (r.status === 200 && r.json) {
+    const models = dshReadListing(r.json);
+    if (models.length) return { kind: "anthropic", api, root: rootOf(base), specs: models };
+    return { kind: "offline", api, error: "HTTP 200 but no model listing in the answer" };
+  }
+  if (r.status === 401 || r.status === 403) return { kind: "auth", api, root: rootOf(base) };
+  return { kind: "offline", api, root: rootOf(base), status: r.status, error: r.error || (r.status ? `HTTP ${r.status}` : "no answer") };
 }
 
 // ---------- heuristics (used only for NEW models) ----------
@@ -1313,7 +1392,7 @@ const dshWrite = (st, providers) => {
 // create or update an llm-pi-ai provider so `add` reaches every installed
 // harness. Matched by base URL first (re-running updates instead of
 // duplicating), then by id (a moved server re-points its entry).
-export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models, dryRun, create }) {
+export function dshUpsert({ id, name, base, api: apiFlag, keyRaw, keyFlag, keyEnvFlag, models, dryRun, create }) {
   if (!existsSync(DSH_HOME) && !create)
     return { status: "absent", why: `dsh not installed (${disp(DSH_HOME)} not found)` };
   const st = dshState({ create: !!create });
@@ -1380,7 +1459,9 @@ export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models,
   const removed = curById.size;
   const entry = {
     ...old,
-    api: old.api || "openai-completions",
+    // a declared route needs a protocol: the installed catalog does not
+    // describe a self-hosted endpoint, so without one dsh refuses every model
+    api: old.api || apiFlag || "openai-completions",
     baseURL: base,
     displayName: flags.name ? name : old.displayName || name,
     models: newModels,
@@ -1434,7 +1515,11 @@ async function syncDsh({ apply }) {
     if (!p.baseURL) return { id, skip: "no baseURL (catalog provider)" };
     const k = dshKeyOf(p, id);
     const runKey = k.key || flags.key || null; // --key stands in for this run only
-    const pr = await probeCached(p.baseURL, runKey);
+    // interrogate the route the way dsh does: the listing endpoint and the auth
+    // header depend on the protocol the entry declares
+    const api = typeof p.api === "string" && p.api ? p.api : "openai-completions";
+    const pr = await probeDshCached(p.baseURL, api, runKey);
+    if (pr.kind === "unsupported") return { id, skip: `dsh protocol "${api}" is not one this build can serve — provider-sync cannot interrogate it` };
     if (pr.kind === "offline") return { id, base: p.baseURL, offline: pr.error || "HTTP " + pr.status };
     if (pr.kind === "auth") return { id, base: p.baseURL, badauth: true, k, supplied: !k.key && !!flags.key };
     try { return { id, base: p.baseURL, kind: pr.kind, server: await fetchModels(pr, p.baseURL, runKey) }; }
@@ -1693,6 +1778,9 @@ async function cmdAdd(id, url) {
   const keyEnv = flags["key-env"];
   if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv))
     die(`--key-env needs an environment variable name, got "${keyEnv}"`);
+  // a note raised while probing (an Anthropic-compatible endpoint), reported
+  // with the rest once the write path is known
+  const notes0 = [];
   // --username/--password are one Unsloth UI login: half a pair cannot log in,
   // so it is refused up front instead of being dropped without a word
   if (!!flags.username !== !!flags.password)
@@ -1706,11 +1794,25 @@ async function cmdAdd(id, url) {
   // probe with the literal --key, the stored key with {env:VAR} resolved from
   // this environment, or the value --key-env names when it is set here
   const probeKey = derefKey(key) || (keyEnv ? derefKey(`{env:${keyEnv}}`) : null);
-  const pr = await probeCached(base, probeKey);
+  let pr = await probeCached(base, probeKey);
+  // an Anthropic-compatible endpoint answers neither the OpenAI listing (it
+  // wants x-api-key and a version header) nor a bearer probe — it refuses both —
+  // and dsh can serve it, so try the protocol dsh would name for it before
+  // reporting the server unreachable or its key rejected
+  let dshApi = "openai-completions";
+  if ((pr.kind === "offline" || pr.kind === "auth") && (flags.target === "dsh" || !flags.target)) {
+    const alt = await probeDsh(base, "anthropic-messages", probeKey);
+    if (alt.kind === "anthropic") {
+      pr = alt;
+      dshApi = "anthropic-messages";
+      notes0.push("the server answers the Anthropic Messages listing — the dsh route gets api: anthropic-messages");
+    }
+  }
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   if (pr.kind === "auth")
     die(probeKey ? `${base} rejected the supplied key (HTTP 401) — check the server's api key, nothing was written`
         : key ? `${base} requires auth — the stored key is ${key}, which is not set in this environment; export it or pass --key K`
+        : keyEnv ? `${base} requires auth — --key-env ${keyEnv} is not set in this environment; export it or pass --key K`
         : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
   let runKey = probeKey; // credential used for this run's requests
   // the pair is never a silent no-op: when it cannot be used, the report says why
@@ -1736,6 +1838,7 @@ async function cmdAdd(id, url) {
   if (!server.length) die("server returned 0 models");
 
   const notes = [];
+  notes.push(...notes0);
   if (loginSkip) notes.push(loginSkip);
   const mode = flags["dry-run"] ? "report" : "write";
   // a harness is written only if it is installed on this machine; --target
@@ -1811,7 +1914,7 @@ async function cmdAdd(id, url) {
   // dsh has its own credential store; the same raw key value is passed so an
   // {env:VAR} reference stays a reference (apiKeyEnv) instead of becoming a
   // literal secret in .credentials.yaml
-  const dargs = { id, name: prov.name, base, keyRaw: hkey, keyFlag: flags.key || null, keyEnvFlag: keyEnv || null, models: hmodels, create: wantD };
+  const dargs = { id, name: prov.name, base, api: dshApi, keyRaw: hkey, keyFlag: flags.key || null, keyEnvFlag: keyEnv || null, models: hmodels, create: wantD };
   const nModels = Object.keys(prov.models).length;
   // every target is reported afterwards: what was written and what was skipped, and why
   const ocLine = (verb) => wantOc
