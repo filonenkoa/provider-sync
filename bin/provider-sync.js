@@ -540,7 +540,9 @@ DeepSeek Harness key resolution, first match wins:
 Safety:
   - every write is atomic (tmp file + fsync + rename) and preceded by a
     .bak-provider-sync-* backup; only the last 3 backups per file are kept
-  - the config file is validated after each write; the hermes config is
+  - the config file is validated after each write against OpenCode's own
+    schema (https://opencode.ai/config.json — the legacy and the 2.x entry
+    shapes); the hermes config is
     re-read and rolled back from its backup if it no longer parses, and the
     dsh configs are re-read and compared provider-by-provider, with the
     same rollback on a mismatch
@@ -1447,24 +1449,57 @@ async function syncDsh({ apply }) {
 }
 
 // ---------- validation ----------
+// What OpenCode itself accepts, per its published schema
+// (https://opencode.ai/config.json — `ProviderConfig` for a legacy
+// `provider.<id>` entry, `Config.ModelEncoded` for a native `providers.<id>`
+// one). Both model maps set additionalProperties:false, so a key outside these
+// sets is an error in OpenCode — and, just as important, a key inside them is
+// not: reporting a valid entry as broken would be worse than missing a typo.
 const MODS = new Set(["text", "image", "audio", "video", "pdf"]);
-// keys provider-sync itself writes into a legacy model entry; native 2.x
-// entries have OpenCode's own (larger) schema, so the unknown-key check is
-// legacy-only
-const MODEL_KEYS = new Set(["name", "attachment", "modalities", "limit", "tool_call", "reasoning", "options"]);
-function validate(cfg) {
+const LEGACY_MODEL_KEYS = new Set([
+  "id", "name", "family", "release_date", "attachment", "reasoning", "temperature",
+  "tool_call", "interleaved", "cost", "limit", "modalities", "experimental",
+  "status", "provider", "options", "headers", "variants",
+]);
+const NATIVE_MODEL_KEYS = new Set([
+  "modelID", "family", "name", "releaseDate", "compatibility", "package", "settings",
+  "headers", "body", "capabilities", "variants", "cost", "disabled", "limit",
+]);
+const NATIVE_CAPABILITY_KEYS = new Set(["tools", "input", "output", "temperature", "reasoning"]);
+export function validate(cfg) {
   const errs = [];
   for (const pid of providerIds(cfg)) {
     const { shape, entry } = providerShape(cfg, pid);
-    const boxes = (m) => (shape === "native" ? m.capabilities : m.modalities);
     for (const k of Object.keys(entry?.models || {})) {
       const m = entry.models[k];
-      if (shape === "legacy")
-        for (const key of Object.keys(m)) if (!MODEL_KEYS.has(key)) errs.push(`${pid}/${k}: unknown model key "${key}"`);
-      if (m.limit && (!m.limit.context || !m.limit.output)) errs.push(`${pid}/${k}: limit needs context+output`);
+      const where = `${pid}/${k}`;
+      if (!m || typeof m !== "object") { errs.push(`${where}: model entry is not an object`); continue; }
+      if (shape === "native") {
+        // a native model declares capabilities, and its input/output lists are
+        // free strings in the schema — so only the known keys and value types
+        for (const key of Object.keys(m))
+          if (!NATIVE_MODEL_KEYS.has(key)) errs.push(`${where}: unknown model key "${key}"`);
+        const caps = m.capabilities;
+        if (caps !== undefined && (typeof caps !== "object" || caps === null || Array.isArray(caps)))
+          errs.push(`${where}: capabilities must be an object`);
+        else if (caps) {
+          for (const key of Object.keys(caps))
+            if (!NATIVE_CAPABILITY_KEYS.has(key)) errs.push(`${where}: unknown capability "${key}"`);
+          for (const side of ["input", "output"])
+            if (caps[side] !== undefined && !(Array.isArray(caps[side]) && caps[side].every((v) => typeof v === "string")))
+              errs.push(`${where}: capabilities.${side} must be a list of strings`);
+          for (const flag of ["tools", "temperature"])
+            if (caps[flag] !== undefined && typeof caps[flag] !== "boolean") errs.push(`${where}: capabilities.${flag} must be true or false`);
+        }
+        continue;
+      }
+      for (const key of Object.keys(m)) if (!LEGACY_MODEL_KEYS.has(key)) errs.push(`${where}: unknown model key "${key}"`);
+      // only the legacy limit requires both numbers; a native one may carry
+      // context alone
+      if (m.limit && (!m.limit.context || !m.limit.output)) errs.push(`${where}: limit needs context+output`);
       for (const side of ["input", "output"])
-        for (const v of boxes(m)?.[side] || []) if (!MODS.has(v)) errs.push(`${pid}/${k}: bad modality "${v}"`);
-      if (boxes(m)?.input && !boxes(m).input.includes("text")) errs.push(`${pid}/${k}: input must include "text"`);
+        for (const v of m.modalities?.[side] || []) if (!MODS.has(v)) errs.push(`${where}: bad modality "${v}"`);
+      if (m.modalities?.input && !m.modalities.input.includes("text")) errs.push(`${where}: input must include "text"`);
     }
   }
   return errs;

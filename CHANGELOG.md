@@ -5,6 +5,15 @@ Format: [semver](https://semver.org). Dates are ISO.
 ## Unreleased
 
 ### Fixed
+- The post-write validation no longer calls a valid OpenCode model entry
+  broken. It knew only the keys provider-sync itself writes, so a config that
+  also carried `cost`, `family`, `variants`, `headers`, `interleaved`,
+  `release_date` or `status` — anything OpenCode's own schema allows, and what
+  a models.dev-derived entry looks like — came back as `VALIDATION ERRORS` and a
+  non-zero exit. Both entry shapes are now checked against the published schema
+  (https://opencode.ai/config.json): every accepted key passes, unknown keys and
+  bad values are still reported, and a 2.x `capabilities.input` list is not held
+  to the legacy modality enum or to `limit` needing both numbers.
 - **dsh routes authenticated by a stored record are no longer mistaken for
   keyless ones.** dsh stores what a sign-in produces under
   `records: llm-pi-ai/<route>` in `~/.dsh/.credentials.yaml`; provider-sync read
