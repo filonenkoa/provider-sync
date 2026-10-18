@@ -212,6 +212,60 @@ test("add: a server with no auth gets the dummy placeholder", async () => {
   assert.equal(read(home, STORE), "version: 1\nrefs:\n  MM_API_KEY: dummy\n");
 });
 
+test("list: a route dsh authenticated by a stored record is not called keyless", () => {
+  const home = homeWith({
+    [WEB]: patchWith("      m4max:\n        displayName: M4 Max\n        api: openai-completions\n        baseURL: http://127.0.0.1:9/v1\n        models:\n          - id: qwen3.8-27b\n"),
+    [STORE]: "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/m4max:\n    kind: api-key\n    key: sk-record\n",
+  });
+  assert.match(list(home, ["--target", "dsh"]), /m4max\s+1 models\s+http:\/\/127\.0\.0\.1:9\/v1\s+key \(dsh sign-in record\)/);
+});
+
+test("list: a stored grant is reported as signed in, not as no key", () => {
+  const home = homeWith({
+    [WEB]: patchWith("      acme:\n        baseURL: http://127.0.0.1:9/v1\n        models: []\n"),
+    [STORE]: "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/acme:\n    kind: grant\n    payload:\n      type: oauth\n      token: x\n",
+  });
+  assert.match(list(home, ["--target", "dsh"]), /signed in by dsh, stored as a grant/);
+});
+
+test("sync: the record's key is the one the server is probed with", async () => {
+  const home = homeWith({
+    [WEB]: patchWith("      locked:\n        api: openai-completions\n        baseURL: " + authUrl + "\n        models:\n          - id: old\n            contextWindow: 1024\n"),
+    [STORE]: "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/locked:\n    kind: api-key\n    key: sk-record\n",
+  });
+  const out = await sync(home, ["--target", "dsh"]);
+  assert.match(out, /locked \(\w+, http:\/\/127\.0\.0\.1:\d+\/v1\): 1 on server, 1 in config/);
+  assert.doesNotMatch(out, /AUTH 401/);
+  assert.match(out, /- old \(no longer on server\)/);
+});
+
+test("add: a record-authenticated route keeps dsh's own credential", async () => {
+  const home = homeWith({
+    [WEB]: patchWith(`      m4max:\n        displayName: M4 Max\n        api: openai-completions\n        baseURL: ${url}\n        models:\n          - id: qwen3.8-27b\n            contextWindow: 4096\n`),
+    [STORE]: "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/m4max:\n    kind: api-key\n    key: sk-record\n",
+  });
+  const out = await add(home, []);
+  assert.match(out, /provider "m4max" updated \(2 models, key kept as dsh stored it\)/);
+  assert.match(out, /kept the credential dsh stored for "m4max" \(llm-pi-ai\/m4max\)/);
+  assert.match(out, /dsh-keys \S* no change \(no key to store\)/);
+  const cfg = read(home, WEB);
+  assert.doesNotMatch(cfg, /apiKeyEnv/, "naming a reference would override the stored record");
+  assert.doesNotMatch(cfg, /dummy/);
+  assert.equal(read(home, STORE), "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/m4max:\n    kind: api-key\n    key: sk-record\n",
+    "the record is byte-identical");
+});
+
+test("add: --key replaces a record-authenticated route on purpose", async () => {
+  const home = homeWith({
+    [WEB]: patchWith(`      m4max:\n        api: openai-completions\n        baseURL: ${url}\n        models: []\n`),
+    [STORE]: "version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/m4max:\n    kind: api-key\n    key: sk-record\n",
+  });
+  const out = await add(home, ["--key", "K1"]);
+  assert.match(out, /provider "m4max" updated \(2 models, key ref M4MAX_API_KEY\)/);
+  assert.match(read(home, WEB), /apiKeyEnv: M4MAX_API_KEY/);
+  assert.match(read(home, STORE), /M4MAX_API_KEY: K1/);
+});
+
 test("add: an existing settings.yaml is the surface until dsh imports it", async () => {
   const home = homeWith({
     ".dsh/settings.yaml": "ui-onboarding:\n  done: true\nllm-pi-ai:\n  providers:\n",

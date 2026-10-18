@@ -526,6 +526,11 @@ DeepSeek Harness key resolution, first match wins:
   2. the stored reference in ~/.dsh/.credentials.yaml (values are never
      printed; a multi-line value is reported as unreadable, not guessed)
   3. ~/.dsh/.env
+  A route that names no apiKeyEnv authenticates from its own record in the
+  store (llm-pi-ai/<route>), which is what a dsh sign-in writes: the record's
+  key is used to probe, a grant is reported as signed-in but unreadable, and
+  provider-sync never adds an apiKeyEnv over such a route (that would override
+  the credential dsh resolves itself).
   --key K is stored in that file under the entry's reference (a new
   provider gets <ID>_API_KEY, dsh's own convention); --key-env VAR sets
   apiKeyEnv: VAR and stores nothing. A keyless OpenAI-compatible server
@@ -1107,12 +1112,16 @@ function dshNotes(st) {
   return notes;
 }
 
-// dsh key resolution, in dsh's own order: the launch environment wins, then
-// the stored .credentials.yaml, then ~/.dsh/.env. Values are never printed.
+// dsh key resolution, in dsh's own order: a route that names apiKeyEnv resolves
+// that reference (launch environment, then the stored .credentials.yaml, then
+// ~/.dsh/.env); a route that names none authenticates from its own record in
+// the store (`llm-pi-ai/<route>`, what a sign-in writes). Values are never
+// printed.
+const DSH_RECORD_SCOPE = "llm-pi-ai";
 const dshStore = once(() => {
-  if (!existsSync(DSH_STORE)) return { refs: new Map(), error: null };
+  if (!existsSync(DSH_STORE)) return { refs: new Map(), records: new Map(), error: null };
   try { return parseDshStore(readFileSync(DSH_STORE, "utf8")); }
-  catch (e) { return { refs: new Map(), error: e.message }; }
+  catch (e) { return { refs: new Map(), records: new Map(), error: e.message }; }
 });
 const dshHomeEnv = once(() => {
   const env = {};
@@ -1124,9 +1133,8 @@ const dshHomeEnv = once(() => {
     }
   return env;
 });
-function dshKeyOf(p) {
-  const ref = typeof p?.apiKeyEnv === "string" && p.apiKeyEnv ? p.apiKeyEnv : null;
-  if (!ref) return { state: "none" };
+// one credential reference, resolved exactly as dsh's reference seam resolves it
+function dshResolveRef(ref) {
   if (process.env[ref]) return { state: "env", ref, key: process.env[ref] };
   const hit = dshStore().refs.get(ref);
   if (hit?.value) return { state: "stored", ref, key: hit.value };
@@ -1135,14 +1143,39 @@ function dshKeyOf(p) {
   if (home) return { state: "envfile", ref, key: home };
   return { state: "unset", ref };
 }
-function dshKeyLabel(p) {
-  const k = dshKeyOf(p);
+// the credential route `pid` would actually send: an apiKeyEnv reference when
+// the entry names one (it wins — dsh passes it to pi-ai as an explicit
+// override), otherwise the route's own stored record
+function dshKeyOf(p, pid) {
+  const ref = typeof p?.apiKeyEnv === "string" && p.apiKeyEnv ? p.apiKeyEnv : null;
+  if (ref) return dshResolveRef(ref);
+  if (!pid) return { state: "none" };
+  // a record id is a lowercase hyphenated identifier (dsh's own rule), so a
+  // route named any other way cannot address one
+  if (!/^[a-z][a-z0-9-]*$/.test(pid)) return { state: "none" };
+  const rec = dshStore().records.get(`${DSH_RECORD_SCOPE}/${pid}`);
+  if (!rec) return { state: "none" };
+  if (rec.kind === "grant" || (rec.kind !== "api-key" && !rec.opaque && !rec.key && !rec.env?.length))
+    return { state: "grant", ref: `${DSH_RECORD_SCOPE}/${pid}` };
+  if (rec.key) return { state: "record", ref: `${DSH_RECORD_SCOPE}/${pid}`, key: rec.key };
+  if (rec.opaque) return { state: "opaque", ref: `${DSH_RECORD_SCOPE}/${pid}` };
+  // an api-key record may name the references its value lives under instead
+  for (const name of rec.env || []) {
+    const hit = dshResolveRef(name);
+    if (hit.key) return { state: "record", ref: `${DSH_RECORD_SCOPE}/${pid}`, via: name, key: hit.key };
+  }
+  return { state: "unset", ref: `${DSH_RECORD_SCOPE}/${pid}` };
+}
+function dshKeyLabel(p, pid) {
+  const k = dshKeyOf(p, pid);
   if (k.state === "env") return `key (env ${k.ref})`;
   if (k.state === "stored") return "key (stored)";
   if (k.state === "envfile") return "key (.dsh/.env)";
+  if (k.state === "record") return k.via ? `key (dsh record, via ${k.via})` : "key (dsh sign-in record)";
   if (k.state === "unset") return `no-key (${k.ref} unset here)`;
   if (k.state === "opaque") return `key (${k.ref} is multi-line — cannot read)`;
-  if (k.state === "none") return "no-key (no apiKeyEnv)";
+  if (k.state === "grant") return "key (signed in by dsh, stored as a grant — not readable here)";
+  if (k.state === "none") return "no-key (no apiKeyEnv, no stored record)";
   return "key";
 }
 
@@ -1237,9 +1270,15 @@ export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models,
   // the key: keep the entry's existing reference when there is one; a new
   // provider follows dsh's own UI convention <ID_UPPER>_API_KEY. --key-env
   // wins, an {env:VAR} reference borrowed from OpenCode is kept as a ref too.
-  let ref = keyEnvFlag || (typeof old.apiKeyEnv === "string" && old.apiKeyEnv) || dshRefName(pid);
+  const hasRef = typeof old.apiKeyEnv === "string" && old.apiKeyEnv ? old.apiKeyEnv : null;
+  let ref = keyEnvFlag || hasRef || dshRefName(pid);
   let storeValue = null;
   let storeNote = null;
+  // a route dsh authenticated through its own stored record (a sign-in)
+  // keeps that credential: naming an apiKeyEnv here would override it — with
+  // the stored reference if one exists, otherwise with a MISSING_CREDENTIAL
+  const record = dshKeyOf(old, pid);
+  const recordAuth = !hasRef && !!record.ref;
   if (keyFlag) storeValue = keyFlag;
   else if (!keyEnvFlag && keyRaw) {
     const er = envRef(keyRaw);
@@ -1247,15 +1286,22 @@ export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models,
     else storeValue = keyRaw;
   }
   if (!storeValue && !keyEnvFlag && !envRef(keyRaw)) {
-    // an OpenAI-compatible route with no resolvable key fails every request
-    // (MISSING_CREDENTIAL), so a keyless server gets the conventional
-    // placeholder — but never over a value the store already holds
-    const src = dshKeyOf({ apiKeyEnv: ref });
-    if (src.state === "unset") {
-      storeValue = "dummy";
-      storeNote = `no key known for ${ref} — storing "dummy" (an OpenAI-compatible route needs one)`;
+    if (hasRef) storeNote = `kept the entry's own reference ${hasRef} — pass --key K to change it`;
+    else if (recordAuth) storeNote = `kept the credential dsh stored for "${pid}" (${record.ref}) — pass --key K to replace it`;
+    else {
+      // an OpenAI-compatible route with no resolvable key fails every request
+      // (MISSING_CREDENTIAL), so a keyless server gets the conventional
+      // placeholder — but never over a value the store already holds
+      const src = dshKeyOf({ apiKeyEnv: ref });
+      if (src.state === "unset") {
+        storeValue = "dummy";
+        storeNote = `no key known for ${ref} — storing "dummy" (an OpenAI-compatible route needs one)`;
+      }
     }
   }
+  // a record-authenticated route keeps no apiKeyEnv: dsh resolves its own
+  // credential, and an unset reference would override it with a failure
+  const useRef = !(recordAuth && !keyEnvFlag && !storeValue && !hasRef && !envRef(keyRaw));
   const curModels = Array.isArray(old.models) ? old.models : [];
   const curById = new Map(curModels.map((m) => [m?.id, m]));
   let added = 0, changed = 0;
@@ -1272,18 +1318,23 @@ export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models,
     ...old,
     api: old.api || "openai-completions",
     baseURL: base,
-    apiKeyEnv: ref,
     displayName: flags.name ? name : old.displayName || name,
     models: newModels,
   };
+  // no apiKeyEnv at all on a record-authenticated route: the field is omitted,
+  // not written as null
+  if (useRef) entry.apiKeyEnv = ref;
+  else delete entry.apiKeyEnv;
   providers[pid] = entry;
   const res = {
     status: existed ? "updated" : "created",
-    pid, n, ref,
+    pid, n, ref: useRef ? ref : null,
     store: storeValue ? (storeValue === "dummy" ? "dummy" : "key") : null,
     file: st.file, kind: st.kind,
     added, changed, removed,
-    note: note || storeNote || null,
+    // both notes can apply at once (an entry matched by base URL that also keeps a
+    // credential); report them together rather than dropping the second
+    note: [note, storeNote].filter(Boolean).join("; ") || null,
   };
   if (dryRun) return res;
   try {
@@ -1316,7 +1367,7 @@ async function syncDsh({ apply }) {
     const p = providers[id];
     if (!p || typeof p !== "object") return { id, skip: "the entry is not a mapping" };
     if (!p.baseURL) return { id, skip: "no baseURL (catalog provider)" };
-    const k = dshKeyOf(p);
+    const k = dshKeyOf(p, id);
     const runKey = k.key || flags.key || null; // --key stands in for this run only
     const pr = await probeCached(p.baseURL, runKey);
     if (pr.kind === "offline") return { id, base: p.baseURL, offline: pr.error || "HTTP " + pr.status };
@@ -1332,11 +1383,13 @@ async function syncDsh({ apply }) {
     if (r.badauth) {
       console.log(r.supplied
         ? `  ${r.id} (${r.base}): AUTH 401 — the key passed with --key was rejected — check it`
-        : r.k.state === "unset"
-          ? `  ${r.id} (${r.base}): AUTH 401 — its key is ${r.k.ref}, which is not set here (checked the environment, ${disp(DSH_STORE)} and ~/.dsh/.env); export it or pass --key K`
-          : r.k.state === "opaque"
-            ? `  ${r.id} (${r.base}): AUTH 401 — ${r.k.ref} is stored as a multi-line value provider-sync cannot read; pass --key K to check this server`
-            : `  ${r.id} (${r.base}): AUTH 401 — key missing or invalid`);
+        : r.k.state === "grant"
+          ? `  ${r.id} (${r.base}): AUTH 401 — it is signed in through ${r.k.ref}, a grant provider-sync cannot read or send; check the sign-in, or pass --key K to check this server`
+          : r.k.state === "unset"
+            ? `  ${r.id} (${r.base}): AUTH 401 — its key is ${r.k.ref}, which is not set here (checked the environment, ${disp(DSH_STORE)} and ~/.dsh/.env); export it or pass --key K`
+            : r.k.state === "opaque"
+              ? `  ${r.id} (${r.base}): AUTH 401 — ${r.k.ref} is stored as a multi-line value provider-sync cannot read; pass --key K to check this server`
+              : `  ${r.id} (${r.base}): AUTH 401 — key missing or invalid`);
       continue;
     }
     if (r.err) { console.log(`  ${r.id} (${r.base}): ERROR — ${r.err}`); continue; }
@@ -1520,7 +1573,7 @@ function cmdList() {
           for (const id of ids) {
             const p = st.providers[id] && typeof st.providers[id] === "object" ? st.providers[id] : {};
             const n = Array.isArray(p.models) ? p.models.length : 0;
-            console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${p.baseURL || "-"}  ${dshKeyLabel(p)}`);
+            console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${p.baseURL || "-"}  ${dshKeyLabel(p, id)}`);
           }
         }
         for (const nt of dshNotes(st)) console.log(`  note: ${nt}`);
@@ -1675,7 +1728,8 @@ async function cmdAdd(id, url) {
   const dshLine = (r, verb) => {
     if (!wantD) return `skipped — ${dWhy}`;
     if (dshSkip(r)) return `skipped — ${r.why}`;
-    return `provider "${r.pid}" ${verb}${r.status} (${r.n} models, key ref ${r.ref})`;
+    const key = r.ref ? `, key ref ${r.ref}` : ", key kept as dsh stored it";
+    return `provider "${r.pid}" ${verb}${r.status} (${r.n} models${key})`;
   };
   const dshKeysLine = (r, dry) => {
     if (!wantD) return `skipped — ${dWhy}`;

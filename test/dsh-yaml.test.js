@@ -223,6 +223,65 @@ test("store: a key with a line break is refused", () => {
   assert.throws(() => setDshStoreRef("", "A_API_KEY", "a\nb"), /line break/);
 });
 
+test("store: records are read as well as refs", () => {
+  const doc = `version: 1
+refs:
+  A_API_KEY: sk-ref
+records:
+  llm-pi-ai/openrouter:
+    kind: api-key
+    key: sk-record
+  llm-pi-ai/acme:
+    kind: api-key
+    env:
+      ACME_TOKEN: secret
+  llm-pi-ai/oauth-route:
+    kind: grant
+    payload:
+      type: oauth
+      token: x
+`;
+  const { refs, records } = parseDshStore(doc);
+  assert.equal(refs.get("A_API_KEY").value, "sk-ref");
+  assert.equal(records.get("llm-pi-ai/openrouter").kind, "api-key");
+  assert.equal(records.get("llm-pi-ai/openrouter").key, "sk-record");
+  assert.deepEqual(records.get("llm-pi-ai/acme").env, ["ACME_TOKEN"]);
+  assert.equal(records.get("llm-pi-ai/oauth-route").kind, "grant");
+  assert.equal(records.get("llm-pi-ai/oauth-route").key, undefined, "a grant holds no api key");
+});
+
+test("store: a record written on one line is not guessed", () => {
+  const one = parseDshStore("version: 1\nrefs: {}\nrecords:\n  llm-pi-ai/a: {kind: api-key, key: sk}\n");
+  assert.equal(one.records.get("llm-pi-ai/a").opaque, true);
+});
+
+test("store: a ref value keeps a trailing comment out of the key", () => {
+  const p = parseDshStore("version: 1\nrefs:\n  A_API_KEY: sk-real # the openrouter one\n");
+  assert.equal(p.refs.get("A_API_KEY").value, "sk-real");
+});
+
+test("store: a new ref joins an existing section at its own indent", () => {
+  const wide = setDshStoreRef("version: 1\nrefs:\n    A_API_KEY: sk\n", "B_API_KEY", "sk2").text;
+  assert.match(wide, / {4}B_API_KEY: sk2\n/);
+  assert.equal(parseDshStore(wide).refs.get("B_API_KEY").value, "sk2", "still a valid mapping");
+});
+
+test("store: refs and records coexist when a new ref is added", () => {
+  const doc = "version: 1\nrecords:\n  llm-pi-ai/a:\n    kind: api-key\n    key: sk\n";
+  const out = setDshStoreRef(doc, "A_API_KEY", "sk2").text;
+  assert.match(out, /^version: 1\nrefs:\n  A_API_KEY: sk2\nrecords:\n/m);
+  const p = parseDshStore(out);
+  assert.equal(p.refs.get("A_API_KEY").value, "sk2");
+  assert.equal(p.records.get("llm-pi-ai/a").key, "sk", "the record survived");
+});
+
+test("store: an inline empty refs map is expanded, a valued one is refused", () => {
+  const out = setDshStoreRef("version: 1\nrefs: {}\n", "A_API_KEY", "sk").text;
+  assert.equal(out, "version: 1\nrefs:\n  A_API_KEY: sk\n");
+  assert.throws(() => setDshStoreRef("version: 1\nrefs: {B_API_KEY: sk}\n", "A_API_KEY", "sk"),
+    /refs: is written on one line/);
+});
+
 test("dq quotes anything YAML would read as a non-string", () => {
   assert.equal(dq("http://127.0.0.1:1234/v1"), "http://127.0.0.1:1234/v1");
   assert.equal(dq("m4max"), "m4max");

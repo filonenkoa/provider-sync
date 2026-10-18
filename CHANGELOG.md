@@ -2,6 +2,22 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- **dsh routes authenticated by a stored record are no longer mistaken for
+  keyless ones.** dsh stores what a sign-in produces under
+  `records: llm-pi-ai/<route>` in `~/.dsh/.credentials.yaml`; provider-sync read
+  only `refs:`. A route in that state was listed as `no-key (no apiKeyEnv)`,
+  probed without a key (`AUTH 401 — key missing or invalid`), and — worst —
+  `add` stored a `dummy` under an invented `<ID>_API_KEY` and wrote
+  `apiKeyEnv:` for it, which overrides the credential dsh resolves itself and
+  breaks the route with `MISSING_CREDENTIAL`. Records are now read: an api-key
+  record's key is used to probe and reported as `key (dsh sign-in record)`, a
+  grant is reported as signed-in but unreadable, and `add` leaves such a route's
+  credential alone (`--key K` still replaces it on purpose). `--key-env` is
+  documented as the one flag that overrides a record.
+
 ## 1.2.0 — 2026-10-17
 
 ### Added
