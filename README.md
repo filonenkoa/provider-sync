@@ -20,7 +20,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.2.1
+provider-sync --version   # 1.2.2
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:

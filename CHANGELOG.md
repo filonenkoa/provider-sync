@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.2.2 — 2026-10-18
 
 ### Fixed
 - The Hermes line of the `written:` report names the section that was actually
