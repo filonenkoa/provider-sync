@@ -26,6 +26,9 @@ Format: [semver](https://semver.org). Dates are ISO.
   dsh reads it from (`contextWindow`, `context_window`, `context_length`,
   `max_input_tokens`, `limit.context`). A route naming a protocol this build
   cannot serve is reported as such instead of being probed.
+- The Hermes line of the `written:` report names the section that was actually
+  edited (`providers` or the legacy `custom_providers`), and `list` shows the
+  surface in its header, instead of always claiming `custom_providers`.
 - An entry whose `models:` is an empty inline mapping (`models: {}`, how
   Hermes' own dumper spells an empty catalog) was refused with a reason in the
   mapping surface, and produced a duplicate `models:` key in the legacy list.

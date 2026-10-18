@@ -1041,7 +1041,7 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
   if (found) {
     if (found.flow)
       return { status: "flow", why: `the entry for ${base} is written in flow style on one line — provider-sync will not rewrite it` };
-    if (dryRun) return { status: "updated", name: found.name, n };
+    if (dryRun) return { status: "updated", name: found.name, n, form: h.form };
     const lines = h.lines.slice();
     hermesSetModels(lines, found, models);
     if (ref) {
@@ -1050,9 +1050,9 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
       if (found.api_key && found.api_key !== "dummy") hermesSetField(lines, found, "api_key", "dummy");
     } else if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
     writeHermesCfg(lines, h.eol, { entries: h.entries.length, models: [{ base, ids: models.map((m) => m.id) }] });
-    return { status: "updated", name: found.name, n };
+    return { status: "updated", name: found.name, n, form: h.form };
   }
-  if (dryRun) return { status: "created", name, n };
+  if (dryRun) return { status: "created", name, n, form: h.form };
   const created = h.form === "list"
     ? hermesUpsertList(h, { name, base, key, ref, model, models })
     : hermesUpsertDict(text, { keyName, name, base, key, ref, model, models });
@@ -1061,7 +1061,7 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
     entries: h.entries.length + 1,
     models: [{ base, ids: models.map((m) => m.id) }],
   });
-  return { status: "created", name, n };
+  return { status: "created", name, n, form: h.form };
 }
 // append to the legacy `custom_providers:` list
 function hermesUpsertList(h, { name, base, key, ref, model, models }) {
@@ -1756,7 +1756,9 @@ function cmdList() {
       const text = readFileSync(HERMES_CFG, "utf8");
       const h = hermesDoc(text);
       const section = h.form === "dict" ? "providers" : "custom_providers";
-      console.log(`hermes  ${disp(HERMES_CFG)}`);
+      // the surface in use is part of the picture: the two are edited the same
+      // way but only one of them survives Hermes' next config migration
+      console.log(`hermes  ${disp(HERMES_CFG)}${h.form === "none" ? "" : ` (${section})`}`);
       if (h.error) console.log(`  note: ${h.error}`);
       else if (!h.entries.length)
         console.log(`  ${h.form === "none" ? `no ${section} section` : `${section} present but no entries parsed`}${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
@@ -1954,7 +1956,9 @@ async function cmdAdd(id, url) {
   const hermesLine = (r, verb) => {
     if (!wantH) return `skipped — ${hWhy}`;
     if (["absent", "no-section", "unparsed", "layout", "flow", "error"].includes(r.status)) return `skipped — ${r.why}`;
-    return `custom_providers "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
+    // name the section that was actually edited, not a fixed one
+    const section = r.form === "dict" ? "providers" : "custom_providers";
+    return `${section} "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
   };
   const dshSkip = (r) => !wantD || !r || ["absent", "empty", "refused", "overridden", "error"].includes(r.status);
   const dshLine = (r, verb) => {

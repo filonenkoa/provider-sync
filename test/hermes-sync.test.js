@@ -104,7 +104,7 @@ test("add updates a mapping entry in place, matched by base url", async () => {
     ".hermes/config.yaml": HERMES_DICT().replace("stale:\n        context_length: 4096\n", ""),
   });
   const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key", "SECRET"]));
-  assert.match(out, /custom_providers "H" updated \(1 models/);
+  assert.match(out, /providers "H" updated \(1 models/, "the report names the section actually edited");
   const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
   assert.match(cfg, /api_key: SECRET/);
   assert.equal((cfg.match(/^ {2}h1:$/gm) || []).length, 1, "no duplicate entry");
@@ -122,7 +122,7 @@ test("add creates an entry in an existing mapping, keeping the rest byte for byt
     const home = homeWith({ ".hermes/config.yaml": HERMES_DICT().replace("stale:\n        context_length: 4096\n", "") });
     const before = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
     const out = flat(await runCliAsyncP(home, ["add", "other", otherUrl, "--key", "K1", "--target", "hermes"]));
-    assert.match(out, /custom_providers "other" created \(1 models/);
+    assert.match(out, /providers "other" created \(1 models/);
     const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
     assert.match(cfg, /^ {2}h1:$/m, "the existing entry is untouched");
     assert.equal(cfg.split("# must survive").length, before.split("# must survive").length);
@@ -151,6 +151,7 @@ test("a mapping entry provider-sync cannot rewrite is refused, not mangled", asy
 test("a file carrying both surfaces says which one is managed", async () => {
   const home = homeWith({ ".hermes/config.yaml": HERMES_DICT() + "\ncustom_providers:\n  - name: Old\n    base_url: http://127.0.0.1:7/v1\n" });
   const l = flat(runCli(home, ["list", "--target", "hermes"]));
+  assert.match(l, /hermes \S*config\.yaml \(providers\)/, "the header names the surface in use");
   assert.match(l, /note: custom_providers: is still present — provider-sync manages providers:/);
   assert.match(l, /H\s+2 models/);
 });
