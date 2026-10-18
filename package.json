@@ -1,6 +1,6 @@
 {
   "name": "provider-sync",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Manage local model providers for OpenCode, Hermes Agent and DeepSeek Harness from the CLI: auto-detect server type, sync models/ctx/modalities, keep offline fallback catalogs current.",
   "type": "module",
   "bin": {

@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.2.1 — 2026-10-18
 
 ### Added
 - **A dsh route that serves images now says so.** dsh's model schema accepts

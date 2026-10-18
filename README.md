@@ -18,7 +18,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.2.0
+provider-sync --version   # 1.2.1
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:
@@ -34,7 +34,7 @@ No `npm install` — there are no dependencies. Needs Node >= 18 (built-in `fetc
 ## Quick start
 
 ```sh
-provider-sync --version       # 1.2.0
+provider-sync --version       # 1.2.1
 provider-sync list            # what is configured, per harness
 provider-sync sync            # status check, writes nothing (safe default)
 provider-sync add 3090 http://10.0.0.5:64980/v1 --key <api-key>    # register a provider
