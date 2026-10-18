@@ -5,6 +5,15 @@ Format: [semver](https://semver.org). Dates are ISO.
 ## Unreleased
 
 ### Added
+- **A dsh route that serves images now says so.** dsh's model schema accepts
+  exactly two request modalities (`text` and `image`), and a model entry that
+  declares neither falls back to text only — so a vision model on a dsh route
+  refused every image. A server that reports image input (llama.cpp's
+  `architecture.input_modalities`, LM Studio's VLM flag) gets
+  `input: [text, image]` on that model entry, from `add` and `sync` alike.
+  Reports of modalities dsh cannot express (audio, video) are left out rather
+  than written: an input list outside its schema takes that model out of every
+  picker.
 - **dsh routes are interrogated the way dsh interrogates them.** A route's
   `api:` field decides the listing endpoint and the auth header, exactly as
   llm-pi-ai's discovery does: the OpenAI protocols list at `{baseURL}/models`

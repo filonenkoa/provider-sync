@@ -468,8 +468,10 @@ Commands:
                   settings.yaml while dsh has not imported it yet. Model
                   lists are server-authoritative (added/removed models and
                   server-reported contextWindow values are written; entries
-                  dsh owns — api, displayName, other fields — survive). A
-                  route is interrogated the way its api: field says dsh
+                  dsh owns — api, displayName, other fields — survive), and a
+                  model the server reports as taking images gets
+                  input: [text, image] (dsh's schema has exactly those two).
+                  A route is interrogated the way its api: field says dsh
                   interrogates it (OpenAI listing + bearer, or Anthropic
                   x-api-key listing). Refuses to touch a providers block it
                   cannot rewrite losslessly, and reports why instead.
@@ -1343,7 +1345,7 @@ function verifyDshWrite(file, kind, want) {
   const p = kind === "legacy" ? parseDshSettings(readFileSync(file, "utf8")) : parseDshPatch(readFileSync(file, "utf8"));
   if (p.error) return `the written file no longer parses (${p.error})`;
   const got = p.providers ?? {};
-  const sig = (m) => JSON.stringify(Object.fromEntries(Object.entries(m).map(([id, v]) => [id, (Array.isArray(v?.models) ? v.models : []).map((x) => [x?.id ?? null, x?.contextWindow ?? null])])));
+  const sig = (m) => JSON.stringify(Object.fromEntries(Object.entries(m).map(([id, v]) => [id, (Array.isArray(v?.models) ? v.models : []).map((x) => [x?.id ?? null, x?.contextWindow ?? null, x?.input ?? null])])));
   if (Object.keys(got).length !== Object.keys(want).length)
     return `provider count changed (${Object.keys(want).length} -> ${Object.keys(got).length})`;
   if (sig(got) !== sig(want)) return "the providers did not land as written";
@@ -1384,6 +1386,31 @@ const dshOverridesOnly = (p) =>
   Object.keys(p.modelOverrides).length > 0 &&
   !(Array.isArray(p.models) && p.models.length > 0);
 const DSH_OVERRIDES_WHY = (id) => `the entry "${id}" tunes the installed catalog with modelOverrides and lists no models; dsh refuses a models list beside modelOverrides — declare the fields on its model entries, or drop modelOverrides, by hand`;
+// dsh accepts exactly two request modalities — `text` and `image` (llm-pi-ai's
+// MODALITIES). Declaring anything else fails the model schema and takes that
+// model out of every picker, so a server-reported list is narrowed to the ones
+// dsh knows and dropped when nothing is left (an absent `input` means the
+// route's default, which is text).
+const DSH_INPUT = ["text", "image"];
+export function dshInput(modalities) {
+  if (!Array.isArray(modalities) || !modalities.length) return null;
+  const keep = DSH_INPUT.filter((x) => modalities.includes(x));
+  // only image is worth declaring: text alone is what an absent `input` already
+  // means, and writing it would add a field that says nothing
+  return keep.includes("image") ? keep : null;
+}
+// one model entry as it is written: a new one takes the server-reported context
+// and modalities, an existing one keeps every field dsh owns and only has its
+// context corrected
+const dshModelFields = (c, m) => {
+  const input = dshInput(m.input);
+  const base = c ? { ...c } : { id: m.id };
+  if (m.ctx != null && base.contextWindow !== m.ctx) base.contextWindow = m.ctx;
+  // a server that reports image input gets it declared, on a new entry and on an
+  // existing one alike: dsh refuses an image it was never told the model takes
+  if (input && JSON.stringify(base.input ?? null) !== JSON.stringify(input)) base.input = input;
+  return base;
+};
 const dshWrite = (st, providers) => {
   const text = st.kind === "patch" && st.fresh ? PATCH_HEADER.join("\n") + "\n" : st.text;
   return st.kind === "legacy" ? writeDshSettings(text, providers) : writeDshPatch(text, providers);
@@ -1451,10 +1478,11 @@ export function dshUpsert({ id, name, base, api: apiFlag, keyRaw, keyFlag, keyEn
   const newModels = [];
   for (const m of models) {
     const c = curById.get(m.id);
-    if (!c) { newModels.push({ id: m.id, ...(m.ctx != null ? { contextWindow: m.ctx } : {}) }); added++; continue; }
+    if (!c) { newModels.push(dshModelFields(null, m)); added++; continue; }
     curById.delete(m.id);
-    if (m.ctx != null && c.contextWindow !== m.ctx) { newModels.push({ ...c, contextWindow: m.ctx }); changed++; }
-    else newModels.push(c);
+    const next = dshModelFields(c, m);
+    if (next.contextWindow !== c.contextWindow) changed++;
+    newModels.push(next);
   }
   const removed = curById.size;
   const entry = {
@@ -1545,7 +1573,7 @@ async function syncDsh({ apply }) {
     if (r.err) { console.log(`  ${r.id} (${r.base}): ERROR — ${r.err}`); continue; }
     const p = providers[r.id];
     const cur = Array.isArray(p.models) ? p.models : [];
-    const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
+    const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
     const curById = new Map(cur.map((m) => [m?.id, m]));
     const liveIds = new Set(live.map((m) => m.id));
     const added = live.filter((m) => !curById.has(m.id));
@@ -1554,12 +1582,15 @@ async function syncDsh({ apply }) {
     // against the effective value — that is what pinning would change
     const eff = (c) => c.contextWindow ?? p.defaultContextWindow ?? DEFAULT_CTX;
     const ctxCh = live.filter((m) => { const c = curById.get(m.id); return c && m.ctx != null && eff(c) !== m.ctx; });
+    // a server that reports image input gets it declared; dsh has no way to ask
+    const modCh = live.filter((m) => { const c = curById.get(m.id); return c && dshInput(m.input) && JSON.stringify(c.input || ["text"]) !== JSON.stringify(dshInput(m.input)); });
     console.log(`  ${r.id} (${r.kind}, ${r.base}): ${live.length} on server, ${cur.length} in config`);
     for (const a of added) console.log(`    + ${a.id}`);
     for (const a of removed) console.log(`    - ${a.id} (no longer on server)`);
     for (const c of ctxCh) console.log(`    ~ ctx ${c.id}: ${curById.get(c.id).contextWindow ?? `default ${eff(curById.get(c.id))}`} -> ${c.ctx}`);
-    if (!added.length && !removed.length && !ctxCh.length) { console.log("    in sync"); continue; }
-    changes += added.length + removed.length + ctxCh.length;
+    for (const c of modCh) console.log(`    ~ input ${c.id}: ${JSON.stringify(curById.get(c.id).input || ["text"])} -> ${JSON.stringify(dshInput(c.input))}`);
+    if (!added.length && !removed.length && !ctxCh.length && !modCh.length) { console.log("    in sync"); continue; }
+    changes += added.length + removed.length + ctxCh.length + modCh.length;
     edits.push({ id: r.id, live });
   }
   if (!edits.length) return { status: "in-sync", n: ids.length };
@@ -1570,12 +1601,7 @@ async function syncDsh({ apply }) {
     const cur = Array.isArray(p.models) ? p.models : [];
     const curById = new Map(cur.map((m) => [m?.id, m]));
     const models = [];
-    for (const m of ed.live) {
-      const c = curById.get(m.id);
-      if (!c) models.push({ id: m.id, ...(m.ctx != null ? { contextWindow: m.ctx } : {}) });
-      else if (m.ctx != null) models.push({ ...c, contextWindow: m.ctx });
-      else models.push(c);
-    }
+    for (const m of ed.live) models.push(dshModelFields(curById.get(m.id) ?? null, m));
     next[ed.id] = { ...p, models };
   }
   const out = dshWrite(st, next);
@@ -1905,7 +1931,7 @@ async function cmdAdd(id, url) {
   if (!res.added.length && !res.removed.length && !res.ctx.length && !res.mods.length) console.log("  up to date");
   for (const nt of notes) console.log("  note: " + nt);
 
-  const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
+  const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
   // the raw value matters here: {env:VAR} stays a reference, which hermesUpsert
   // turns into key_env instead of copying OpenCode's syntax
   const hkey = key || configApiKey(cfg, id) || a[id]?.key || keyValue;

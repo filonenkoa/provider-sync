@@ -9,7 +9,7 @@ import path from "node:path";
 import http from "node:http";
 import { runCliAsyncP, runCli, flat, hermeticEnv } from "./helpers.js";
 
-let server, url, authServer, authUrl, anthServer, anthUrl;
+let server, url, authServer, authUrl, anthServer, anthUrl, vlmServer, vlmUrl;
 const homes = [];
 before(async () => {
   server = http.createServer((q, s) => {
@@ -46,7 +46,7 @@ before(async () => {
   await new Promise((r) => anthServer.listen(0, "127.0.0.1", r));
   anthUrl = `http://127.0.0.1:${anthServer.address().port}`;
 });
-after(() => { server.close(); authServer.close(); anthServer.close(); for (const h of homes) rmSync(h, { recursive: true, force: true }); });
+after(() => { server.close(); authServer.close(); anthServer.close(); vlmServer?.close(); for (const h of homes) rmSync(h, { recursive: true, force: true }); });
 
 const homeWith = (files) => {
   const home = mkdtempSync(path.join(tmpdir(), "ps-dsh-"));
@@ -161,6 +161,35 @@ test("add: --key-env with an unset variable names the variable, not a bad key", 
     () => runCliAsyncP(home, ["add", "anth", anthUrl, "--key-env", "PS_UNSET_VAR"]),
     /--key-env PS_UNSET_VAR is not set in this environment/,
   );
+});
+
+test("sync: a vision model's image input is declared, and nothing dsh cannot parse is", async () => {
+  vlmServer = http.createServer((q, s) => {
+    if (q.url === "/v1/models") {
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ data: [
+        // llama.cpp reports the build's modalities in architecture.input_modalities
+        { id: "vlm-12b", architecture: { input_modalities: ["text", "image"] } },
+        { id: "audio-only", architecture: { input_modalities: ["text", "audio"] } },
+      ] }));
+      return;
+    }
+    s.statusCode = 404; s.end("{}");
+  });
+  await new Promise((r) => vlmServer.listen(0, "127.0.0.1", r));
+  vlmUrl = `http://127.0.0.1:${vlmServer.address().port}/v1`;
+  const home = homeWith({ [WEB]: patchWith(`      vlm:\n        api: openai-completions\n        baseURL: ${vlmUrl}\n        models:\n          - id: vlm-12b\n`) });
+  const out = await sync(home, ["--target", "dsh", "--apply"]);
+  assert.match(out, /~ input vlm-12b: \["text"\] -> \["text","image"\]/);
+  const cfg = read(home, WEB);
+  assert.match(cfg, /- id: vlm-12b\n\s+input:\n\s+- text\n\s+- image\n/);
+  // dsh's model schema accepts exactly text and image, so an audio-only report
+  // must leave the declaration out rather than write an input dsh rejects
+  assert.match(cfg, /- id: audio-only\n/, "an audio-only report leaves the declaration out");
+  assert.doesNotMatch(cfg, /- audio\n/, "dsh's model schema has no audio modality — it would take the model out of the picker");
+  assert.equal((cfg.match(/input:/g) || []).length, 1, "declared once");
+  // and a second run has nothing left to do
+  assert.match(await sync(home, ["--target", "dsh"]), /in sync/);
 });
 
 test("list: dsh providers, key states and notes", () => {
