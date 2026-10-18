@@ -2,6 +2,26 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- The Hermes line of the `written:` report names the section that was actually
+  edited (`providers` or the legacy `custom_providers`), and `list` shows the
+  surface in its header, instead of always claiming `custom_providers`.
+- An entry whose `models:` is an empty inline mapping (`models: {}`, how
+  Hermes' own dumper spells an empty catalog) was refused with a reason in the
+  mapping surface, and produced a duplicate `models:` key in the legacy list.
+  Both are expanded to the block form the entries go under.
+
+### Changed
+- README rewritten for readability and completeness: a real `list` and `sync`
+  sample, per-command option tables, a keys table (where each harness stores
+  and resolves them), per-harness behaviour sections, what a write reports,
+  safety, exit codes, known limits, troubleshooting and development notes. Two
+  claims were wrong and are corrected: server detection is probed Unsloth UI
+  first (not llama.cpp), and Unsloth context comes from `context_length` (not a
+  "loaded context").
+
 ## 1.2.1 — 2026-10-18
 
 ### Added
