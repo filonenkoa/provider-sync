@@ -129,6 +129,24 @@ test("a config with neither section gets the modern providers: mapping", () => {
   assert.equal(parseHermesProviders(read()).entries.length, 1);
 });
 
+test("an empty inline models: {} is expanded, in both surfaces", () => {
+  // `models: {}` is how Hermes' own dumper spells an empty catalog
+  for (const [doc, reparse] of [
+    [`custom_providers:\n  - name: E\n    base_url: http://10.0.0.14:64980/v1\n    api_key: dummy\n    models: {}\n`, parseHermes],
+    [`providers:\n  e:\n    name: E\n    base_url: http://10.0.0.14:64980/v1\n    api_key: dummy\n    models: {}\n`, parseHermesProviders],
+  ]) {
+    write(doc);
+    const r = hermesUpsert({ name: "E", base: "http://10.0.0.14:64980/v1", key: "k", model: "tiny", models: MODELS, dryRun: false });
+    assert.equal(r.status, "updated");
+    const out = read();
+    assert.doesNotMatch(out, /models: \{\}/, "the inline mapping is gone");
+    assert.equal((out.match(/^\s*models:$/gm) || []).length, 1, "one models key");
+    assert.equal(reparse(out).entries.length, 1);
+    assert.deepEqual(reparse(out).entries[0].models.map((m) => m.id), ["IY/Qwen3.8-27B-262Kctx", "tiny"]);
+    assert.match(out, /context_length: 262144/);
+  }
+});
+
 test("a mapping entry with no models block gets one, fields in place", () => {
   write(`providers:
   h1:
