@@ -17,6 +17,9 @@ Format: [semver](https://semver.org). Dates are ISO.
   grant is reported as signed-in but unreadable, and `add` leaves such a route's
   credential alone (`--key K` still replaces it on purpose). `--key-env` is
   documented as the one flag that overrides a record.
+- A dsh route that tunes its installed catalog with `modelOverrides` and lists
+  no models is refused instead of given a `models` list: dsh rejects the two
+  together, and the rejection takes the route out of every model picker.
 
 ## 1.2.0 — 2026-10-17
 

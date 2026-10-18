@@ -1242,6 +1242,16 @@ function dshProvidersOf(st) {
   if (st.error) throw new Error(st.error);
   return st.providers && typeof st.providers === "object" && !Array.isArray(st.providers) ? { ...st.providers } : {};
 }
+// dsh serves a route from its installed catalog and lets `modelOverrides` tune
+// the entries of it; a `models` list *replaces* that catalog, and dsh refuses
+// the combination ("sets modelOverrides ... beside a models list"), which takes
+// the whole route out of every picker. Writing the list under such an entry
+// would therefore break a working route, so it is reported instead.
+const dshOverridesOnly = (p) =>
+  !!p && typeof p === "object" && p.modelOverrides && typeof p.modelOverrides === "object" &&
+  Object.keys(p.modelOverrides).length > 0 &&
+  !(Array.isArray(p.models) && p.models.length > 0);
+const DSH_OVERRIDES_WHY = (id) => `the entry "${id}" tunes the installed catalog with modelOverrides and lists no models; dsh refuses a models list beside modelOverrides — declare the fields on its model entries, or drop modelOverrides, by hand`;
 const dshWrite = (st, providers) => {
   const text = st.kind === "patch" && st.fresh ? PATCH_HEADER.join("\n") + "\n" : st.text;
   return st.kind === "legacy" ? writeDshSettings(text, providers) : writeDshPatch(text, providers);
@@ -1267,6 +1277,7 @@ export function dshUpsert({ id, name, base, keyRaw, keyFlag, keyEnvFlag, models,
   const old = providers[pid] && typeof providers[pid] === "object" ? providers[pid] : {};
   const existed = !!providers[pid];
   const n = models.length;
+  if (dshOverridesOnly(old)) return { status: "refused", why: DSH_OVERRIDES_WHY(pid), file: st.file };
   // the key: keep the entry's existing reference when there is one; a new
   // provider follows dsh's own UI convention <ID_UPPER>_API_KEY. --key-env
   // wins, an {env:VAR} reference borrowed from OpenCode is kept as a ref too.
@@ -1366,6 +1377,7 @@ async function syncDsh({ apply }) {
   const rs = await Promise.all(ids.map(async (id) => {
     const p = providers[id];
     if (!p || typeof p !== "object") return { id, skip: "the entry is not a mapping" };
+    if (dshOverridesOnly(p)) return { id, skip: DSH_OVERRIDES_WHY(id) };
     if (!p.baseURL) return { id, skip: "no baseURL (catalog provider)" };
     const k = dshKeyOf(p, id);
     const runKey = k.key || flags.key || null; // --key stands in for this run only

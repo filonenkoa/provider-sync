@@ -73,6 +73,34 @@ const M4MAX = m4maxBlock("http://127.0.0.1:9/v1"); // list-only tests never prob
 const WEB = ".dsh/profiles/web/cordis.patch.yml";
 const STORE = ".dsh/.credentials.yaml";
 
+test("an entry that tunes its catalog with modelOverrides is never given a models list", async () => {
+  // dsh refuses modelOverrides beside a models list; writing one would take the
+  // route out of every picker
+  const block = `      catalog-route:
+        api: openai-completions
+        baseURL: ${url}
+        modelOverrides:
+          qwen3.8-27b:
+            contextWindow: 99999
+`;
+  const home = homeWith({ [WEB]: patchWith(block) });
+  const before = read(home, WEB);
+  const s = await sync(home, ["--target", "dsh"]);
+  assert.match(s, /catalog-route: the entry "catalog-route" tunes the installed catalog with modelOverrides/);
+  const out = await add(home, []);
+  assert.match(out, /dsh \S*cordis\.patch\.yml skipped — the entry "catalog-route" tunes the installed catalog/);
+  assert.equal(read(home, WEB), before, "nothing was written");
+  assert.equal(existsSync(inHome(home, STORE)), false, "no key was stored either");
+});
+
+test("an entry dsh already serves from a models list is still synced", async () => {
+  const home = homeWith({ [WEB]: patchWith(
+    `      listed:\n        api: openai-completions\n        baseURL: ${url}\n        models:\n          - id: stale\n            contextWindow: 8\n`) });
+  const out = await sync(home, ["--target", "dsh", "--apply"]);
+  assert.match(out, /APPLIED 3 change\(s\)/);
+  assert.match(read(home, WEB), /- id: qwen3\.8-27b/);
+});
+
 test("list: dsh providers, key states and notes", () => {
   const home = homeWith({
     [WEB]: patchWith(M4MAX),
