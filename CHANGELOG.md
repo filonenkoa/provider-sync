@@ -4,6 +4,22 @@ Format: [semver](https://semver.org). Dates are ISO.
 
 ## Unreleased
 
+### Added
+- **Hermes' `providers:` mapping is now managed, not just the legacy
+  `custom_providers:` list.** Hermes' config migration (v11 → v12) moves every
+  `custom_providers` entry into a root `providers:` mapping and deletes the
+  list; from that point on provider-sync reported "no custom_providers section —
+  skipped" and stopped managing Hermes altogether. Whichever surface the file
+  carries is now the one that is read and written (a file carrying both says so),
+  and a file with neither gets `providers:`, the mapping Hermes itself defaults
+  to. The mapping is edited with the same line-surgical rules — one entry's own
+  `models:` block is rewritten, everything else survives — and refuses a shape it
+  cannot rewrite (a comment inside an entry, a flow-style entry, a one-line
+  entry) with the reason. Verified against Hermes' own reader and writer: what
+  provider-sync writes round-trips through `providers_dict_to_custom_providers`,
+  and a file emitted by Hermes' dumper (keys sorted, `tiny: {}` for an empty
+  model) is read back unchanged.
+
 ### Fixed
 - The post-write validation no longer calls a valid OpenCode model entry
   broken. It knew only the keys provider-sync itself writes, so a config that

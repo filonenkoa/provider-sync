@@ -11,7 +11,7 @@ import { pinHomeForImport } from "./helpers.js";
 const home = mkdtempSync(path.join(tmpdir(), "ps-hermes-"));
 pinHomeForImport(home);
 const { HERMES_CFG, hermesUpsert } = await import("../bin/provider-sync.js");
-const { parseHermes } = await import("../lib/hermes-yaml.js");
+const { parseHermes, parseHermesProviders } = await import("../lib/hermes-yaml.js");
 
 const MODELS = [
   { id: "IY/Qwen3.8-27B-262Kctx", ctx: 262144 },
@@ -119,10 +119,41 @@ test("reports a missing hermes install instead of failing", () => {
   assert.equal(existsSync(HERMES_CFG), false);
 });
 
-test("reports a config without a custom_providers section", () => {
+test("a config with neither section gets the modern providers: mapping", () => {
+  // Hermes defaults `providers: {}` (config v12+) and migrates a
+  // `custom_providers:` list into it, so that is what a fresh entry creates
   write("model:\n  default: x\n");
-  const r = hermesUpsert({ name: "X", base: "http://10.0.0.4:1/v1", key: null, model: null, models: MODELS, dryRun: false });
-  assert.equal(r.status, "no-section");
+  const r = hermesUpsert({ name: "X", keyName: "x", base: "http://10.0.0.4:1/v1", key: null, model: null, models: MODELS, dryRun: false });
+  assert.equal(r.status, "created");
+  assert.match(read(), /^model:\n  default: x\n\nproviders:\n  x:\n    name: X\n    base_url: http:\/\/10\.0\.0\.4:1\/v1\n/);
+  assert.equal(parseHermesProviders(read()).entries.length, 1);
+});
+
+test("a mapping entry with no models block gets one, fields in place", () => {
+  write(`providers:
+  h1:
+    base_url: http://10.0.0.12:64980/v1
+    name: No models yet
+`);
+  const r = hermesUpsert({ name: "No models yet", base: "http://10.0.0.12:64980/v1", key: "k", model: "tiny", models: MODELS, dryRun: false });
+  assert.equal(r.status, "updated");
+  const out = read();
+  assert.match(out, /^providers:\n {2}h1:\n {4}base_url: http:\/\/10\.0\.0\.12:64980\/v1\n {4}api_key: k\n {4}name: No models yet\n {4}models:\n/m,
+    "the key goes next to base_url and the rest of the entry keeps its order");
+  assert.match(out, / {6}IY\/Qwen3\.8-27B-262Kctx:\n {8}context_length: 262144\n/);
+  assert.match(out, / {4}models_discovered: true/);
+  const entries = parseHermesProviders(out).entries;
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].models.map((m) => m.id), ["IY/Qwen3.8-27B-262Kctx", "tiny"]);
+});
+
+test("an entry written on one line in the mapping is refused, not split", () => {
+  const doc = "providers:\n  h1: {name: x, base_url: 'http://10.0.0.13:64980/v1'}\n";
+  write(doc);
+  const r = hermesUpsert({ name: "x", base: "http://10.0.0.13:64980/v1", key: "k", model: null, models: MODELS, dryRun: false });
+  assert.equal(r.status, "layout");
+  assert.match(r.why, /written on one line/);
+  assert.equal(read(), doc, "the file is byte-identical");
 });
 
 test("preserves CRLF line endings", () => {

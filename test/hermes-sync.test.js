@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { runCliAsyncP, flat } from "./helpers.js";
+import { runCliAsyncP, runCli, flat } from "./helpers.js";
 
 let server, url;
 const homes = [];
@@ -61,6 +61,99 @@ const HERMES = () => `custom_providers:
       m1:
         context_length: 4096
 `;
+
+// the v12+ mapping Hermes migrates custom_providers into
+const HERMES_DICT = () => `model:
+  default: x
+
+# must survive
+providers:
+  h1:
+    name: H
+    base_url: ${url}
+    api_key: dummy
+    models:
+      m1:
+        context_length: 1
+      stale:
+        context_length: 4096
+`;
+
+test("sync reads and writes the providers: mapping Hermes migrated into", async () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"), ".hermes/config.yaml": HERMES_DICT() });
+  const l = flat(runCli(home, ["list", "--target", "hermes"]));
+  assert.match(l, /H\s+2 models\s+http:\/\/127\.0\.0\.1:\d+\/v1\s+key \(borrowed from p1\)/,
+  "api_key: dummy is a placeholder, so the key is borrowed from the opencode entry");
+  const report = flat(await runCliAsyncP(home, ["sync", "--target", "hermes"]));
+  assert.match(report, /hermes .*: 1 custom provider\(s\) in providers:/);
+  assert.match(report, /~ ctx m1: 1 -> 4096/);
+  assert.match(report, /- stale \(no longer on server\)/);
+  assert.match(report, /2 change\(s\) pending/);
+  const out = flat(await runCliAsyncP(home, ["sync", "--target", "hermes", "--apply"]));
+  assert.match(out, /APPLIED 2 change\(s\)/);
+  const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(cfg, /# must survive/, "unrelated lines survive");
+  assert.match(cfg, /      m1:\n        context_length: 4096\n/);
+  assert.doesNotMatch(cfg, /stale/);
+  assert.match(flat(await runCliAsyncP(home, ["sync", "--target", "hermes"])), /in sync/);
+});
+
+test("add updates a mapping entry in place, matched by base url", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": HERMES_DICT().replace("stale:\n        context_length: 4096\n", ""),
+  });
+  const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key", "SECRET"]));
+  assert.match(out, /custom_providers "H" updated \(1 models/);
+  const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(cfg, /api_key: SECRET/);
+  assert.equal((cfg.match(/^ {2}h1:$/gm) || []).length, 1, "no duplicate entry");
+  assert.doesNotMatch(cfg, /^- name: mm$/, "the mapping keeps its own key");
+});
+
+test("add creates an entry in an existing mapping, keeping the rest byte for byte", async () => {
+  const second = http.createServer((q, s) => {
+    if (q.url === "/v1/models") { s.setHeader("content-type", "application/json"); s.end(JSON.stringify({ data: [{ id: "m2", context_length: 2048 }] })); }
+    else { s.statusCode = 404; s.end("{}"); }
+  });
+  await new Promise((r) => second.listen(0, "127.0.0.1", r));
+  const otherUrl = `http://127.0.0.1:${second.address().port}/v1`;
+  try {
+    const home = homeWith({ ".hermes/config.yaml": HERMES_DICT().replace("stale:\n        context_length: 4096\n", "") });
+    const before = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+    const out = flat(await runCliAsyncP(home, ["add", "other", otherUrl, "--key", "K1", "--target", "hermes"]));
+    assert.match(out, /custom_providers "other" created \(1 models/);
+    const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+    assert.match(cfg, /^ {2}h1:$/m, "the existing entry is untouched");
+    assert.equal(cfg.split("# must survive").length, before.split("# must survive").length);
+    assert.match(cfg, /^ {2}other:\n {4}name: other\n {4}base_url: http:\/\/127\.0\.0\.1:\d+\/v1\n {4}api_key: K1\n/m);
+    assert.match(cfg, / {6}m2:\n {8}context_length: 2048\n/);
+    assert.match(cfg, / {4}models_discovered: true/);
+    // the new entry is a working provider for hermes afterwards
+    assert.match(flat(await runCliAsyncP(home, ["sync", "--target", "hermes"])), /other \(\w+, http:\/\/127\.0\.0\.1:\d+\/v1\): 1 on server, 1 in config/);
+  } finally { second.close(); }
+});
+
+test("a mapping entry provider-sync cannot rewrite is refused, not mangled", async () => {
+  const commented = `providers:
+  h1:
+    base_url: ${url}
+    # a note the user wrote
+    api_key: dummy
+`;
+  const home = homeWith({ ".hermes/config.yaml": commented });
+  const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key", "SECRET", "--target", "hermes"]));
+  assert.match(out, /hermes .* skipped — providers: line 4: a comment inside the "h1" entry/);
+  assert.equal(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), commented);
+  assert.match(flat(runCli(home, ["list", "--target", "hermes"])), /note: providers: line 4: a comment/);
+});
+
+test("a file carrying both surfaces says which one is managed", async () => {
+  const home = homeWith({ ".hermes/config.yaml": HERMES_DICT() + "\ncustom_providers:\n  - name: Old\n    base_url: http://127.0.0.1:7/v1\n" });
+  const l = flat(runCli(home, ["list", "--target", "hermes"]));
+  assert.match(l, /note: custom_providers: is still present — provider-sync manages providers:/);
+  assert.match(l, /H\s+2 models/);
+});
 
 test("sync borrows the key stored in the opencode config entry", async () => {
   const home = homeWith({

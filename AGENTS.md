@@ -7,7 +7,7 @@ You are an AI agent (Hermes, OpenCode, Claude, …) on a machine where `provider
 Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Studio, Unsloth UI, any OpenAI-compatible endpoint): models added/removed, context windows, input modalities. Targets:
 
 - **opencode** — `provider` definitions in the OpenCode config file;
-- **hermes** — `custom_providers` entries in `~/.hermes/config.yaml`: `add` creates/updates them (matched by base URL), `sync` refreshes their offline fallback catalogs (`models:` maps) so Hermes' model picker works when a server is down;
+- **hermes** — `custom_providers` entries in `~/.hermes/config.yaml`, or the `providers:` mapping Hermes writes since config v12 (its v11→v12 migration moves the list there and deletes the list, so the mapping is what a migrated config has): `add` creates/updates them (matched by base URL), `sync` refreshes their offline fallback catalogs (`models:` maps) so Hermes' model picker works when a server is down;
 - **dsh** (DeepSeek Harness) — the `llm-pi-ai` providers in the live profile patch (`~/.dsh/profiles/<name>/cordis.patch.yml`) or in `~/.dsh/settings.yaml` while dsh has not imported it yet. Keys live in `~/.dsh/.credentials.yaml` (written by `add --key`, mode 600, references like `<ID>_API_KEY`). `$DSH_HOME` moves the whole home; `--profile NAME` picks the profile (default `web`).
 
 ## Golden rules

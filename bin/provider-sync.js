@@ -358,7 +358,8 @@ Files:
            it as the bearer token. OpenCode's own stores (auth.json on 1.x,
            opencode.db on 2.x) are read-only for provider-sync: presence is
            reported, never changed
-  hermes   ~/.hermes/config.yaml               custom_providers (if installed)
+  hermes   ~/.hermes/config.yaml               providers: mapping, or the legacy
+                                               custom_providers: list (if installed)
            ~/.hermes/.env                      key source for Hermes providers
   dsh      ~/.dsh/profiles/<name>/cordis.patch.yml  the live llm-pi-ai providers
                                                (the dsh home honors $DSH_HOME)
@@ -394,7 +395,8 @@ Commands:
       On a machine without an OpenCode config the file is created (first
       provider bootstraps it); --dry-run writes nothing.
       Reaches every installed harness: the same provider is also created or
-      updated under custom_providers in ~/.hermes/config.yaml (matched by
+      updated under the providers: mapping (or the legacy custom_providers:
+      list, when that is what ~/.hermes/config.yaml carries; matched by
       base URL, so re-running updates instead of duplicating) and in the dsh
       llm-pi-ai config (matched by base URL, then by id). A harness that
       is not installed is left alone — no config file is created for it — and
@@ -454,8 +456,9 @@ Commands:
       a terminal, provider-sync may ask interactively about ctx it cannot determine.
       Targets:
         opencode  providers in the OpenCode config file (default when --provider set)
-        hermes    custom_providers in ~/.hermes/config.yaml — the offline
-                  fallback catalog Hermes shows when a server is down. Only
+        hermes    the providers: mapping in ~/.hermes/config.yaml (or the legacy
+                  custom_providers: list) — the offline fallback catalog Hermes
+                  shows when a server is down. Only
                   server-reported context lengths are written; guesses never
                   go into Hermes. Model entries keep only context_length —
                   any other fields are dropped (with a warning).
@@ -807,9 +810,27 @@ export function reconcile(models, server, { out, ctxMap, shape = "legacy" }) {
   return { models: next, ...res };
 }
 
-import { ind, normUrl, deq, yq, parseHermes, renderModels, hermesSetModels, hermesSetField } from "../lib/hermes-yaml.js";
+import { ind, normUrl, deq, yq, parseHermes, renderModels, hermesSetModels, hermesSetField, parseHermesProviders, renderProviderEntry, writeHermesProviders } from "../lib/hermes-yaml.js";
 
-// ---------- hermes (~/.hermes/config.yaml, custom_providers) ----------
+// ---------- hermes (~/.hermes/config.yaml) ----------
+// Two surfaces, one entry: the legacy `custom_providers:` list and the
+// `providers:` mapping Hermes writes since config v12 (and migrates the list
+// into, dropping the list). Whichever the file carries is the one provider-sync
+// edits; a file with neither gets `providers:`, the form Hermes itself
+// defaults to. Entries are matched by base URL in either form.
+function hermesDoc(text) {
+  const dict = parseHermesProviders(text);
+  if (dict)
+    return { form: "dict", lines: dict.lines, entries: dict.entries, unparsed: dict.unparsed ?? 0,
+             eol: dict.eol ?? (text.includes("\r\n") ? "\r\n" : "\n"),
+             listInd: dict.keyInd ?? 2, fldInd: dict.entries[0]?.fldInd ?? 4,
+             listEnd: dict.sectionEnd ?? dict.lines.length, error: dict.error ?? null, dict };
+  const list = parseHermes(text);
+  if (list) return { form: "list", ...list, error: null };
+  const alsoList = /^custom_providers:/m.test(text);
+  return { form: alsoList ? "list" : "none", lines: text.split(/\r?\n/), entries: [], unparsed: 0,
+           eol: text.includes("\r\n") ? "\r\n" : "\n", listInd: 2, fldInd: 4, listEnd: text.split(/\r?\n/).length, error: null };
+}
 // Surgical line-based YAML edits: no full-file reparse/rewrite, comments and
 // formatting of untouched sections are preserved. Only the per-provider
 // `models:` block (a fallback catalog for offline use) is rewritten.
@@ -883,12 +904,17 @@ function hermesKeySource(e, ocCfg, ocAuth) {
 
 // ---------- hermes writes (shared by sync and add) ----------
 
+// the key an entry of the v12+ `providers:` mapping gets: the same id the user
+// gave on the command line (the dict key is the provider id Hermes routes by),
+// with anything YAML would not take as a plain key quoted away
+const hermesProviderKey = (id) => (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) ? id : String(id).replace(/\s+/g, "-"));
+
 // read the file we just wrote and confirm it still says what we intended;
 // a mismatch means the line surgery produced something we do not understand,
 // so the backup (made a moment earlier) is put back and the caller is told
 function verifyHermesWrite(expect) {
-  const after = parseHermes(readFileSync(HERMES_CFG, "utf8"));
-  if (!after) return "the written file no longer has a custom_providers section";
+  const after = hermesDoc(readFileSync(HERMES_CFG, "utf8"));
+  if (after.error) return `the written file no longer parses (${after.error})`;
   if (expect.entries != null && after.entries.length !== expect.entries)
     return `entry count changed (${expect.entries} -> ${after.entries.length})`;
   for (const { base, ids } of expect.models || []) {
@@ -919,10 +945,13 @@ function writeHermesCfg(lines, eol = "\n", expect = {}) {
 
 // create or update a custom_providers entry so `add` reaches every installed
 // harness; matched by base URL, so re-running updates instead of duplicating
-export function hermesUpsert({ name, base, key, model, models, dryRun }) {
+export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }) {
   if (!existsSync(HERMES_CFG)) return { status: "absent", why: `hermes not installed (${disp(HERMES_CFG)} not found)` };
-  const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
-  if (!h) return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };
+  const text = readFileSync(HERMES_CFG, "utf8");
+  const h = hermesDoc(text);
+  if (h.error) return { status: "layout", why: h.error };
+  if (h.form === "list" && !h.entries.length && !parseHermes(text))
+    return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };
   const n = models.length;
   // `{env:VAR}` is OpenCode's syntax; Hermes reads `key_env` from
   // ~/.hermes/.env, so an env reference is translated instead of copied
@@ -943,13 +972,30 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
     return { status: "updated", name: found.name, n };
   }
   if (dryRun) return { status: "created", name, n };
+  const created = h.form === "list"
+    ? hermesUpsertList(h, { name, base, key, ref, model, models })
+    : hermesUpsertDict(text, { keyName, name, base, key, ref, model, models });
+  if (created?.status) return created;
+  writeHermesCfg(created.lines, h.eol, {
+    entries: h.entries.length + 1,
+    models: [{ base, ids: models.map((m) => m.id) }],
+  });
+  return { status: "created", name, n };
+}
+// append to the legacy `custom_providers:` list
+function hermesUpsertList(h, { name, base, key, ref, model, models }) {
   if (h.unparsed) return { status: "unparsed", why: `${h.unparsed} custom_providers item(s) not understood (unexpected layout) — refusing to append, update them by hand` };
   // yaml requires the fields of a list item exactly two columns right of its dash;
   // anything else means the file is hand-made and we must not guess its style
   if (h.entries.length && h.fldInd !== h.listInd + 2)
     return { status: "layout", why: `existing entries are indented unusually (dash ${h.listInd}, fields ${h.fldInd}) — refusing to append, update by hand` };
   const li = h.listInd, fi = li + 2;
-  const block = [
+  const lines = h.lines.slice();
+  let at = h.listEnd;
+  while (at > 0 && lines[at - 1].trim() === "") at--;
+  // separate the new entry from a following top-level key with one blank line
+  const blank = at < lines.length && lines[at].trim() !== "" ? [""] : [];
+  lines.splice(at, 0,
     `${ind(li)}- name: ${yq(name)}`,
     `${ind(fi)}base_url: ${yq(base)}`,
     `${ind(fi)}api_key: ${!ref && key ? yq(key) : "dummy"}`,
@@ -958,24 +1004,29 @@ export function hermesUpsert({ name, base, key, model, models, dryRun }) {
     `${ind(fi)}models:`,
     ...renderModels(models, fi + 2, fi + 4),
     `${ind(fi)}models_discovered: true`,
-  ];
-  const lines = h.lines.slice();
-  let at = h.listEnd;
-  while (at > 0 && lines[at - 1].trim() === "") at--;
-  // separate the new entry from a following top-level key with one blank line
-  const blank = at < lines.length && lines[at].trim() !== "" ? [""] : [];
-  lines.splice(at, 0, ...block, ...blank);
-  writeHermesCfg(lines, h.eol, { entries: h.entries.length + 1, models: [{ base, ids: models.map((m) => m.id) }] });
-  return { status: "created", name, n };
+    ...blank);
+  return { lines };
+}
+// append to (or create) the v12+ `providers:` mapping
+function hermesUpsertDict(text, { keyName, name, base, key, ref, model, models }) {
+  let out;
+  try { out = writeHermesProviders(text, keyName, { name, base, keyValue: key, keyEnv: ref, model, models }); }
+  catch (e) { return { status: "layout", why: e.message }; }
+  return { lines: out.text.split(/\r?\n/) };
 }
 
 async function syncHermes({ apply, ocCfg, ocAuth }) {
   if (!existsSync(HERMES_CFG)) { console.log(`hermes (${disp(HERMES_CFG)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
   const text = readFileSync(HERMES_CFG, "utf8");
-  const h = parseHermes(text);
-  if (!h) { console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers — skipped`); return { status: "no-section", why: "no custom_providers section" }; }
-  if (!h.entries.length) { console.log(`hermes: custom_providers found but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : " (unexpected indentation?)"} — skipped`); return { status: "empty", why: "no entries parsed" }; }
-  console.log(`hermes (${disp(HERMES_CFG)}): ${h.entries.length} custom provider(s)`);
+  const h = hermesDoc(text);
+  const section = h.form === "dict" ? "providers" : "custom_providers";
+  if (h.error) { console.log(`hermes (${disp(HERMES_CFG)}): ${h.error} — skipped`); return { status: "no-section", why: h.error }; }
+  if (!h.entries.length) {
+    const why = h.form === "none" ? `no ${section} section` : h.unparsed ? `no entries parsed (${h.unparsed} item(s) in an unexpected layout)` : "no entries parsed (unexpected indentation?)";
+    console.log(`hermes (${disp(HERMES_CFG)}): ${h.form === "none" ? `no ${section} section` : `${section} found but no entries`}${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
+    return { status: h.form === "none" ? "no-section" : "empty", why };
+  }
+  console.log(`hermes (${disp(HERMES_CFG)}): ${h.entries.length} custom provider(s) in ${section}:`);
   if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — skipped, provider-sync will not touch them`);
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(h.entries.map(async (e) => {
@@ -1591,16 +1642,21 @@ function cmdList() {
   if (target === "all" || target === "hermes") {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
-      const h = parseHermes(readFileSync(HERMES_CFG, "utf8"));
+      const text = readFileSync(HERMES_CFG, "utf8");
+      const h = hermesDoc(text);
+      const section = h.form === "dict" ? "providers" : "custom_providers";
       console.log(`hermes  ${disp(HERMES_CFG)}`);
-      if (!h) console.log("  no custom_providers section — skipped");
-      else if (!h.entries.length) console.log(`  custom_providers present but no entries parsed${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""}`);
+      if (h.error) console.log(`  note: ${h.error}`);
+      else if (!h.entries.length)
+        console.log(`  ${h.form === "none" ? `no ${section} section` : `${section} present but no entries parsed`}${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
       else {
         // partial coverage must be visible: those entries are listed nowhere
         if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — not listed, and provider-sync will not touch them`);
+        if (h.form === "dict" && /^custom_providers:/m.test(text))
+          console.log("  note: custom_providers: is still present — provider-sync manages providers:, the mapping Hermes migrates entries into");
         for (const e of h.entries) {
           const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
-          console.log(`  ${e.name.padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}  ${hermesKeySource(e, cfg, auth)}`);
+          console.log(`  ${(e.name || e.key || "-").padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}  ${hermesKeySource(e, cfg, auth)}`);
         }
       }
     }
@@ -1751,7 +1807,7 @@ async function cmdAdd(id, url) {
   // turns into key_env instead of copying OpenCode's syntax
   const hkey = key || configApiKey(cfg, id) || a[id]?.key || keyValue;
   const hmodel = flags.model || hmodels[0]?.id || null;
-  const hargs = { name: prov.name, base, key: hkey, model: hmodel, models: hmodels };
+  const hargs = { name: prov.name, base, key: hkey, keyName: hermesProviderKey(id), model: hmodel, models: hmodels };
   // dsh has its own credential store; the same raw key value is passed so an
   // {env:VAR} reference stays a reference (apiKeyEnv) instead of becoming a
   // literal secret in .credentials.yaml
