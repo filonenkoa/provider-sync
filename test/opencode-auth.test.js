@@ -238,10 +238,11 @@ test("an {env:VAR} config key is resolved from the environment when probing", as
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   try {
     const u = `http://127.0.0.1:${srv.address().port}/v1`;
+    const today = new Date().toISOString().slice(0, 10);
     const home = homeWith({
       ".config/opencode/opencode.jsonc": `{
   "provider": {
-    "envp": { "options": { "baseURL": "${u}", "apiKey": "{env:PS_TEST_SYNC_KEY}" }, "models": { "m1": { "limit": { "context": 4096, "output": 1024 } } } }
+    "envp": { "options": { "baseURL": "${u}", "apiKey": "{env:PS_TEST_SYNC_KEY}" }, "models": { "m1": { "release_date": "${today}", "limit": { "context": 4096, "output": 1024 } } } }
   }
 }
 `,

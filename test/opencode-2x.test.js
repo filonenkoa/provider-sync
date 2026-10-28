@@ -149,6 +149,32 @@ test("sync --apply updates the 2.x entry in place and reads its settings.baseURL
   assert.equal(p.models["mm-2"].limit.context, 8192);
 });
 
+test("sync --apply backfills release dates when dates are the only drift", async () => {
+  const cfg0 = JSON.stringify({
+    providers: {
+      mm: {
+        package: NATIVE_PKG,
+        settings: { baseURL: url },
+        models: {
+          "mm-1": { name: "mm-1", limit: { context: 4096, output: 65536 } },
+          "mm-2": { name: "mm-2", limit: { context: 8192, output: 65536 } },
+        },
+      },
+    },
+  }, null, 2) + "\n";
+  const home = homeWith({ ".config/opencode/opencode.jsonc": cfg0 });
+  const report = flat(await runCliAsyncP(home, ["sync"]));
+  assert.match(report, /~ release date mm-1: missing -> \d{4}-\d{2}-\d{2}/);
+  assert.match(report, /~ release date mm-2: missing -> \d{4}-\d{2}-\d{2}/);
+  assert.match(report, /2 change\(s\) pending/);
+  const out = flat(await runCliAsyncP(home, ["sync", "--apply"]));
+  assert.match(out, /APPLIED 2 change\(s\)/);
+  const cfg = readCfg(home);
+  const today = new Date().toISOString().slice(0, 10);
+  assert.equal(cfg.providers.mm.models["mm-1"].releaseDate, today);
+  assert.equal(cfg.providers.mm.models["mm-2"].releaseDate, today);
+});
+
 test("list marks 2.x entries and reads their settings", async () => {
   const cfg0 = JSON.stringify({
     provider: { old: { options: { baseURL: "http://o/v1" }, models: {} } },

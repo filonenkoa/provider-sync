@@ -57,6 +57,45 @@ test("ctx 0 in ctxMap omits the limit entirely", () => {
   assert.equal("limit" in r.models.a, false);
 });
 
+const TODAY = "2026-10-28";
+const opts = (extra = {}) => ({ out: 1024, ctxMap: {}, today: TODAY, ...extra });
+
+test("new native models get releaseDate so the desktop client does not hide them", () => {
+  const r = reconcile({}, [srv("a")], opts({ shape: "native" }));
+  assert.equal(r.models.a.releaseDate, TODAY);
+});
+
+test("new legacy models get the legacy release_date field", () => {
+  const r = reconcile({}, [srv("a")], opts());
+  assert.equal(r.models.a.release_date, TODAY);
+  assert.equal("releaseDate" in r.models.a, false);
+});
+
+test("an existing model without a release date is backfilled and reported", () => {
+  const r = reconcile({ m: { name: "m" } }, [srv("m")], opts({ shape: "native" }));
+  assert.equal(r.models.m.releaseDate, TODAY);
+  assert.deepEqual(r.dates, [["m", null, TODAY]]);
+});
+
+test("an existing legacy model is backfilled in place, not with the 2.x key", () => {
+  const r = reconcile({ m: { name: "m" } }, [srv("m")], opts());
+  assert.equal(r.models.m.release_date, TODAY);
+  assert.equal("releaseDate" in r.models.m, false);
+  assert.deepEqual(r.dates, [["m", null, TODAY]]);
+});
+
+test("a recent release date is kept and not reported", () => {
+  const r = reconcile({ m: { name: "m", releaseDate: "2026-10-01" } }, [srv("m")], opts({ shape: "native" }));
+  assert.equal(r.models.m.releaseDate, "2026-10-01");
+  assert.deepEqual(r.dates, []);
+});
+
+test("a stale release date is refreshed so the model stays visible", () => {
+  const r = reconcile({ m: { name: "m", releaseDate: "2026-01-01" } }, [srv("m")], opts({ shape: "native" }));
+  assert.equal(r.models.m.releaseDate, TODAY);
+  assert.deepEqual(r.dates, [["m", "2026-01-01", TODAY]]);
+});
+
 test("guessed context windows are sane powers of two", () => {
   assert.equal(guessCtx("model-128K"), 131072);
   assert.equal(guessCtx("Qwen3.8-Flash-262Kctx"), 262144);

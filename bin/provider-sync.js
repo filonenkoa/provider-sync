@@ -388,6 +388,9 @@ Commands:
       added, server-authoritative ctx/modalities applied; configured values
       are kept when the server reports nothing. Re-running add against a
       moved server re-points baseURL and reconciles the model list.
+      Every managed model gets a release date (releaseDate in the 2.x shape,
+      release_date in the legacy one) so OpenCode's desktop/web model picker
+      does not hide it as a 1970 model; a date older than 90 days is refreshed.
       Key resolution: --key K > the key already in the provider entry for <id>
       > OpenCode's own store (auth.json / database). For an
       Unsloth UI with neither, pass --username U --password P: provider-sync logs in
@@ -451,8 +454,10 @@ Commands:
   provider-sync sync [--apply] [--target all|opencode|hermes|dsh] [--provider ID]
                       [--profile NAME]
       Check configured providers against their servers: new/removed models,
-      ctx changes, modality corrections. Offline or auth-failing servers are
-      reported and skipped; disabled_providers in the config are ignored.
+      ctx changes, modality corrections, and release-date backfills/refreshes
+      (so the desktop/web model picker keeps showing local models). Offline
+      or auth-failing servers are reported and skipped; disabled_providers in
+      the config are ignored.
       Without --apply nothing is written — the safe default for a status
       check (ctx of brand-new models is shown as a guess). With --apply in
       a terminal, provider-sync may ask interactively about ctx it cannot determine.
@@ -834,10 +839,28 @@ async function resolveCtxs(server, { ctxFlag, mode, notes, existing = [] }) {
   return map;
 }
 
+// A config-declared model with no release date reaches OpenCode 2.x clients as
+// time.released: 0, which the desktop/web model picker normalizes to
+// 1970-01-01 and hides by default (its visibility window is about six months).
+// Local servers do not publish release dates, so every managed model gets the
+// date it was last seen, refreshed well before that window closes. The field
+// depends on the entry shape: native 2.x models use releaseDate, legacy 1.x
+// models use release_date (2.x drops that one while migrating, but 1.x reads it).
+const RELEASE_FIELD = { native: "releaseDate", legacy: "release_date" };
+const RELEASE_REFRESH_MS = 90 * 24 * 60 * 60 * 1000;
+const todayIso = (now = new Date()) => now.toISOString().slice(0, 10);
+const releaseField = (shape) => RELEASE_FIELD[shape] || RELEASE_FIELD.legacy;
+// a date inside the refresh window still passes the client's visibility filter
+const releaseFresh = (value, today) => {
+  if (typeof value !== "string") return false;
+  const at = Date.parse(value);
+  return Number.isFinite(at) && at > Date.parse(today) - RELEASE_REFRESH_MS;
+};
+
 // Model fields differ per shape: legacy entries use modalities / attachment /
 // tool_call / reasoning; native 2.x entries use capabilities (input / output /
 // tools / reasoning). The information maps 1:1, only the field names change.
-function freshEntry(id, m, { out, ctxMap, shape = "legacy" }) {
+function freshEntry(id, m, { out, ctxMap, shape = "legacy", today = todayIso() }) {
   const inp = m.input || MOD_BY_ID(id);
   const raw = m.ctx ?? ctxMap?.[id] ?? null;
   const c = typeof raw === "number" && raw > 0 ? raw : null; // ctx 0 means "omit the limit"
@@ -853,11 +876,13 @@ function freshEntry(id, m, { out, ctxMap, shape = "legacy" }) {
     if (REASON_BY_ID(id)) e.reasoning = true;
   }
   if (c != null) e.limit = { context: c, output: out };
+  e[releaseField(shape)] = today;
   return e;
 }
 export function upsertEntry(old, m, opts) {
   const shape = opts.shape || "legacy";
-  if (!old) return freshEntry(m.id, m, opts);
+  const today = opts.today || todayIso();
+  if (!old) return freshEntry(m.id, m, { ...opts, today });
   const e = structuredClone(old);
   if (m.input) {
     if (shape === "native")
@@ -865,26 +890,33 @@ export function upsertEntry(old, m, opts) {
     else e.modalities = { input: m.input, output: e.modalities?.output || ["text"] };
   }
   if (m.ctx != null) e.limit = { context: m.ctx, output: e.limit?.output || opts.out };
+  const field = releaseField(shape);
+  if (!releaseFresh(e[field], today)) e[field] = today;
   return e;
 }
 // the input modalities an entry declares, whichever shape it is written in
 export const entryInputMods = (shape, m) => ((shape === "native" ? m?.capabilities?.input : m?.modalities?.input) || []);
 
 // existing models object + server specs -> merged + diff
-export function reconcile(models, server, { out, ctxMap, shape = "legacy" }) {
-  const res = { added: [], removed: [], ctx: [], mods: [] };
+export function reconcile(models, server, { out, ctxMap, shape = "legacy", today = todayIso() }) {
+  const res = { added: [], removed: [], ctx: [], mods: [], dates: [] };
   const next = {};
   const seen = new Set();
+  const dateKey = releaseField(shape);
   for (const m of server) {
     seen.add(m.id);
     if (m.skip) { if (models[m.id]) next[m.id] = models[m.id]; continue; }
     const old = models[m.id];
-    next[m.id] = upsertEntry(old, m, { out, ctxMap, shape });
+    const updated = upsertEntry(old, m, { out, ctxMap, shape, today });
+    next[m.id] = updated;
     if (!old) res.added.push(m.id);
     else {
       if (m.ctx != null && old.limit?.context !== m.ctx) res.ctx.push([m.id, old.limit?.context, m.ctx]);
       if (m.input && JSON.stringify(entryInputMods(shape, old)) !== JSON.stringify(m.input))
         res.mods.push([m.id, entryInputMods(shape, old), m.input]);
+      const before = old[dateKey] ?? null;
+      const after = updated[dateKey] ?? null;
+      if (before !== after) res.dates.push([m.id, before, after]);
     }
   }
   for (const id of Object.keys(models)) if (!seen.has(id)) { res.removed.push(id); delete next[id]; }
@@ -1930,7 +1962,8 @@ async function cmdAdd(id, url) {
   for (const a of res.removed) console.log(`  - ${a} (no longer on server)`);
   for (const [m, o, n] of res.ctx) console.log(`  ~ ctx ${m}: ${o} -> ${n}`);
   for (const [m, o, n] of res.mods) console.log(`  ~ modalities ${m}: [${o}] -> [${n}]`);
-  if (!res.added.length && !res.removed.length && !res.ctx.length && !res.mods.length) console.log("  up to date");
+  for (const [m, o, n] of res.dates) console.log(`  ~ release date ${m}: ${o ?? "missing"} -> ${n}`);
+  if (!res.added.length && !res.removed.length && !res.ctx.length && !res.mods.length && !res.dates.length) console.log("  up to date");
   for (const nt of notes) console.log("  note: " + nt);
 
   const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
@@ -2100,8 +2133,9 @@ async function cmdSync() {
       for (const a of res.removed) console.log(`  - ${a} (no longer on server)`);
       for (const [m, o, nw] of res.ctx) console.log(`  ~ ctx ${m}: ${o} -> ${nw}`);
       for (const [m, o, nw] of res.mods) console.log(`  ~ modalities ${m}: [${o}] -> [${nw}]`);
+      for (const [m, o, nw] of res.dates) console.log(`  ~ release date ${m}: ${o ?? "missing"} -> ${nw}`);
       for (const nt of notes) console.log("  note: " + nt);
-      const total = res.added.length + res.ctx.length + res.mods.length + res.removed.length;
+      const total = res.added.length + res.ctx.length + res.mods.length + res.removed.length + res.dates.length;
       if (!total) { console.log("  in sync"); continue; }
       changes += total;
       if (apply) { pentry.models = res.models; console.log(`  APPLIED ${total} change(s)`); }

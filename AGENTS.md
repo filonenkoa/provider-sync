@@ -10,6 +10,8 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 - **hermes** — `custom_providers` entries in `~/.hermes/config.yaml`, or the `providers:` mapping Hermes writes since config v12 (its v11→v12 migration moves the list there and deletes the list, so the mapping is what a migrated config has): `add` creates/updates them (matched by base URL), `sync` refreshes their offline fallback catalogs (`models:` maps) so Hermes' model picker works when a server is down;
 - **dsh** (DeepSeek Harness) — the `llm-pi-ai` providers in the live profile patch (`~/.dsh/profiles/<name>/cordis.patch.yml`) or in `~/.dsh/settings.yaml` while dsh has not imported it yet. Keys live in `~/.dsh/.credentials.yaml` (written by `add --key`, mode 600, references like `<ID>_API_KEY`). `$DSH_HOME` moves the whole home; `--profile NAME` picks the profile (default `web`).
 
+OpenCode models also get a release date (`releaseDate` in the native 2.x shape, `release_date` in the legacy one) that `sync` refreshes after 90 days: the desktop/web picker hides config-declared models whose date is missing or older than about six months. OpenCode 2.x drops legacy `release_date` during migration, so that part of the fix reaches the desktop picker only for native `providers.<id>` entries.
+
 ## Golden rules
 
 1. Run `provider-sync sync` (no `--apply`) **first** — it is read-only and shows exactly what would change.
@@ -41,6 +43,7 @@ Keeps local AI-agent configs in sync with local model servers (llama.cpp, LM Stu
 | user gives a new server URL | `provider-sync add <id> <url> --key K` (prefer `--dry-run` first if unsure); one command registers it in OpenCode and Hermes |
 | Hermes picker is missing models | `provider-sync sync --apply --target hermes` |
 | opencode config is stale only | `provider-sync sync --apply --target opencode` |
+| OpenCode desktop/web picker is missing local models | `provider-sync sync --apply --target opencode` — backfills `releaseDate`/`release_date`; on OpenCode 2.x only native `providers.<id>` entries keep it (2.x drops legacy `release_date` at migration) |
 | dsh models/ctx stale, or a provider missing in dsh | `provider-sync sync --apply --target dsh` (add `--profile NAME` if the user does not run the default `web` profile) |
 | server was down, now back | same as "everything updated" |
 

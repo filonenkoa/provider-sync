@@ -86,7 +86,7 @@ A harness that is not installed is reported as `not found — skipped` instead o
 
 ### `provider-sync add <id> <baseURL> [options]`
 
-Registers or updates one provider everywhere. Upsert: models missing on the server are removed, new ones added, server-reported context and modalities applied, configured values kept when the server reports nothing. Re-running against a moved server re-points it instead of duplicating (entries are matched by base URL, then by id).
+Registers or updates one provider everywhere. Upsert: models missing on the server are removed, new ones added, server-reported context and modalities applied, configured values kept when the server reports nothing. Re-running against a moved server re-points it instead of duplicating (entries are matched by base URL, then by id). Every managed model also gets a recent release date so OpenCode's desktop/web picker does not hide it as a 1970 model.
 
 | Option | Effect |
 | --- | --- |
@@ -116,6 +116,8 @@ A harness that is not installed is **skipped, not created** — except when you 
 | `--key K` | A key to use **for this run only** (e.g. one that lives in OpenCode's database and cannot be read). Never stored. |
 | `--dry-run` | Report only. It wins over `--apply` on the same line. |
 
+Release dates are backfilled when a managed model has none, and refreshed after 90 days. A date-only change is reported and written by `--apply` like any other drift.
+
 ### `provider-sync set-ctx <provider> [--output N] [--key K] [--dry-run]`
 
 Asks, per model whose server reports no context window: **Enter** = best known value (native trained window from server metadata when available, else a heuristic on the model id), **a number** = use it, **k** = keep the current value, **0** = write no limit. Models the server no longer lists are skipped.
@@ -141,7 +143,7 @@ Configured values are never clobbered — re-ask them with `set-ctx`. Guesses ar
 
 **Modalities.** llama.cpp's `architecture.input_modalities` is ground truth and corrects wrong declarations; LM Studio reports VLM models as text+image; otherwise a heuristic on the model id (`qwen3.8*` → text+image+video, `qwen*`/`gemma*` → text+image, else text).
 
-**New models in OpenCode** additionally get: attachment support when input is more than text, `tool_call` disabled for `*base*` model ids, `reasoning` enabled for thinking-style ids (`qwen3.5+`, `qwen4`, `muse-glimmer`, `*thinking*`).
+**New models in OpenCode** additionally get: attachment support when input is more than text, `tool_call` disabled for `*base*` model ids, `reasoning` enabled for thinking-style ids (`qwen3.5+`, `qwen4`, `muse-glimmer`, `*thinking*`), and a release date (`releaseDate` in the 2.x shape, `release_date` in the legacy one) so the desktop/web model picker's default visibility window does not hide them. Dates older than 90 days are refreshed.
 
 ## Keys
 
@@ -172,6 +174,8 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 ### OpenCode
 
 Each provider is kept in **exactly one entry shape** — the one its entry already uses. A config may carry both the legacy `provider.<id>` shape and the 2.x native `providers.<id>` shape; on 2.x a native entry *replaces* a legacy one wholesale, so a second, partial entry for the same id would shadow and break the real provider. provider-sync therefore updates a `providers.<id>` entry in place (`package` / `settings` / `models`) and leaves a legacy one legacy (2.x migrates it at load). A brand-new provider follows the file's dialect: 2.x shape only in a config that has `providers` and no `provider`, legacy everywhere else.
+
+OpenCode 2.x's desktop/web picker hides models whose release date is more than about six months old; a model without one reaches the client as `time.released: 0`, which it normalizes to `1970-01-01` and hides. provider-sync therefore writes the date a model was last seen — `releaseDate` in the native shape, `release_date` in the legacy one — and refreshes it after 90 days. OpenCode 2.x drops the legacy `release_date` during its migration, so the desktop fix covers native `providers.<id>` entries; a legacy entry still relies on the client's manual show toggle.
 
 After every write the config is checked against [OpenCode's own schema](https://opencode.ai/config.json) — unknown model keys, bad modalities and incomplete limits are reported; valid entries OpenCode knows about (`cost`, `variants`, `headers`, …) are not.
 

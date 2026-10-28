@@ -2,6 +2,20 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## Unreleased
+
+### Fixed
+- **OpenCode desktop/web no longer hides provider-sync's models.** A
+  config-declared model without a release date reaches OpenCode 2.x clients as
+  `time.released: 0`, which the desktop/web picker normalizes to `1970-01-01`
+  and hides by default (its visibility window is about six months). Every
+  managed model now gets the date it was last seen — `releaseDate` in the
+  native `providers.<id>` shape, `release_date` in the legacy `provider.<id>`
+  one — and a date older than 90 days is refreshed by `add`/`sync`. A
+  date-only backfill is reported and written by `sync --apply` like any other
+  drift. OpenCode 2.x drops legacy `release_date` during migration, so the
+  desktop fix covers native entries.
+
 ## 1.2.2 — 2026-10-18
 
 ### Fixed
