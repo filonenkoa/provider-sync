@@ -1076,8 +1076,11 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
     if (dryRun) return { status: "updated", name: found.name, n, form: h.form };
     const lines = h.lines.slice();
     hermesSetModels(lines, found, models);
+    // `add --model` is the user's explicit default; an existing entry must take it
+    const modelField = found.modelField || (found.section === "providers" ? "default_model" : "model");
+    if (model && found.model !== model) hermesSetField(lines, found, modelField, model);
     if (ref) {
-      if (found.key_env !== ref) hermesSetField(lines, found, "key_env", ref);
+      if (found.key_env !== ref) hermesSetField(lines, found, found.keyEnvField || "key_env", ref);
       // a live literal key would shadow key_env on Hermes' side
       if (found.api_key && found.api_key !== "dummy") hermesSetField(lines, found, "api_key", "dummy");
     } else if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);

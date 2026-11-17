@@ -125,7 +125,7 @@ test("a config with neither section gets the modern providers: mapping", () => {
   write("model:\n  default: x\n");
   const r = hermesUpsert({ name: "X", keyName: "x", base: "http://10.0.0.4:1/v1", key: null, model: null, models: MODELS, dryRun: false });
   assert.equal(r.status, "created");
-  assert.match(read(), /^model:\n  default: x\n\nproviders:\n  x:\n    name: X\n    base_url: http:\/\/10\.0\.0\.4:1\/v1\n/);
+  assert.match(read(), /^model:\n  default: x\n\nproviders:\n  x:\n    name: X\n    api: http:\/\/10\.0\.0\.4:1\/v1\n/);
   assert.equal(parseHermesProviders(read()).entries.length, 1);
 });
 
@@ -156,8 +156,9 @@ test("a mapping entry with no models block gets one, fields in place", () => {
   const r = hermesUpsert({ name: "No models yet", base: "http://10.0.0.12:64980/v1", key: "k", model: "tiny", models: MODELS, dryRun: false });
   assert.equal(r.status, "updated");
   const out = read();
-  assert.match(out, /^providers:\n {2}h1:\n {4}base_url: http:\/\/10\.0\.0\.12:64980\/v1\n {4}api_key: k\n {4}name: No models yet\n {4}models:\n/m,
+  assert.match(out, /^providers:\n {2}h1:\n {4}base_url: http:\/\/10\.0\.0\.12:64980\/v1\n {4}api_key: k\n {4}default_model: tiny\n {4}name: No models yet\n {4}models:\n/m,
     "the key goes next to base_url and the rest of the entry keeps its order");
+  assert.match(out, / {4}default_model: tiny\n/, "an entry with no model field gets the canonical v12 name");
   assert.match(out, / {6}IY\/Qwen3\.8-27B-262Kctx:\n {8}context_length: 262144\n/);
   assert.match(out, / {4}models_discovered: true/);
   const entries = parseHermesProviders(out).entries;
@@ -188,4 +189,86 @@ test("keeps a rotating backup of the previous file", () => {
   const baks = readdirSync(path.dirname(HERMES_CFG)).filter((f) => f.startsWith("config.yaml.bak-provider-sync-"));
   assert.equal(baks.length, 3, "only the last 3 backups are kept");
   assert.equal(baks.join(), baks.sort().join(), "backups sorted oldest-first by name");
+});
+test("a canonical v12 entry keeps api/default_model and its models list", () => {
+  write(`providers:
+  ollama-launch:
+    api: http://127.0.0.1:11434/v1
+    default_model: qwen3.6:35b-a3b-coding-nvfp4
+    models:
+      - qwen3.6:35b-a3b-coding-nvfp4
+      - qwen3.6:27b-coding-nvfp4
+    name: Ollama
+`);
+  const r = hermesUpsert({
+    name: "Ollama", base: "http://127.0.0.1:11434/v1", key: null,
+    model: "qwen3.6:35b-a3b-coding-nvfp4",
+    models: [{ id: "qwen3.6:35b-a3b-coding-nvfp4", ctx: 262144 }, { id: "new-model", ctx: null }],
+    dryRun: false,
+  });
+  assert.equal(r.status, "updated");
+  const out = read();
+  assert.match(out, /api: http:\/\/127\.0\.0\.1:11434\/v1/);
+  assert.doesNotMatch(out, /base_url:/, "the entry's own spelling survives");
+  assert.match(out, /default_model: qwen3\.6:35b-a3b-coding-nvfp4/);
+  assert.doesNotMatch(out, /^ {4}model:/m, "no second model field appears");
+  assert.match(out, / {4}models:\n {6}- id: qwen3\.6:35b-a3b-coding-nvfp4\n {8}context_length: 262144\n {6}- new-model\n/);
+  assert.equal(parseHermesProviders(out).entries[0].modelsShape, "list");
+});
+
+test("a models mapping stays a mapping when it is rewritten", () => {
+  write(`providers:
+  h1:
+    api: http://10.0.0.12:64980/v1
+    default_model: tiny
+    models:
+      old: {}
+`);
+  const r = hermesUpsert({ name: "H1", base: "http://10.0.0.12:64980/v1", key: "k", model: "tiny", models: MODELS, dryRun: false });
+  assert.equal(r.status, "updated");
+  const out = read();
+  assert.match(out, / {4}models:\n {6}IY\/Qwen3\.8-27B-262Kctx:\n {8}context_length: 262144\n {6}tiny: \{\}\n/);
+  assert.equal(parseHermesProviders(out).entries[0].modelsShape, "map");
+});
+
+test("add --model updates default_model of an existing canonical entry", () => {
+  write(`providers:
+  p:
+    api: http://10.0.0.20:64980/v1
+    default_model: old
+    models:
+      - old
+      - new
+`);
+  const r = hermesUpsert({ name: "P", base: "http://10.0.0.20:64980/v1", key: "k", model: "new", models: [{ id: "old", ctx: null }, { id: "new", ctx: null }], dryRun: false });
+  assert.equal(r.status, "updated");
+  assert.match(read(), /default_model: new\n/);
+  assert.doesNotMatch(read(), /default_model: old\n/);
+});
+
+test("a new providers entry uses the canonical v12 field names", () => {
+  write("model:\n  default: x\n");
+  const r = hermesUpsert({ name: "Canon", keyName: "canon", base: "http://10.0.0.21:64980/v1", key: "k", model: "tiny", models: MODELS, dryRun: false });
+  assert.equal(r.status, "created");
+  const out = read();
+  assert.match(out, /^ {2}canon:\n {4}name: Canon\n {4}api: http:\/\/10\.0\.0\.21:64980\/v1\n {4}api_key: k\n {4}default_model: tiny\n/m);
+  assert.doesNotMatch(out, /base_url:/);
+  assert.doesNotMatch(out, /^ {4}model:/m);
+});
+
+test("a canonical entry in the legacy list keeps its api/default_model spelling", () => {
+  write(`custom_providers:
+  - name: Canon
+    api: http://10.0.0.22:64980/v1
+    default_model: old
+    models:
+      - old
+`);
+  const r = hermesUpsert({ name: "Canon", base: "http://10.0.0.22:64980/v1", key: null, model: "new", models: [{ id: "old", ctx: null }, { id: "new", ctx: null }], dryRun: false });
+  assert.equal(r.status, "updated");
+  const out = read();
+  assert.match(out, /api: http:\/\/10\.0\.0\.22:64980\/v1/);
+  assert.match(out, /default_model: new/);
+  assert.doesNotMatch(out, /base_url:|^\s+model:/m);
+  assert.match(out, / {6}- old\n {6}- new\n/);
 });

@@ -126,7 +126,7 @@ test("add creates an entry in an existing mapping, keeping the rest byte for byt
     const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
     assert.match(cfg, /^ {2}h1:$/m, "the existing entry is untouched");
     assert.equal(cfg.split("# must survive").length, before.split("# must survive").length);
-    assert.match(cfg, /^ {2}other:\n {4}name: other\n {4}base_url: http:\/\/127\.0\.0\.1:\d+\/v1\n {4}api_key: K1\n/m);
+    assert.match(cfg, /^ {2}other:\n {4}name: other\n {4}api: http:\/\/127\.0\.0\.1:\d+\/v1\n {4}api_key: K1\n/m);
     assert.match(cfg, / {6}m2:\n {8}context_length: 2048\n/);
     assert.match(cfg, / {4}models_discovered: true/);
     // the new entry is a working provider for hermes afterwards
