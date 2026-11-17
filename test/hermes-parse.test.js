@@ -1,7 +1,7 @@
 // hermes custom_providers parsing: indentation, dashes, line endings, models blocks
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseHermes, renderModels, yq, deq, parseFlowMap } from "../lib/hermes-yaml.js";
+import { parseHermes, parseHermesProviders, parseHermesConfig, renderModels, yq, deq, parseFlowMap } from "../lib/hermes-yaml.js";
 
 const STD = `model:
   default: x
@@ -193,4 +193,92 @@ test("yq only quotes when a plain scalar would be ambiguous", () => {
 test("deq round trips what yq produced", () => {
   for (const s of ["plain", "a: b", 'he said "hi"', "D:\\m\\q.gguf", "a, }b"])
     assert.equal(deq(yq(s)), s);
+});
+
+test("parses canonical v12: api, default_model and a models list", () => {
+  const h = parseHermesProviders(`providers:
+  ollama-launch:
+    api: http://127.0.0.1:11434/v1
+    default_model: qwen3.6:35b-a3b-coding-nvfp4
+    models:
+      - qwen3.6:35b-a3b-coding-nvfp4
+      - qwen3.6:27b-coding-nvfp4
+    name: Ollama
+`);
+  const e = h.entries[0];
+  assert.equal(h.error, null);
+  assert.equal(e.base_url, "http://127.0.0.1:11434/v1");
+  assert.equal(e.baseField, "api");
+  assert.equal(e.model, "qwen3.6:35b-a3b-coding-nvfp4");
+  assert.equal(e.modelField, "default_model");
+  assert.equal(e.modelsShape, "list");
+  assert.deepEqual(e.models.map((m) => m.id), ["qwen3.6:35b-a3b-coding-nvfp4", "qwen3.6:27b-coding-nvfp4"]);
+});
+
+test("parses a canonical models list with id rows and context_length", () => {
+  const h = parseHermesProviders(`providers:
+  p:
+    api: http://h/v1
+    models:
+      - id: alpha
+        context_length: 4096
+      - beta
+`);
+  assert.deepEqual(h.entries[0].models.map((m) => [m.id, m.ctx]), [["alpha", 4096], ["beta", null]]);
+});
+
+test("parses canonical aliases in the legacy custom_providers list", () => {
+  const h = parseHermes(`custom_providers:
+  - name: Canonical
+    api: http://h/v1
+    default_model: alpha
+    models:
+      - alpha
+      - beta
+    enabled: false
+`);
+  const e = h.entries[0];
+  assert.equal(e.base_url, "http://h/v1");
+  assert.equal(e.model, "alpha");
+  assert.equal(e.modelsShape, "list");
+  assert.equal(e.enabled, false);
+});
+
+test("one unknown field does not discard the whole providers section", () => {
+  const h = parseHermesProviders(`providers:
+  broken:
+    api: http://a/v1
+    default_model: a
+    models:
+      - a
+  good:
+    api: http://b/v1
+    default_model: b
+    models:
+      - b
+    some_future_field:
+      nested: value
+`);
+  assert.equal(h.error, null);
+  assert.equal(h.entries.length, 2);
+  assert.deepEqual(h.entries.map((e) => e.base_url), ["http://a/v1", "http://b/v1"]);
+});
+
+test("parseHermesConfig returns both surfaces in one document", () => {
+  const d = parseHermesConfig(`providers:
+  p:
+    api: http://p/v1
+    models:
+      - p1
+custom_providers:
+  - name: L
+    base_url: http://l/v1
+    models:
+      l1: {}
+`);
+  assert.equal(d.docs.length, 2);
+  assert.deepEqual(d.docs.map((x) => x.section), ["providers", "custom_providers"]);
+  assert.equal(d.entries.length, 2);
+  assert.equal(d.entries[0].section, "providers");
+  assert.equal(d.entries[1].section, "custom_providers");
 });
