@@ -1307,7 +1307,7 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
 // to settings.yaml.imported. provider-sync edits whichever document is live:
 // settings.yaml while it exists, the profile patch after dsh consumed it.
 
-import { parseDshSettings, writeDshSettings, parseDshPatch, writeDshPatch, parseDshStore, setDshStoreRef, dshRefName, PATCH_HEADER } from "../lib/dsh-yaml.js";
+import { parseDshSettings, writeDshSettings, parseDshPatch, writeDshPatch, parseDshStore, setDshStoreRef, deleteDshStoreRef, deleteDshStoreRecord, dshRefName, PATCH_HEADER } from "../lib/dsh-yaml.js";
 
 function dshProfiles() {
   try {
@@ -1441,6 +1441,36 @@ function dshKeyLabel(p, pid) {
   if (k.state === "grant") return "key (signed in by dsh, stored as a grant — not readable here)";
   if (k.state === "none") return "no-key (no apiKeyEnv, no stored record)";
   return "key";
+}
+
+// deleting stored credentials is deliberately narrow: only refs and record
+// blocks this reader understands, never a value it cannot see, and never a ref
+// another route still names. Owner-only mode is preserved.
+function dshStorePurge({ refs = [], records = [], keepRefs = new Set() }) {
+  if (!existsSync(DSH_STORE)) return { removed: [], kept: [] };
+  let out = readFileSync(DSH_STORE, "utf8");
+  const removed = [], kept = [];
+  for (const r of refs) {
+    if (keepRefs.has(r)) { kept.push(r); continue; }
+    const res = deleteDshStoreRef(out, r);
+    if (res.removed) { out = res.text; removed.push(r); }
+  }
+  for (const r of records) {
+    const res = deleteDshStoreRecord(out, r);
+    if (res.removed) { out = res.text; removed.push(r); }
+  }
+  if (!removed.length) return { removed, kept };
+  const bak = DSH_STORE + ".bak-provider-sync-" + stamp();
+  copyFileSync(DSH_STORE, bak);
+  try { pruneBackups(DSH_STORE); } catch {}
+  atomicWrite(DSH_STORE, out, 0o600);
+  const back = parseDshStore(readFileSync(DSH_STORE, "utf8"));
+  const still = removed.filter((n) => (n.includes("/") ? back.records.has(n) : back.refs.has(n)));
+  if (back.error || still.length) {
+    copyFileSync(bak, DSH_STORE);
+    throw new Error(`the credential${still.length === 1 ? "" : "s"} ${still.join(", ") || "(store unreadable)"} did not leave ${disp(DSH_STORE)} — restored from ${path.basename(bak)}`);
+  }
+  return { removed, kept };
 }
 
 // the credentials store: only ever add or replace single-line refs; dsh
@@ -1652,6 +1682,7 @@ export function dshUpsert({ id, name, base, api: apiFlag, keyRaw, keyFlag, keyEn
 
 async function syncDsh({ apply }) {
   if (!existsSync(DSH_HOME)) { console.log(`dsh (${disp(DSH_HOME)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
+  const state = readState();
   const st = dshState();
   if (st.kind === "empty") { console.log(`dsh (${disp(DSH_HOME)}): ${st.note || "no profile and no settings.yaml — nothing configured"} — skipped`); return { status: "empty", why: st.note || "nothing configured" }; }
   const label = st.kind === "legacy" ? `${disp(st.file)} (pre-0.2 document)` : `${disp(st.file)} (profile ${st.profile})`;
@@ -1703,7 +1734,12 @@ async function syncDsh({ apply }) {
     if (r.err) { console.log(`  ${r.id} (${r.base}): ERROR — ${r.err}`); continue; }
     const p = providers[r.id];
     const cur = Array.isArray(p.models) ? p.models : [];
-    const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
+    const visible = filterServerModels(
+      r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null })),
+      state,
+      { target: "dsh", provider: r.id, baseURL: r.base },
+    );
+    const live = visible.server;
     const curById = new Map(cur.map((m) => [m?.id, m]));
     const liveIds = new Set(live.map((m) => m.id));
     const added = live.filter((m) => !curById.has(m.id));
@@ -1715,6 +1751,7 @@ async function syncDsh({ apply }) {
     // a server that reports image input gets it declared; dsh has no way to ask
     const modCh = live.filter((m) => { const c = curById.get(m.id); return c && dshInput(m.input) && JSON.stringify(c.input || ["text"]) !== JSON.stringify(dshInput(m.input)); });
     console.log(`  ${r.id} (${r.kind}, ${r.base}): ${live.length} on server, ${cur.length} in config`);
+    if (visible.hidden.length) console.log(`    note: ${visible.hidden.length} model(s) hidden by provider-sync remove`);
     for (const a of added) console.log(`    + ${a.id}`);
     for (const a of removed) console.log(`    - ${a.id} (no longer on server)`);
     for (const c of ctxCh) console.log(`    ~ ctx ${c.id}: ${curById.get(c.id).contextWindow ?? `default ${eff(curById.get(c.id))}`} -> ${c.ctx}`);
@@ -2268,14 +2305,20 @@ function cmdRemove(id) {
     die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
   if (models.length && flags["keep-exclusions"])
     die("--keep-exclusions applies to provider removal, not --model");
+  if (models.length && flags["purge-credentials"])
+    die("--purge-credentials removes a provider's stored key — it does not apply to --model");
+  if (flags["purge-credentials"] && target !== "all" && target !== "dsh")
+    die("--purge-credentials is for the dsh target — OpenCode's own stores are read-only for provider-sync");
   const apply = !!flags.apply && !flags["dry-run"];
   if (flags.apply && flags["dry-run"]) console.error("note: --dry-run — ignoring --apply, nothing will be written");
   const force = !!flags.force;
 
   const haveOc = (target === "all" || target === "opencode") && existsSync(CFG);
   const haveH = (target === "all" || target === "hermes") && existsSync(HERMES_CFG);
+  const haveD = (target === "all" || target === "dsh") && existsSync(DSH_HOME);
   if ((target === "all" || target === "opencode") && !existsSync(CFG)) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
   if ((target === "all" || target === "hermes") && !existsSync(HERMES_CFG)) console.log(`hermes    ${disp(HERMES_CFG)}: not found — skipped`);
+  if ((target === "all" || target === "dsh") && !existsSync(DSH_HOME)) console.log(`dsh       ${disp(DSH_HOME)}: not found — skipped`);
 
   const cfg = haveOc ? loadCfg() : null;
   const hermesText = haveH ? readFileSync(HERMES_CFG, "utf8") : null;
@@ -2345,12 +2388,49 @@ function cmdRemove(id) {
     }
   }
 
+  // ---- stage dsh ----
+  // dsh routes may carry their catalog as a `models` list; with modelOverrides
+  // and no list there is nothing provider-sync can delete, so the tombstone is
+  // the only thing recorded.
+  let dChanged = 0, dRemoved = 0;
+  let dPlan = { st: null, providers: null, entry: null, file: null, base: null, note: null };
+  if (haveD) {
+    const st = dshState();
+    if (st.kind === "empty") dPlan.note = st.note || "no profile and no settings.yaml";
+    else if (st.error) dPlan.note = st.error;
+    else if (dshHomeOverride()) dPlan.note = dshHomeOverride().why;
+    else {
+      const providers = dshProvidersOf(st);
+      const p = providers[id];
+      dPlan.st = st;
+      dPlan.file = st.file;
+      if (p && typeof p === "object") {
+        dPlan.entry = p;
+        dPlan.base = typeof p.baseURL === "string" ? p.baseURL : null;
+        if (models.length) {
+          if (Array.isArray(p.models)) {
+            const kept = p.models.filter((m) => !models.includes(m?.id));
+            const n = p.models.length - kept.length;
+            if (n) { providers[id] = { ...p, models: kept }; dChanged += n; dPlan.providers = providers; }
+          }
+        } else {
+          delete providers[id];
+          dChanged = 1;
+          dRemoved = 1;
+          dPlan.providers = providers;
+        }
+      }
+    }
+  }
+
   // ---- report the plan ----
   const ocUnit = models.length ? `${ocChanged} model(s)` : `${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`;
   const hUnit = models.length ? `${hChanged} model(s)` : `${hChanged} entr${hChanged === 1 ? "y" : "ies"}`;
+  const dUnit = models.length ? `${dChanged} model(s)` : `${dChanged} entr${dChanged === 1 ? "y" : "ies"}`;
   console.log(`remove ${id}${models.length ? ` --model ${models.join(", ")}` : ""}:`);
   console.log(`  opencode  ${disp(CFG)}  ${ocChanged ? `${ocUnit} would be removed` : "nothing to remove"}`);
   console.log(`  hermes    ${disp(HERMES_CFG)}  ${hChanged ? `${hUnit} would be removed` : "nothing to remove"}`);
+  console.log(`  dsh       ${disp(DSH_HOME)}  ${dChanged ? `${dUnit} would be removed` : dPlan.note ? `nothing to remove (${dPlan.note})` : "nothing to remove"}`);
   if (!apply) { console.log("nothing written — re-run with --apply to write"); return; }
 
   // ---- write, with rollback of every file if a later write fails ----
@@ -2359,6 +2439,8 @@ function cmdRemove(id) {
   const targets = [];
   if (haveOc) targets.push({ target: "opencode", base: [...ocBases][0] || null });
   if (haveH) targets.push({ target: "hermes", base: hm.entries.find((e) => e.base_url)?.base_url || [...bases][0] || null });
+  if (haveD && dPlan.providers) targets.push({ target: "dsh", base: dPlan.base });
+  let purged = { removed: [], kept: [] };
   try {
     if (haveOc && ocChanged) {
       remember(CFG);
@@ -2368,6 +2450,30 @@ function cmdRemove(id) {
     if (haveH && hChanged) {
       remember(HERMES_CFG);
       writeHermesCfg(hLines, h.eol, { entries: h.entries.length - hRemovedEntries });
+    }
+    if (haveD && dChanged) {
+      remember(dPlan.file);
+      const out = dshWrite(dPlan.st, dPlan.providers);
+      writeDshFile(dPlan.file, out.text, dPlan.st.kind, dPlan.providers);
+    }
+    // keys go last and only for a provider removal the user asked to purge; a
+    // ref any surviving route still names is kept even with --purge-credentials
+    if (haveD && dRemoved && flags["purge-credentials"]) {
+      const refsToDrop = [], recsToDrop = [];
+      const keepRefs = new Set();
+      if (dPlan.entry && typeof dPlan.entry.apiKeyEnv === "string" && dPlan.entry.apiKeyEnv)
+        refsToDrop.push(dPlan.entry.apiKeyEnv);
+      if (/^[a-z][a-z0-9-]*$/.test(id)) recsToDrop.push(`${DSH_RECORD_SCOPE}/${id}`);
+      for (const p of Object.values(dPlan.providers))
+        if (p && typeof p.apiKeyEnv === "string" && p.apiKeyEnv) keepRefs.add(p.apiKeyEnv);
+      if (existsSync(DSH_STORE)) {
+        try {
+          const store = parseDshStore(readFileSync(DSH_STORE, "utf8"));
+          for (const [k, rec] of store.records)
+            if (k !== `${DSH_RECORD_SCOPE}/${id}`) for (const n of rec.env || []) keepRefs.add(n);
+        } catch { /* an unreadable store is reported, never guessed at */ }
+      }
+      purged = dshStorePurge({ refs: refsToDrop, records: recsToDrop, keepRefs });
     }
     // tombstones last: they are what keeps the next sync honest
     let state = readState();
@@ -2384,8 +2490,13 @@ function cmdRemove(id) {
     for (const [f, text] of originals) { try { atomicWrite(f, text); } catch {} }
     throw e;
   }
-  if (ocChanged) console.log(`  opencode  removed ${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`);
-  if (hChanged) console.log(`  hermes    removed ${hChanged} ${models.length ? "model(s)" : "entr" + (hChanged === 1 ? "y" : "ies")}`);
+  if (ocChanged) console.log(`  opencode  removed ${models.length ? `${ocChanged} model(s)` : `${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`}`);
+  if (hChanged) console.log(`  hermes    removed ${models.length ? `${hChanged} model(s)` : `${hChanged} entr${hChanged === 1 ? "y" : "ies"}`}`);
+  if (dChanged) console.log(`  dsh       removed ${models.length ? `${dChanged} model(s)` : `${dChanged} entr${dChanged === 1 ? "y" : "ies"}`}`);
+  if (purged.removed.length) console.log(`  dsh-keys  removed ${purged.removed.join(", ")} from ${disp(DSH_STORE)}`);
+  for (const r of purged.kept) console.log(`  dsh-keys  ${r} still used by another route — kept`);
+  if (flags["purge-credentials"] && !purged.removed.length && !purged.kept.length && haveD)
+    console.log("  dsh-keys  nothing to purge");
   if (models.length) console.log(`  state     ${disp(STATE_FILE)}  excluded ${models.join(", ")} for ${targets.map((t) => t.target).join(", ") || "no harness"}`);
   else console.log(`  state     ${disp(STATE_FILE)}  tombstones for ${id} ${flags["keep-exclusions"] ? "kept (--keep-exclusions)" : "cleared"}`);
   console.log("done");

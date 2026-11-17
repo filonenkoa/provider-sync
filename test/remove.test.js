@@ -210,3 +210,83 @@ test("list reports how many models remove is hiding", () => {
   assert.match(out, /dropme\s+1 models\s+.*1 hidden \(remove\)/);
   assert.equal((out.match(/1 hidden \(remove\)/g) || []).length, 2, "both harnesses report it");
 });
+
+const WEB = ".dsh/profiles/web/cordis.patch.yml";
+const STORE = ".dsh/.credentials.yaml";
+const DSH_PATCH = () => `# the live profile patch
+- id: ui-settings
+  name: "@deepseek-ai/dsh-ui-settings"
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      keep:
+        displayName: Keep
+        api: openai-completions
+        baseURL: ${url}
+        apiKeyEnv: SHARED_API_KEY
+        models:
+          - id: m1
+            contextWindow: 4096
+      dropme:
+        api: openai-completions
+        baseURL: ${url}
+        apiKeyEnv: DROP_API_KEY
+        models:
+          - id: m1
+            contextWindow: 4096
+          - id: m2
+            contextWindow: 8192
+`;
+
+test("remove --apply deletes a dsh provider from the live profile patch", () => {
+  const home = homeWith({ [WEB]: DSH_PATCH() });
+  const out = flat(runCli(home, ["remove", "dropme", "--apply"]));
+  assert.match(out, /dsh/);
+  const cfg = read(home, WEB);
+  assert.doesNotMatch(cfg, /^ {6}dropme:/m, "the route is gone");
+  assert.match(cfg, /^ {6}keep:/m);
+  assert.match(cfg, /displayName: Keep/);
+  assert.match(cfg, /- id: ui-settings/);
+});
+
+test("remove --model on a dsh route filters its models list and sync respects it", async () => {
+  const home = homeWith({ [WEB]: DSH_PATCH() });
+  flat(runCli(home, ["remove", "dropme", "--model", "m2", "--apply"]));
+  const cfg = read(home, WEB);
+  assert.match(cfg, /- id: m1/);
+  assert.doesNotMatch(cfg, /- id: m2/);
+  assert.ok(state(home).excluded.some((e) => e.target === "dsh" && e.models.includes("m2")));
+  const rep = flat(await runCliAsyncP(home, ["sync", "--target", "dsh", "--apply"]));
+  assert.match(rep, /hidden by provider-sync remove/);
+  assert.doesNotMatch(read(home, WEB), /- id: m2/, "sync did not add the model back");
+});
+
+test("--purge-credentials deletes a ref no other dsh route uses", () => {
+  const home = homeWith({
+    [WEB]: DSH_PATCH(),
+    [STORE]: "version: 1\nrefs:\n  SHARED_API_KEY: sk-shared\n  DROP_API_KEY: sk-drop\n",
+  });
+  flat(runCli(home, ["remove", "dropme", "--apply", "--purge-credentials"]));
+  const store = read(home, STORE);
+  assert.doesNotMatch(store, /DROP_API_KEY/);
+  assert.match(store, /SHARED_API_KEY: sk-shared/, "a ref another route still uses survives");
+  assert.doesNotMatch(read(home, WEB), /DROP_API_KEY/);
+});
+
+test("--purge-credentials keeps a ref another route still names", () => {
+  const home = homeWith({
+    [WEB]: DSH_PATCH().replace("apiKeyEnv: DROP_API_KEY", "apiKeyEnv: SHARED_API_KEY"),
+    [STORE]: "version: 1\nrefs:\n  SHARED_API_KEY: sk-shared\n",
+  });
+  const out = flat(runCli(home, ["remove", "dropme", "--apply", "--purge-credentials"]));
+  assert.match(out, /SHARED_API_KEY still used/);
+  assert.match(read(home, STORE), /SHARED_API_KEY: sk-shared/);
+});
+
+test("remove --target dsh without a dsh home is skipped, not an error", () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": OC() });
+  const out = flat(runCli(home, ["remove", "dropme", "--target", "dsh", "--apply"]));
+  assert.match(out, /dsh.*not found — skipped/);
+  assert.match(read(home, ".config/opencode/opencode.jsonc"), /dropme/, "opencode was not touched");
+});

@@ -7,7 +7,7 @@ import {
   PROVIDER_ID, PATCH_HEADER, dq, dshRefName,
   parseDshSettings, writeDshSettings,
   parseDshPatch, writeDshPatch,
-  parseDshStore, setDshStoreRef,
+  parseDshStore, setDshStoreRef, deleteDshStoreRef, deleteDshStoreRecord,
 } from "../lib/dsh-yaml.js";
 
 const SAMPLE = `ui-onboarding:
@@ -303,4 +303,42 @@ test("dshRefName follows dsh's own ID_upper_API_KEY convention", () => {
 
 test("PROVIDER_ID matches the loader entry dsh itself writes", () => {
   assert.equal(PROVIDER_ID, "llm-pi-ai");
+});
+
+test("store deletion removes one ref and leaves every other line alone", () => {
+  const text = "version: 1\nrefs:\n  A_API_KEY: sk-a\n  B_API_KEY: sk-b\n";
+  const out = deleteDshStoreRef(text, "A_API_KEY");
+  assert.equal(out.removed, true);
+  assert.equal(out.text, "version: 1\nrefs:\n  B_API_KEY: sk-b\n");
+  assert.equal(deleteDshStoreRef(out.text, "A_API_KEY").removed, false);
+});
+
+test("store deletion never splits an opaque multi-line value", () => {
+  const text = "version: 1\nrefs:\n  A_API_KEY: |\n    line one\n    line two\n  B_API_KEY: sk-b\n";
+  const out = deleteDshStoreRef(text, "A_API_KEY");
+  assert.equal(out.text, "version: 1\nrefs:\n  B_API_KEY: sk-b\n");
+  assert.match(out.text, /B_API_KEY: sk-b/);
+});
+
+test("store record deletion removes the whole block and keeps its neighbours", () => {
+  const text = `version: 1
+refs:
+  A_API_KEY: sk-a
+records:
+  llm-pi-ai/one:
+    kind: api-key
+    key: sk-one
+  llm-pi-ai/two:
+    kind: grant
+`;
+  const out = deleteDshStoreRecord(text, "llm-pi-ai/one");
+  assert.equal(out.removed, true);
+  assert.doesNotMatch(out.text, /llm-pi-ai\/one/);
+  assert.match(out.text, /llm-pi-ai\/two:\n    kind: grant/);
+  assert.equal(deleteDshStoreRecord(out.text, "llm-pi-ai/one").removed, false);
+});
+
+test("an inline record body is refused, not partially deleted", () => {
+  assert.throws(() => deleteDshStoreRecord("records:\n  llm-pi-ai/x: {kind: grant}\n", "llm-pi-ai/x"),
+    /written on one line/);
 });
