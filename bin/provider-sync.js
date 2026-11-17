@@ -8,6 +8,7 @@ import os from "node:os";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { detectBackend, listCredentials } from "../lib/opencode-auth.js";
+import { emptyState, normalizeState, excludeModels, restoreModels, dropProvider, filterServerModels, hiddenCount } from "../lib/state.js";
 import { createHash } from "node:crypto";
 
 // config file resolution mirrors OpenCode's own discovery: PS_CONFIG override
@@ -47,17 +48,30 @@ const DSH_IMPORTED = path.join(DSH_HOME, "settings.yaml.imported");
 const DSH_STORE = path.join(DSH_HOME, ".credentials.yaml");
 const DSH_HOME_PATCH = path.join(DSH_HOME, "cordis.patch.yml");
 const DSH_PROFILES = path.join(DSH_HOME, "profiles");
+// provider-sync's own memory, not a harness config: tombstoned models live here
+// so a server-authoritative sync does not resurrect what the user removed.
+export const STATE_FILE = (() => {
+  const raw = process.env.PS_STATE;
+  if (!raw) return path.join(os.homedir(), ".config/provider-sync/state.json");
+  return path.resolve(raw.replace(/^~(?=$|\/)/, os.homedir()));
+})();
 
 // ---------- cli ----------
 const die = (m) => { console.error("error: " + m); process.exit(1); };
 // parses ["--k","v"] and ["--k=v"]; boolean flags are the known no-value ones
-const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h", "version"]);
+const BOOL_FLAGS = new Set(["apply", "dry-run", "no-hermes", "help", "h", "version", "force", "purge-credentials", "keep-exclusions"]);
 // a typo must not be swallowed: `--targe=hermes` used to be ignored and the
 // default taken, which can write to a harness the user did not name
 const VALUE_FLAGS = new Set(["name", "key", "key-env", "username", "password", "model", "target", "profile", "ctx", "output", "provider"]);
 export function parseArgs(argv) {
   const flags = {};
   const pos = [];
+  const put = (k, v) => {
+    // --model is repeatable for remove/restore; add accepts the same flag once
+    if (k === "model" && flags.model !== undefined)
+      flags.model = Array.isArray(flags.model) ? [...flags.model, v] : [flags.model, v];
+    else flags[k] = v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") { pos.push(...argv.slice(i + 1)); break; }
@@ -71,10 +85,10 @@ export function parseArgs(argv) {
       continue;
     }
     if (!VALUE_FLAGS.has(k)) die(`unknown flag "--${k}" — see provider-sync help`);
-    if (eq > 2) { flags[k] = a.slice(eq + 1); continue; }
+    if (eq > 2) { put(k, a.slice(eq + 1)); continue; }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) die(`--${k} needs a value`);
-    flags[k] = argv[++i];
+    put(k, argv[++i]);
   }
   return { flags, pos };
 }
@@ -320,6 +334,16 @@ function saveJson(file, obj) {
   }
   atomicWrite(file, JSON.stringify(obj, null, 2) + "\n");
 }
+// tombstones: read is forgiving (a broken state file must not block syncing),
+// write is atomic and leaves the harness configs untouched
+function readState() {
+  if (!existsSync(STATE_FILE)) return emptyState();
+  try { return normalizeState(readFileSync(STATE_FILE, "utf8")); }
+  catch { return emptyState(); }
+}
+function writeState(state) {
+  atomicWrite(STATE_FILE, JSON.stringify(normalizeState(state), null, 2) + "\n");
+}
 export const saveCfg = (c) => {
   if (cfgStore.hadComments && !cfgStore.warnedComments) {
     cfgStore.warnedComments = true;
@@ -502,6 +526,37 @@ Commands:
       0 = omit the limit. Use this to fix guessed or stale values. Needs a
       terminal. Options: --output N, --key K (this run only), --dry-run.
 
+  provider-sync remove <id> [options]
+      Remove a provider, or single models of it, from the harnesses that have
+      it — OpenCode (both entry shapes), both Hermes surfaces and dsh. Without
+      --apply nothing is written: the command prints what it would remove.
+      A removed *model* is recorded as a tombstone in
+      ~/.config/provider-sync/state.json, because every harness is
+      server-authoritative — without it the next sync would add the model
+      right back. A removed *provider* drops its tombstones instead.
+      Models referenced elsewhere (OpenCode model / small_model, Hermes
+      model.provider / model.default / a provider's default_model) make the
+      command refuse unless --force is given, so nothing is left dangling
+      without an explicit decision.
+      Options:
+        --model M         remove one model (repeatable); without it the whole
+                          provider entry is removed
+        --apply           write the changes (default: report only)
+        --force           remove even though a reference would dangle, or when
+                          a Hermes match is ambiguous
+        --keep-exclusions keep the tombstones of a removed provider
+        --purge-credentials  also drop the provider's keys from
+                          ~/.dsh/.credentials.yaml (never from OpenCode's own
+                          stores, which are read-only for provider-sync)
+        --target T        all|opencode|hermes|dsh (default all)
+        --profile NAME    dsh profile (default: web, else the only one)
+        --dry-run         report only; wins over --apply
+
+  provider-sync restore <id> [--model M]... [--target T] [--dry-run]
+      Lift tombstones written by remove, so the next \`sync --apply\` re-adds
+      the models the server still reports. Without --model every tombstone of
+      that provider is lifted. Writes only the state file.
+
   provider-sync help
       Show this text (bare \`provider-sync\` prints it too and exits non-zero).
 
@@ -589,6 +644,9 @@ Examples:
   provider-sync sync --target dsh         # only the dsh llm-pi-ai providers
   provider-sync add new http://10.0.0.5:64980/v1 --key ... --ctx 32768
   provider-sync set-ctx 3090
+  provider-sync remove dropme --model m2 --apply   # hide one model for good
+  provider-sync remove dropme --apply              # remove the whole provider
+  provider-sync restore dropme --model m2          # and let sync bring it back
 `;
 
 // ---------- http ----------
@@ -923,7 +981,7 @@ export function reconcile(models, server, { out, ctxMap, shape = "legacy", today
   return { models: next, ...res };
 }
 
-import { ind, normUrl, yq, renderModels, hermesSetModels, hermesSetField, parseHermesConfig, writeHermesProviders } from "../lib/hermes-yaml.js";
+import { ind, normUrl, deq, yq, renderModels, hermesSetModels, hermesSetField, parseHermesConfig, writeHermesProviders } from "../lib/hermes-yaml.js";
 
 // ---------- hermes (~/.hermes/config.yaml) ----------
 // Two surfaces, one file: the legacy `custom_providers:` list and the
@@ -1153,6 +1211,7 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   if (!existsSync(HERMES_CFG)) { console.log(`hermes (${disp(HERMES_CFG)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
   const text = readFileSync(HERMES_CFG, "utf8");
   const h = hermesDocs(text);
+  const state = readState();
   if (!h.docs.length) {
     console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers section — skipped`);
     return { status: "no-section", why: "no providers section" };
@@ -1205,13 +1264,19 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
     }
     if (r.err) { console.log(`  ${tag(r.e)} (${r.e.base_url}): ERROR — ${r.err}`); continue; }
     const e = r.e;
-    const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
+    const visible = filterServerModels(
+      r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null })),
+      state,
+      { target: "hermes", provider: e.key || e.name, baseURL: e.base_url },
+    );
+    const live = visible.server;
     const curIds = new Map(e.models.map((m) => [m.id, m]));
     const liveIds = new Set(live.map((m) => m.id));
     const added = live.filter((m) => !curIds.has(m.id));
     const removed = e.models.filter((m) => !liveIds.has(m.id));
     const ctxCh = live.filter((m) => { const c = curIds.get(m.id); return c && m.ctx != null && c.ctx !== m.ctx; });
     console.log(`  ${tag(e)} (${r.kind}, ${e.base_url}): ${live.length} on server, ${e.models.length} in config`);
+    if (visible.hidden.length) console.log(`    note: ${visible.hidden.length} model(s) hidden by provider-sync remove`);
     for (const a of added) console.log(`    + ${a.id}`);
     for (const a of removed) console.log(`    - ${a.id} (no longer on server)`);
     for (const c of ctxCh) console.log(`    ~ ctx ${c.id}: ${curIds.get(c.id).ctx} -> ${c.ctx}`);
@@ -1799,6 +1864,11 @@ function cmdList() {
   const haveOc = existsSync(CFG);
   const cfg = haveOc ? loadCfg() : {}; // absent config is not an error here
   const auth = loadAuth();
+  const state = readState();
+  const hiddenTag = (query) => {
+    const n = hiddenCount(state, query);
+    return n ? `  ${n} hidden (remove)` : "";
+  };
   if (target === "all" || target === "opencode") {
     if (!haveOc) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
     else {
@@ -1810,7 +1880,8 @@ function cmdList() {
         const n = Object.keys(entry?.models || {}).length;
         // `providers` entries are the 2.x-native shape (provider-sync edits them in place)
         const mark = shape === "native" ? " (2.x)" : "";
-        console.log(`  ${(id + mark).padEnd(20)} ${String(n).padStart(3)} models  ${(entryBaseURL(shape, entry) || "-")}  ${credentialLabel(credentialFor(id, auth, cfg))}`);
+        const base = entryBaseURL(shape, entry);
+        console.log(`  ${(id + mark).padEnd(20)} ${String(n).padStart(3)} models  ${(base || "-")}  ${credentialLabel(credentialFor(id, auth, cfg))}${hiddenTag({ target: "opencode", provider: id, baseURL: base })}`);
       }
     }
   }
@@ -1840,7 +1911,7 @@ function cmdList() {
           for (const e of d.entries) {
             const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
             const off = e.enabled === false ? "  disabled" : "";
-            console.log(`${pad}${(e.name || e.key || "-").padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}${off}  ${hermesKeySource(e, cfg, auth)}`);
+            console.log(`${pad}${(e.name || e.key || "-").padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}${off}  ${hermesKeySource(e, cfg, auth)}${hiddenTag({ target: "hermes", provider: e.key || e.name, baseURL: e.base_url })}`);
           }
         }
         if (multi) console.log("  note: both surfaces are managed; Hermes merges providers: and custom_providers:");
@@ -1862,7 +1933,7 @@ function cmdList() {
           for (const id of ids) {
             const p = st.providers[id] && typeof st.providers[id] === "object" ? st.providers[id] : {};
             const n = Array.isArray(p.models) ? p.models.length : 0;
-            console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${p.baseURL || "-"}  ${dshKeyLabel(p, id)}`);
+            console.log(`  ${id.padEnd(20)} ${String(n).padStart(3)} models  ${p.baseURL || "-"}  ${dshKeyLabel(p, id)}${hiddenTag({ target: "dsh", provider: id, baseURL: p.baseURL })}`);
           }
         }
         for (const nt of dshNotes(st)) console.log(`  note: ${nt}`);
@@ -1975,8 +2046,18 @@ async function cmdAdd(id, url) {
   const oldProv = entry || {};
   if (cfg.providers?.[id] && cfg.provider?.[id])
     notes.push(`${id} exists in both "provider" and "providers" — OpenCode 2.x uses providers.${id}; updating that entry`);
-  const ctxMap = await resolveCtxs(server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
-  const res = reconcile(oldProv.models || {}, server, { out, ctxMap, notes, shape });
+  // tombstoned models never reach a harness, and a target's own exclusions do
+  // not leak into another target's catalog
+  const state = readState();
+  const modelsFor = (target) => filterServerModels(server, state, { target, provider: id, baseURL: base });
+  const visibleOc = modelsFor("opencode");
+  const visibleH = modelsFor("hermes");
+  const visibleD = modelsFor("dsh");
+  if (visibleOc.hidden.length) notes.push(`${visibleOc.hidden.length} model(s) hidden by provider-sync remove`);
+  if (visibleH.hidden.length) notes.push(`hermes: ${visibleH.hidden.length} model(s) hidden by provider-sync remove`);
+  if (visibleD.hidden.length) notes.push(`dsh: ${visibleD.hidden.length} model(s) hidden by provider-sync remove`);
+  const ctxMap = await resolveCtxs(visibleOc.server, { ctxFlag, mode, notes, existing: Object.keys(oldProv.models || {}) });
+  const res = reconcile(oldProv.models || {}, visibleOc.server, { out, ctxMap, notes, shape });
   // --key stores a literal secret; --key-env stores a {env:VAR} reference so the
   // secret stays out of a file that people commit
   const keyValue = key ? key : keyEnv ? `{env:${keyEnv}}` : null;
@@ -2007,7 +2088,8 @@ async function cmdAdd(id, url) {
   if (!res.added.length && !res.removed.length && !res.ctx.length && !res.mods.length && !res.dates.length) console.log("  up to date");
   for (const nt of notes) console.log("  note: " + nt);
 
-  const hmodels = server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
+  const hmodels = visibleH.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
+  const dmodels = visibleD.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null, input: m.input ?? null }));
   // the raw value matters here: {env:VAR} stays a reference, which hermesUpsert
   // turns into key_env instead of copying OpenCode's syntax
   const hkey = key || configApiKey(cfg, id) || a[id]?.key || keyValue;
@@ -2016,7 +2098,7 @@ async function cmdAdd(id, url) {
   // dsh has its own credential store; the same raw key value is passed so an
   // {env:VAR} reference stays a reference (apiKeyEnv) instead of becoming a
   // literal secret in .credentials.yaml
-  const dargs = { id, name: prov.name, base, api: dshApi, keyRaw: hkey, keyFlag: flags.key || null, keyEnvFlag: keyEnv || null, models: hmodels, create: wantD };
+  const dargs = { id, name: prov.name, base, api: dshApi, keyRaw: hkey, keyFlag: flags.key || null, keyEnvFlag: keyEnv || null, models: dmodels, create: wantD };
   const nModels = Object.keys(prov.models).length;
   // every target is reported afterwards: what was written and what was skipped, and why
   const ocLine = (verb) => wantOc
@@ -2100,6 +2182,238 @@ async function cmdAdd(id, url) {
   console.log(`  dsh-keys  ${disp(DSH_STORE)}  ${dshKeysLine(dres, false)}`);
 }
 
+// ---------- remove / restore ----------
+const asList = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
+
+// every base URL OpenCode has for this provider, from both config shapes; used
+// to recognize the same server in Hermes when its entry carries another name
+function opencodeBases(cfg, id) {
+  const out = new Set();
+  if (!cfg) return out;
+  for (const [key, shape] of [["provider", "legacy"], ["providers", "native"]]) {
+    const e = cfg[key]?.[id];
+    const b = e && typeof e === "object" ? entryBaseURL(shape, e) : null;
+    if (b) out.add(b);
+  }
+  return out;
+}
+
+// Hermes entries for a removal: match the id/key/name first. Only when that
+// finds nothing do we fall back to the server URL, because several providers
+// can legitimately share one endpoint. More than one base match is ambiguous
+// and needs --force.
+function hermesMatches(h, id, bases) {
+  const direct = h.entries.filter((e) =>
+    e.key === id || e.name === id || (/^https?:\/\//i.test(id) && normUrl(e.base_url) === normUrl(id)));
+  if (direct.length) return { entries: direct, byBase: false };
+  const wanted = new Set([...bases].map(normUrl));
+  return { entries: h.entries.filter((e) => e.base_url && wanted.has(normUrl(e.base_url))), byBase: true };
+}
+
+// the top-level `model:` block Hermes routes with; provider-sync never edits it
+function hermesTopRefs(text) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^model:\s*$/.test(l));
+  const out = { provider: null, defaultModel: null, fallbacks: [] };
+  if (start < 0) return out;
+  let inFallbacks = false;
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() && l.length - l.trimStart().length === 0) break;
+    const lm = l.match(/^\s+-\s*(.+?)\s*$/);
+    if (lm) { if (inFallbacks) out.fallbacks.push(deq(lm[1])); continue; }
+    const m = l.match(/^\s+([A-Za-z_]+):\s*(.*?)\s*$/);
+    if (!m) continue;
+    inFallbacks = m[1] === "fallback_providers";
+    if (m[1] === "provider") out.provider = deq(m[2]);
+    else if (m[1] === "default") out.defaultModel = deq(m[2]);
+    else if (inFallbacks && /^\[/.test(m[2]))
+      out.fallbacks = m[2].replace(/^\[|\]$/g, "").split(",").map((s) => deq(s.trim())).filter(Boolean);
+  }
+  return out;
+}
+
+// references that would dangle if this id (provider removal) or these model
+// ids (model removal) disappeared. Removing them without --force is refused.
+function danglingRefs({ cfg, hermesText, hMatches, id, models, haveOc, haveH }) {
+  const refs = [];
+  if (haveOc && cfg) {
+    for (const key of ["model", "small_model"]) {
+      const v = cfg[key];
+      if (typeof v !== "string") continue;
+      if (!models.length ? v.startsWith(id + "/") : models.some((m) => v === `${id}/${m}`))
+        refs.push(`opencode ${key} = ${v}`);
+    }
+  }
+  if (haveH && hermesText) {
+    const t = hermesTopRefs(hermesText);
+    if (!models.length) {
+      if (t.provider === id) refs.push(`hermes model.provider = ${id}`);
+      if (t.fallbacks.includes(id)) refs.push(`hermes model.fallback_providers contains ${id}`);
+    } else {
+      if (t.defaultModel && models.includes(t.defaultModel)) refs.push(`hermes model.default = ${t.defaultModel}`);
+      for (const e of hMatches.entries)
+        if (e.model && models.includes(e.model))
+          refs.push(`hermes ${e.section}/${e.name} default_model = ${e.model}`);
+    }
+  }
+  return refs;
+}
+
+function cmdRemove(id) {
+  const models = asList(flags.model).filter(Boolean);
+  const target = flags.target || "all";
+  if (!["all", "opencode", "hermes", "dsh"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes|dsh)`);
+  if (flags.profile !== undefined && target !== "all" && target !== "dsh")
+    die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
+  if (models.length && flags["keep-exclusions"])
+    die("--keep-exclusions applies to provider removal, not --model");
+  const apply = !!flags.apply && !flags["dry-run"];
+  if (flags.apply && flags["dry-run"]) console.error("note: --dry-run — ignoring --apply, nothing will be written");
+  const force = !!flags.force;
+
+  const haveOc = (target === "all" || target === "opencode") && existsSync(CFG);
+  const haveH = (target === "all" || target === "hermes") && existsSync(HERMES_CFG);
+  if ((target === "all" || target === "opencode") && !existsSync(CFG)) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
+  if ((target === "all" || target === "hermes") && !existsSync(HERMES_CFG)) console.log(`hermes    ${disp(HERMES_CFG)}: not found — skipped`);
+
+  const cfg = haveOc ? loadCfg() : null;
+  const hermesText = haveH ? readFileSync(HERMES_CFG, "utf8") : null;
+  const h = hermesText ? hermesDocs(hermesText) : null;
+  // captured before anything is staged: once the entry is deleted the config no
+  // longer knows the server, and the tombstone would lose its base URL
+  const ocBases = opencodeBases(cfg, id);
+  const bases = new Set(ocBases);
+  const hm = h ? hermesMatches(h, id, bases) : { entries: [], byBase: false };
+  if (hm.byBase && hm.entries.length > 1 && !force)
+    die(`${id} is not a Hermes entry name, and ${hm.entries.length} Hermes entries point at ${[...bases].join(", ")} — name the provider or pass --force`);
+  for (const e of hm.entries) if (e.base_url) bases.add(e.base_url);
+
+  const refs = danglingRefs({ cfg, hermesText, hMatches: hm, id, models, haveOc, haveH });
+  if (refs.length && !force)
+    die(`${refs.join("; ")} would dangle — re-run with --force to remove anyway, or point it at another provider first`);
+  if (refs.length) console.error(`note: removing ${id} anyway — ${refs.join("; ")} will point at a missing provider`);
+
+  // ---- stage OpenCode ----
+  let ocChanged = 0;
+  if (haveOc) {
+    for (const [key, shape] of [["provider", "legacy"], ["providers", "native"]]) {
+      const entry = cfg[key]?.[id];
+      if (!entry || typeof entry !== "object") continue;
+      if (models.length) {
+        for (const m of models) if (entry.models && Object.prototype.hasOwnProperty.call(entry.models, m)) { delete entry.models[m]; ocChanged++; }
+      } else {
+        delete cfg[key][id];
+        ocChanged++;
+      }
+    }
+    if (!models.length && Array.isArray(cfg.disabled_providers)) {
+      const before = cfg.disabled_providers.length;
+      cfg.disabled_providers = cfg.disabled_providers.filter((x) => x !== id);
+      ocChanged += before - cfg.disabled_providers.length;
+    }
+  }
+
+  // ---- stage Hermes (both surfaces, bottom-up) ----
+  let hChanged = 0, hRemovedEntries = 0;
+  let hLines = null;
+  if (haveH && hm.entries.length) {
+    hLines = h.lines.slice();
+    if (models.length) {
+      for (const e of [...hm.entries].sort((a, b) => b.idx - a.idx)) {
+        const kept = e.models.filter((m) => !models.includes(m.id));
+        if (kept.length === e.models.length) continue;
+        hChanged += e.models.length - kept.length;
+        hermesSetModels(hLines, e, kept);
+        // the entry's own default follows the surviving catalog
+        if (e.model && models.includes(e.model) && kept.length)
+          hermesSetField(hLines, e, e.modelField || (e.section === "providers" ? "default_model" : "model"), kept[0].id);
+      }
+    } else {
+      const ranges = hm.entries.map((e) => [e.idx, e.end]).sort((a, b) => b[0] - a[0]);
+      for (const [a, b] of ranges) hLines.splice(a, b - a);
+      hRemovedEntries = ranges.length;
+      hChanged = ranges.length;
+      // a section with no entries left becomes the empty literal, not YAML null
+      const removed = new Set(hm.entries);
+      for (const d of h.docs) {
+        if (!d.entries.length || !d.entries.every((e) => removed.has(e))) continue;
+        const re = d.section === "providers" ? /^providers:(\s*\{\})?\s*$/ : /^custom_providers:(\s*\[\])?\s*$/;
+        const hi = hLines.findIndex((l) => re.test(l));
+        if (hi >= 0) hLines[hi] = d.section === "providers" ? "providers: {}" : "custom_providers: []";
+      }
+    }
+  }
+
+  // ---- report the plan ----
+  const ocUnit = models.length ? `${ocChanged} model(s)` : `${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`;
+  const hUnit = models.length ? `${hChanged} model(s)` : `${hChanged} entr${hChanged === 1 ? "y" : "ies"}`;
+  console.log(`remove ${id}${models.length ? ` --model ${models.join(", ")}` : ""}:`);
+  console.log(`  opencode  ${disp(CFG)}  ${ocChanged ? `${ocUnit} would be removed` : "nothing to remove"}`);
+  console.log(`  hermes    ${disp(HERMES_CFG)}  ${hChanged ? `${hUnit} would be removed` : "nothing to remove"}`);
+  if (!apply) { console.log("nothing written — re-run with --apply to write"); return; }
+
+  // ---- write, with rollback of every file if a later write fails ----
+  const originals = new Map();
+  const remember = (f) => { if (!originals.has(f)) originals.set(f, readFileSync(f, "utf8")); };
+  const targets = [];
+  if (haveOc) targets.push({ target: "opencode", base: [...ocBases][0] || null });
+  if (haveH) targets.push({ target: "hermes", base: hm.entries.find((e) => e.base_url)?.base_url || [...bases][0] || null });
+  try {
+    if (haveOc && ocChanged) {
+      remember(CFG);
+      saveCfg(cfg);
+      reportValidate(cfg);
+    }
+    if (haveH && hChanged) {
+      remember(HERMES_CFG);
+      writeHermesCfg(hLines, h.eol, { entries: h.entries.length - hRemovedEntries });
+    }
+    // tombstones last: they are what keeps the next sync honest
+    let state = readState();
+    const beforeState = JSON.stringify(state);
+    for (const t of targets) {
+      if (models.length) state = excludeModels(state, { target: t.target, provider: id, baseURL: t.base, models });
+      else if (!flags["keep-exclusions"]) {
+        state = dropProvider(state, { target: t.target, provider: id });
+        for (const b of bases) state = dropProvider(state, { target: t.target, provider: id, baseURL: b });
+      }
+    }
+    if (JSON.stringify(state) !== beforeState) writeState(state);
+  } catch (e) {
+    for (const [f, text] of originals) { try { atomicWrite(f, text); } catch {} }
+    throw e;
+  }
+  if (ocChanged) console.log(`  opencode  removed ${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`);
+  if (hChanged) console.log(`  hermes    removed ${hChanged} ${models.length ? "model(s)" : "entr" + (hChanged === 1 ? "y" : "ies")}`);
+  if (models.length) console.log(`  state     ${disp(STATE_FILE)}  excluded ${models.join(", ")} for ${targets.map((t) => t.target).join(", ") || "no harness"}`);
+  else console.log(`  state     ${disp(STATE_FILE)}  tombstones for ${id} ${flags["keep-exclusions"] ? "kept (--keep-exclusions)" : "cleared"}`);
+  console.log("done");
+}
+
+function cmdRestore(id) {
+  const models = asList(flags.model).filter(Boolean);
+  const target = flags.target || "all";
+  if (!["all", "opencode", "hermes", "dsh"].includes(target)) die(`bad --target "${target}" (all|opencode|hermes|dsh)`);
+  if (flags.profile !== undefined && target !== "all" && target !== "dsh")
+    die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
+  if (flags.apply || flags.force)
+    die("restore writes only the tombstone file — drop --apply/--force");
+  const targets = target === "all" ? ["opencode", "hermes", "dsh"] : [target];
+  const before = readState();
+  let state = before;
+  const found = [];
+  for (const t of targets) {
+    const n = hiddenCount(state, { target: t, provider: id });
+    if (!n) continue;
+    state = restoreModels(state, { target: t, provider: id, models });
+    found.push(`${t}${models.length ? ` (${models.join(", ")})` : ""}`);
+  }
+  if (found.length && !flags["dry-run"]) writeState(state);
+  console.log(`restore ${id}${models.length ? ` --model ${models.join(", ")}` : ""}: ${found.length ? `${found.join(", ")} — restored` : "nothing to restore"}`);
+  if (flags["dry-run"]) console.log("nothing written — dry-run");
+}
+
 async function cmdSync() {
   const target = flags.target || "all";
   const written = [];
@@ -2119,6 +2433,7 @@ async function cmdSync() {
   if (!haveOc && (target === "opencode" || flags.provider)) die(`no ${CFG}\nadd a provider first: provider-sync add <id> <baseURL>`);
   const cfg = haveOc ? loadCfg() : {};
   const auth = loadAuth();
+  const state = readState();
   const wantOc = target === "all" || target === "opencode";
   if (wantOc && !haveOc) console.log(`opencode (${CFG}): not found — skipped`);
   if (wantOc && haveOc) {
@@ -2166,10 +2481,12 @@ async function cmdSync() {
       const notes = [];
       const { shape: pshape, entry: pentry } = providerShape(cfg, r.id);
       const cur = pentry?.models || {};
-      const ctxMap = await resolveCtxs(r.server, { ctxFlag, mode, notes, existing: Object.keys(cur) });
-      const res = reconcile(cur, r.server, { out, ctxMap, notes, shape: pshape });
-      const n = r.server.filter((m) => !m.skip).length;
+      const visible = filterServerModels(r.server, state, { target: "opencode", provider: r.id, baseURL: r.base });
+      const ctxMap = await resolveCtxs(visible.server, { ctxFlag, mode, notes, existing: Object.keys(cur) });
+      const res = reconcile(cur, visible.server, { out, ctxMap, notes, shape: pshape });
+      const n = visible.server.filter((m) => !m.skip).length;
       console.log(`${r.id} (${r.kind}, ${r.base}): ${n} on server, ${Object.keys(cur).length} in config`);
+      if (visible.hidden.length) notes.push(`${visible.hidden.length} model(s) hidden by provider-sync remove`);
       for (const a of res.added) console.log(`  + ${a}`);
       for (const a of res.removed) console.log(`  - ${a} (no longer on server)`);
       for (const [m, o, nw] of res.ctx) console.log(`  ~ ctx ${m}: ${o} -> ${nw}`);
@@ -2283,6 +2600,12 @@ const CMD_SPEC = {
     usage: "provider-sync sync [--apply] [--target all|opencode|hermes|dsh] [--provider ID] [--profile NAME]",
   },
   "set-ctx": { flags: ["output", "key", "dry-run"], args: 1, usage: "provider-sync set-ctx <provider>" },
+  remove: {
+    flags: ["apply", "dry-run", "target", "profile", "model", "force", "purge-credentials", "keep-exclusions"],
+    args: 1,
+    usage: "provider-sync remove <id> [--model M]... [--apply] [--target all|opencode|hermes|dsh]",
+  },
+  restore: { flags: ["dry-run", "target", "profile", "model"], args: 1, usage: "provider-sync restore <id> [--model M]..." },
 };
 const FLAG_HINTS = {
   sync: { "no-hermes": "is for add — sync narrows harnesses with --target opencode" },
@@ -2294,6 +2617,14 @@ const FLAG_HINTS = {
   "set-ctx": {
     target: "is not used by set-ctx — it edits one OpenCode provider in place",
     profile: "is for the dsh target — set-ctx edits one OpenCode provider in place",
+  },
+  remove: {
+    key: "is not used by remove — it deletes entries, it does not probe keys",
+    provider: "is for sync — remove takes the provider id as its argument",
+  },
+  restore: {
+    apply: "is not needed — restore lifts tombstones, and the next sync re-adds the models",
+    force: "is for remove — restore only clears tombstones",
   },
 };
 function checkCommandArgs() {
@@ -2343,6 +2674,12 @@ try {
       const locked = !flags["dry-run"]; // same: a preview takes no lock
       if (locked) acquireLock();
       try { await cmdSetCtx(pos[1]); } finally { if (locked) releaseLock(); }
+    } else if (cmd === "remove") {
+      const locked = !!flags.apply && !flags["dry-run"];
+      if (locked) acquireLock();
+      try { cmdRemove(pos[1]); } finally { if (locked) releaseLock(); }
+    } else if (cmd === "restore") {
+      cmdRestore(pos[1]);
     } else die(`unknown command "${cmd}" — see provider-sync help`);
   }
 } catch (e) { die(e.stack || e.message); }

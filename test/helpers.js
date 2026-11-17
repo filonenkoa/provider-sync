@@ -16,7 +16,7 @@ export function hermeticEnv(home, extra = {}) {
   const env = { ...process.env, ...extra };
   // pin every variable that can move the paths, but let a test re-set one on
   // purpose by passing it in `extra`
-  for (const k of ["OPENCODE_CONFIG_DIR", "PS_CONFIG", "OCP_CONFIG", "OPENCODE_CONFIG", "OPENCODE_DB", "DSH_HOME"])
+  for (const k of ["OPENCODE_CONFIG_DIR", "PS_CONFIG", "OCP_CONFIG", "OPENCODE_CONFIG", "OPENCODE_DB", "DSH_HOME", "PS_STATE"])
     if (!(k in extra)) delete env[k];
   env.HOME = home;
   env.USERPROFILE = home;
@@ -35,6 +35,7 @@ export function pinHomeForImport(home) {
   delete process.env.OPENCODE_CONFIG;
   delete process.env.OPENCODE_DB;
   delete process.env.DSH_HOME;
+  delete process.env.PS_STATE;
 }
 
 export const runCli = (home, args = [], opts = {}) =>
