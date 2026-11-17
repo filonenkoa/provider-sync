@@ -148,12 +148,24 @@ test("a mapping entry provider-sync cannot rewrite is refused, not mangled", asy
   assert.match(flat(runCli(home, ["list", "--target", "hermes"])), /note: providers: line 4: a comment/);
 });
 
-test("a file carrying both surfaces says which one is managed", async () => {
+test("a file carrying both surfaces lists and manages both", async () => {
   const home = homeWith({ ".hermes/config.yaml": HERMES_DICT() + "\ncustom_providers:\n  - name: Old\n    base_url: http://127.0.0.1:7/v1\n" });
   const l = flat(runCli(home, ["list", "--target", "hermes"]));
-  assert.match(l, /hermes \S*config\.yaml \(providers\)/, "the header names the surface in use");
-  assert.match(l, /note: custom_providers: is still present — provider-sync manages providers:/);
+  assert.match(l, /hermes \S*config\.yaml \(providers, custom_providers\)/, "the header names both surfaces");
+  assert.match(l, /note: both surfaces are managed/);
   assert.match(l, /H\s+2 models/);
+  assert.match(l, /Old\s+0 models/);
+});
+
+test("a disabled provider is listed as disabled", async () => {
+  const home = homeWith({ ".hermes/config.yaml": `providers:
+  off:
+    api: http://10.0.0.9:1/v1
+    enabled: false
+    models: []
+` });
+  const l = flat(runCli(home, ["list", "--target", "hermes"]));
+  assert.match(l, /off\s+0 models\s+http:\/\/10\.0\.0\.9:1\/v1\s+disabled/);
 });
 
 test("sync borrows the key stored in the opencode config entry", async () => {
@@ -248,4 +260,116 @@ test("sync --key stands in for a stored key that cannot be read, and is not stor
   assert.match(out, /in sync/);
   assert.doesNotMatch(out, /AUTH 401/);
   assert.doesNotMatch(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), /SECRET/, "--key must never be stored");
+});
+
+test("sync manages providers: and custom_providers: in one run", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": `providers:
+  map:
+    api: ${url}
+    default_model: m1
+    models:
+      - m1
+custom_providers:
+  - name: List
+    base_url: ${url}
+    model: m1
+    models:
+      m1: {}
+`,
+  });
+  const report = flat(await runCliAsyncP(home, ["sync", "--target", "hermes"]));
+  assert.match(report, /2 custom provider\(s\) in providers:, custom_providers:/);
+  assert.match(report, /2 change\(s\) pending/);
+  const out = flat(await runCliAsyncP(home, ["sync", "--target", "hermes", "--apply"]));
+  assert.match(out, /APPLIED 2 change\(s\)/);
+  const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(cfg, / {6}- id: m1\n {8}context_length: 4096\n/, "the canonical list gets its ctx");
+  assert.match(cfg, / {6}m1:\n {8}context_length: 4096\n/, "the legacy mapping keeps its shape");
+  assert.match(flat(await runCliAsyncP(home, ["sync", "--target", "hermes"])), /in sync/);
+});
+
+test("a disabled provider is reported and never synced", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": `providers:
+  off:
+    api: ${url}
+    enabled: false
+    default_model: m1
+    models:
+      - stale
+`,
+  });
+  const report = flat(await runCliAsyncP(home, ["sync", "--target", "hermes"]));
+  assert.match(report, /off: disabled — skipped/);
+  assert.doesNotMatch(report, /stale \(no longer on server\)/);
+  assert.doesNotMatch(report, /change\(s\) pending/);
+});
+
+test("an unknown field in one entry does not skip the rest", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": `providers:
+  p:
+    api: ${url}
+    default_model: m1
+    future_option:
+      nested: true
+    models:
+      - m1
+`,
+  });
+  const report = flat(await runCliAsyncP(home, ["sync", "--target", "hermes"]));
+  assert.doesNotMatch(report, /skipped/);
+  assert.match(report, /~ ctx m1:/);
+});
+
+test("add updates a legacy-surface entry even when providers: exists", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": `providers:
+  other:
+    api: http://127.0.0.1:9/v1
+    default_model: x
+    models:
+      - x
+custom_providers:
+  - name: Legacy
+    base_url: ${url}
+    api_key: dummy
+    model: old
+    models:
+      m1: {}
+`,
+  });
+  const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key", "SECRET"]));
+  assert.match(out, /providers "Legacy" updated/);
+  const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(cfg, /api_key: SECRET/);
+  assert.equal((cfg.match(/custom_providers:/g) || []).length, 1);
+  assert.doesNotMatch(cfg, /^ {2}mm:$/m, "no duplicate entry in providers:");
+});
+
+test("add creates in providers: when both surfaces exist and nothing matches", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("p1", "SECRET"),
+    ".hermes/config.yaml": `providers:
+  other:
+    api: http://127.0.0.1:9/v1
+    default_model: x
+    models:
+      - x
+custom_providers:
+  - name: Legacy
+    base_url: http://127.0.0.1:9/v2
+    models: {}
+`,
+  });
+  const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key", "SECRET"]));
+  assert.match(out, /providers "mm" created/);
+  const cfg = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(cfg, /^ {2}mm:\n {4}name: mm\n {4}api: /m);
+  assert.doesNotMatch(cfg, /^- name: mm$/m, "the legacy list is not grown");
 });

@@ -923,26 +923,26 @@ export function reconcile(models, server, { out, ctxMap, shape = "legacy", today
   return { models: next, ...res };
 }
 
-import { ind, normUrl, deq, yq, parseHermes, renderModels, hermesSetModels, hermesSetField, parseHermesProviders, renderProviderEntry, writeHermesProviders } from "../lib/hermes-yaml.js";
+import { ind, normUrl, yq, renderModels, hermesSetModels, hermesSetField, parseHermesConfig, writeHermesProviders } from "../lib/hermes-yaml.js";
 
 // ---------- hermes (~/.hermes/config.yaml) ----------
-// Two surfaces, one entry: the legacy `custom_providers:` list and the
-// `providers:` mapping Hermes writes since config v12 (and migrates the list
-// into, dropping the list). Whichever the file carries is the one provider-sync
-// edits; a file with neither gets `providers:`, the form Hermes itself
-// defaults to. Entries are matched by base URL in either form.
-function hermesDoc(text) {
-  const dict = parseHermesProviders(text);
-  if (dict)
-    return { form: "dict", lines: dict.lines, entries: dict.entries, unparsed: dict.unparsed ?? 0,
-             eol: dict.eol ?? (text.includes("\r\n") ? "\r\n" : "\n"),
-             listInd: dict.keyInd ?? 2, fldInd: dict.entries[0]?.fldInd ?? 4,
-             listEnd: dict.sectionEnd ?? dict.lines.length, error: dict.error ?? null, dict };
-  const list = parseHermes(text);
-  if (list) return { form: "list", ...list, error: null };
-  const alsoList = /^custom_providers:/m.test(text);
-  return { form: alsoList ? "list" : "none", lines: text.split(/\r?\n/), entries: [], unparsed: 0,
-           eol: text.includes("\r\n") ? "\r\n" : "\n", listInd: 2, fldInd: 4, listEnd: text.split(/\r?\n/).length, error: null };
+// Two surfaces, one file: the legacy `custom_providers:` list and the
+// `providers:` mapping Hermes writes since config v12. Hermes reads and merges
+// both, so provider-sync manages both: entries are matched by base URL across
+// surfaces, and edits are applied bottom-up on the shared line array.
+function hermesDocs(text) {
+  const parsed = parseHermesConfig(text);
+  const docs = parsed.docs;
+  return {
+    lines: parsed.lines,
+    eol: parsed.eol,
+    docs,
+    entries: parsed.entries,
+    sections: docs.map((d) => d.section),
+    form: docs.some((d) => d.form === "dict") ? "dict" : docs.some((d) => d.form === "list") ? "list" : "none",
+    error: docs.find((d) => d.error)?.error ?? null,
+    unparsed: docs.reduce((n, d) => n + (d.unparsed ?? 0), 0),
+  };
 }
 // Surgical line-based YAML edits: no full-file reparse/rewrite, comments and
 // formatting of untouched sections are preserved. Only the per-provider
@@ -1026,12 +1026,14 @@ const hermesProviderKey = (id) => (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) ? id 
 // a mismatch means the line surgery produced something we do not understand,
 // so the backup (made a moment earlier) is put back and the caller is told
 function verifyHermesWrite(expect) {
-  const after = hermesDoc(readFileSync(HERMES_CFG, "utf8"));
-  if (after.error) return `the written file no longer parses (${after.error})`;
+  const after = hermesDocs(readFileSync(HERMES_CFG, "utf8"));
+  const allowed = new Set(expect.allowErrors || []);
+  for (const d of after.docs)
+    if (d.error && !allowed.has(d.section)) return `the written file no longer parses (${d.error})`;
   if (expect.entries != null && after.entries.length !== expect.entries)
     return `entry count changed (${expect.entries} -> ${after.entries.length})`;
-  for (const { base, ids } of expect.models || []) {
-    const e = after.entries.find((x) => normUrl(x.base_url) === normUrl(base));
+  for (const { base, ids, section } of expect.models || []) {
+    const e = after.entries.find((x) => (!section || x.section === section) && normUrl(x.base_url) === normUrl(base));
     if (!e) return `entry for ${base} disappeared`;
     if (JSON.stringify(e.models.map((m) => m.id)) !== JSON.stringify(ids))
       return `models of ${base} did not land as written`;
@@ -1056,47 +1058,63 @@ function writeHermesCfg(lines, eol = "\n", expect = {}) {
   return path.basename(bak);
 }
 
-// create or update a custom_providers entry so `add` reaches every installed
-// harness; matched by base URL, so re-running updates instead of duplicating
+// create or update provider entries so `add` reaches every installed harness.
+// One server can be registered in both Hermes surfaces; matching by base URL
+// finds every copy and updates all of them instead of growing a third.
 export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }) {
   if (!existsSync(HERMES_CFG)) return { status: "absent", why: `hermes not installed (${disp(HERMES_CFG)} not found)` };
   const text = readFileSync(HERMES_CFG, "utf8");
-  const h = hermesDoc(text);
-  if (h.error) return { status: "layout", why: h.error };
-  if (h.form === "list" && !h.entries.length && !parseHermes(text))
-    return { status: "no-section", why: `no custom_providers section in ${disp(HERMES_CFG)}` };
+  const h = hermesDocs(text);
   const n = models.length;
   // `{env:VAR}` is OpenCode's syntax; Hermes reads `key_env` from
   // ~/.hermes/.env, so an env reference is translated instead of copied
   const ref = envRef(key);
-  const found = h.entries.find((e) => normUrl(e.base_url) === normUrl(base));
-  if (found) {
-    if (found.flow)
-      return { status: "flow", why: `the entry for ${base} is written in flow style on one line — provider-sync will not rewrite it` };
-    if (dryRun) return { status: "updated", name: found.name, n, form: h.form };
+  const matches = h.entries.filter((e) => normUrl(e.base_url) === normUrl(base));
+  const writable = matches.filter((e) => !e.flow);
+  if (matches.length && !writable.length)
+    return { status: "flow", why: `the entry for ${base} is written in flow style on one line — provider-sync will not rewrite it` };
+  if (writable.length) {
+    const found = writable[0];
+    const form = found.section === "providers" ? "dict" : "list";
+    if (dryRun) return { status: "updated", name: found.name, n, form };
+    if (writable.length > 1)
+      console.error(`note: ${base} is registered in ${writable.length} Hermes entries (${writable.map((e) => e.section).join(", ")}) — updating all of them`);
     const lines = h.lines.slice();
-    hermesSetModels(lines, found, models);
-    // `add --model` is the user's explicit default; an existing entry must take it
-    const modelField = found.modelField || (found.section === "providers" ? "default_model" : "model");
-    if (model && found.model !== model) hermesSetField(lines, found, modelField, model);
-    if (ref) {
-      if (found.key_env !== ref) hermesSetField(lines, found, found.keyEnvField || "key_env", ref);
-      // a live literal key would shadow key_env on Hermes' side
-      if (found.api_key && found.api_key !== "dummy") hermesSetField(lines, found, "api_key", "dummy");
-    } else if (key && found.api_key !== key) hermesSetField(lines, found, "api_key", key);
-    writeHermesCfg(lines, h.eol, { entries: h.entries.length, models: [{ base, ids: models.map((m) => m.id) }] });
-    return { status: "updated", name: found.name, n, form: h.form };
+    // bottom-up: a models splice moves every line below it
+    for (const e of [...writable].sort((a, b) => b.idx - a.idx)) {
+      hermesSetModels(lines, e, models);
+      // `add --model` is the user's explicit default; an existing entry must take it
+      const modelField = e.modelField || (e.section === "providers" ? "default_model" : "model");
+      if (model && e.model !== model) hermesSetField(lines, e, modelField, model);
+      if (ref) {
+        if (e.key_env !== ref) hermesSetField(lines, e, e.keyEnvField || "key_env", ref);
+        // a live literal key would shadow key_env on Hermes' side
+        if (e.api_key && e.api_key !== "dummy") hermesSetField(lines, e, "api_key", "dummy");
+      } else if (key && e.api_key !== key) hermesSetField(lines, e, "api_key", key);
+    }
+    writeHermesCfg(lines, h.eol, {
+      entries: h.entries.length,
+      models: writable.map((e) => ({ base, ids: models.map((m) => m.id), section: e.section })),
+    });
+    return { status: "updated", name: found.name, n, form };
   }
-  if (dryRun) return { status: "created", name, n, form: h.form };
-  const created = h.form === "list"
-    ? hermesUpsertList(h, { name, base, key, ref, model, models })
+  // nothing matched: create in the v12+ mapping when it exists (that is the
+  // surface that survives Hermes' own migration), else in the legacy list,
+  // else create the mapping.
+  const dictDoc = h.docs.find((d) => d.form === "dict" && !d.error);
+  const listDoc = h.docs.find((d) => d.form === "list" && !d.error);
+  const target = dictDoc ? "dict" : listDoc ? "list" : h.docs.length ? null : "dict";
+  if (!target) return { status: "layout", why: h.docs.find((d) => d.error)?.error || "no usable provider section" };
+  if (dryRun) return { status: "created", name, n, form: target };
+  const created = target === "list"
+    ? hermesUpsertList({ ...listDoc, lines: h.lines, eol: h.eol }, { name, base, key, ref, model, models })
     : hermesUpsertDict(text, { keyName, name, base, key, ref, model, models });
   if (created?.status) return created;
   writeHermesCfg(created.lines, h.eol, {
     entries: h.entries.length + 1,
-    models: [{ base, ids: models.map((m) => m.id) }],
+    models: [{ base, ids: models.map((m) => m.id), section: target === "dict" ? "providers" : "custom_providers" }],
   });
-  return { status: "created", name, n, form: h.form };
+  return { status: "created", name, n, form: target };
 }
 // append to the legacy `custom_providers:` list
 function hermesUpsertList(h, { name, base, key, ref, model, models }) {
@@ -1134,19 +1152,30 @@ function hermesUpsertDict(text, { keyName, name, base, key, ref, model, models }
 async function syncHermes({ apply, ocCfg, ocAuth }) {
   if (!existsSync(HERMES_CFG)) { console.log(`hermes (${disp(HERMES_CFG)}): not found — skipped`); return { status: "absent", why: "not installed" }; }
   const text = readFileSync(HERMES_CFG, "utf8");
-  const h = hermesDoc(text);
-  const section = h.form === "dict" ? "providers" : "custom_providers";
-  if (h.error) { console.log(`hermes (${disp(HERMES_CFG)}): ${h.error} — skipped`); return { status: "no-section", why: h.error }; }
-  if (!h.entries.length) {
-    const why = h.form === "none" ? `no ${section} section` : h.unparsed ? `no entries parsed (${h.unparsed} item(s) in an unexpected layout)` : "no entries parsed (unexpected indentation?)";
-    console.log(`hermes (${disp(HERMES_CFG)}): ${h.form === "none" ? `no ${section} section` : `${section} found but no entries`}${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
-    return { status: h.form === "none" ? "no-section" : "empty", why };
+  const h = hermesDocs(text);
+  if (!h.docs.length) {
+    console.log(`hermes (${disp(HERMES_CFG)}): no custom_providers section — skipped`);
+    return { status: "no-section", why: "no providers section" };
   }
-  console.log(`hermes (${disp(HERMES_CFG)}): ${h.entries.length} custom provider(s) in ${section}:`);
-  if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — skipped, provider-sync will not touch them`);
+  // one broken surface must not hide the other: report it and keep going
+  const broken = h.docs.filter((d) => d.error);
+  for (const d of broken) console.log(`hermes (${disp(HERMES_CFG)}): ${d.error} — skipped`);
+  const usable = h.docs.filter((d) => !d.error);
+  const entries = usable.flatMap((d) => d.entries);
+  if (!entries.length) {
+    for (const d of usable)
+      console.log(`hermes (${disp(HERMES_CFG)}): ${d.section} ${d.unparsed ? `has ${d.unparsed} item(s) in an unexpected layout` : "found but no entries"} — skipped`);
+    return { status: broken.length ? "no-section" : "empty", why: broken[0]?.error || "no entries parsed" };
+  }
+  const multi = h.docs.length > 1;
+  const tag = (e) => (multi ? `${e.section}/${e.name}` : e.name);
+  console.log(`hermes (${disp(HERMES_CFG)}): ${entries.length} custom provider(s) in ${usable.map((d) => d.section + ":").join(", ")}`);
+  for (const d of usable)
+    if (d.unparsed) console.log(`  note: ${d.unparsed} ${d.section} item(s) in an unexpected layout — skipped, provider-sync will not touch them`);
   // probe all providers in parallel, then report in config order
-  const rs = await Promise.all(h.entries.map(async (e) => {
+  const rs = await Promise.all(entries.map(async (e) => {
     if (e.flow) return { e, skip: "flow-style entry (one line in braces) — listed, never rewritten" };
+    if (e.enabled === false) return { e, skip: "disabled" };
     if (!e.base_url) return { e, skip: "no base_url" };
     const { key, ref, from, dbKey } = hermesKey(e, ocCfg, ocAuth);
     // --key stands in for this run when the stored key is unreadable (e.g. it
@@ -1162,19 +1191,19 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
   const edits = [];
   let changes = 0;
   for (const r of rs) {
-    if (r.skip) { console.log(`  ${r.e.name}: ${r.skip} — skipped`); continue; }
-    if (r.offline) { console.log(`  ${r.e.name} (${r.e.base_url}): OFFLINE (${r.offline}) — skipped`); continue; }
+    if (r.skip) { console.log(`  ${tag(r.e)}: ${r.skip} — skipped`); continue; }
+    if (r.offline) { console.log(`  ${tag(r.e)} (${r.e.base_url}): OFFLINE (${r.offline}) — skipped`); continue; }
     if (r.badauth) {
       console.log(r.supplied
-        ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — the key passed with --key was rejected — check it`
+        ? `  ${tag(r.e)} (${r.e.base_url}): AUTH 401 — the key passed with --key was rejected — check it`
         : r.unsetRef
-          ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is ${r.unsetRef} (from ${r.refFrom}), which is not set in this environment`
+          ? `  ${tag(r.e)} (${r.e.base_url}): AUTH 401 — its key is ${r.unsetRef} (from ${r.refFrom}), which is not set in this environment`
           : r.dbKey
-            ? `  ${r.e.name} (${r.e.base_url}): AUTH 401 — its key is in OpenCode's database (from ${r.refFrom}) and cannot be read here; pass --key K to check this server`
-            : `  ${r.e.name} (${r.e.base_url}): AUTH 401 — key missing or invalid`);
+            ? `  ${tag(r.e)} (${r.e.base_url}): AUTH 401 — its key is in OpenCode's database (from ${r.refFrom}) and cannot be read here; pass --key K to check this server`
+            : `  ${tag(r.e)} (${r.e.base_url}): AUTH 401 — key missing or invalid`);
       continue;
     }
-    if (r.err) { console.log(`  ${r.e.name} (${r.e.base_url}): ERROR — ${r.err}`); continue; }
+    if (r.err) { console.log(`  ${tag(r.e)} (${r.e.base_url}): ERROR — ${r.err}`); continue; }
     const e = r.e;
     const live = r.server.filter((m) => !m.skip).map((m) => ({ id: m.id, ctx: m.ctx ?? null }));
     const curIds = new Map(e.models.map((m) => [m.id, m]));
@@ -1182,7 +1211,7 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
     const added = live.filter((m) => !curIds.has(m.id));
     const removed = e.models.filter((m) => !liveIds.has(m.id));
     const ctxCh = live.filter((m) => { const c = curIds.get(m.id); return c && m.ctx != null && c.ctx !== m.ctx; });
-    console.log(`  ${e.name} (${r.kind}, ${e.base_url}): ${live.length} on server, ${e.models.length} in config`);
+    console.log(`  ${tag(e)} (${r.kind}, ${e.base_url}): ${live.length} on server, ${e.models.length} in config`);
     for (const a of added) console.log(`    + ${a.id}`);
     for (const a of removed) console.log(`    - ${a.id} (no longer on server)`);
     for (const c of ctxCh) console.log(`    ~ ctx ${c.id}: ${curIds.get(c.id).ctx} -> ${c.ctx}`);
@@ -1192,14 +1221,15 @@ async function syncHermes({ apply, ocCfg, ocAuth }) {
     changes += added.length + removed.length + ctxCh.length;
     edits.push({ e, live });
   }
-  if (!edits.length) return { status: "in-sync", n: h.entries.length };
+  if (!edits.length) return { status: "in-sync", n: entries.length };
   if (!apply) { console.log(`  ${changes} change(s) pending — re-run with --apply to write`); return { status: "pending", changes }; }
   // apply bottom-up so earlier line indices stay valid
   const lines = h.lines.slice();
   for (const ed of edits.sort((a, b) => b.e.idx - a.e.idx)) hermesSetModels(lines, ed.e, ed.live);
   const bak = writeHermesCfg(lines, h.eol, {
-    entries: h.entries.length,
-    models: edits.map((ed) => ({ base: ed.e.base_url, ids: ed.live.map((m) => m.id) })),
+    entries: entries.length,
+    allowErrors: broken.map((d) => d.section),
+    models: edits.map((ed) => ({ base: ed.e.base_url, ids: ed.live.map((m) => m.id), section: ed.e.section })),
   });
   console.log(`  APPLIED ${changes} change(s) — backup at ${bak}`);
   return { status: "applied", changes, providers: edits.length };
@@ -1789,23 +1819,31 @@ function cmdList() {
     if (!existsSync(HERMES_CFG)) console.log(`hermes  ${disp(HERMES_CFG)}: not found — skipped`);
     else {
       const text = readFileSync(HERMES_CFG, "utf8");
-      const h = hermesDoc(text);
-      const section = h.form === "dict" ? "providers" : "custom_providers";
-      // the surface in use is part of the picture: the two are edited the same
-      // way but only one of them survives Hermes' next config migration
-      console.log(`hermes  ${disp(HERMES_CFG)}${h.form === "none" ? "" : ` (${section})`}`);
-      if (h.error) console.log(`  note: ${h.error}`);
-      else if (!h.entries.length)
-        console.log(`  ${h.form === "none" ? `no ${section} section` : `${section} present but no entries parsed`}${h.unparsed ? ` (${h.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
+      const h = hermesDocs(text);
+      const multi = h.docs.length > 1;
+      const sections = h.docs.map((d) => d.section);
+      // the surfaces present are part of the picture: Hermes merges both, and a
+      // file carrying both is exactly the state a migration leaves behind
+      console.log(`hermes  ${disp(HERMES_CFG)}${sections.length ? ` (${sections.join(", ")})` : ""}`);
+      if (!h.docs.length) console.log("  no custom_providers section");
       else {
-        // partial coverage must be visible: those entries are listed nowhere
-        if (h.unparsed) console.log(`  note: ${h.unparsed} item(s) in an unexpected layout — not listed, and provider-sync will not touch them`);
-        if (h.form === "dict" && /^custom_providers:/m.test(text))
-          console.log("  note: custom_providers: is still present — provider-sync manages providers:, the mapping Hermes migrates entries into");
-        for (const e of h.entries) {
-          const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
-          console.log(`  ${(e.name || e.key || "-").padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}  ${hermesKeySource(e, cfg, auth)}`);
+        for (const d of h.docs) {
+          const pad = multi ? "    " : "  ";
+          if (multi) console.log(`  ${d.section}:`);
+          if (d.error) { console.log(`${pad}note: ${d.error}`); continue; }
+          if (!d.entries.length) {
+            console.log(`${pad}${d.section} present but no entries parsed${d.unparsed ? ` (${d.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
+            continue;
+          }
+          // partial coverage must be visible: those entries are listed nowhere
+          if (d.unparsed) console.log(`${pad}note: ${d.unparsed} item(s) in an unexpected layout — not listed, and provider-sync will not touch them`);
+          for (const e of d.entries) {
+            const style = e.flow ? (e.modelsOk ? " (flow style, read-only)" : " (flow style, models unreadable)") : "";
+            const off = e.enabled === false ? "  disabled" : "";
+            console.log(`${pad}${(e.name || e.key || "-").padEnd(20)} ${String(e.models.length).padStart(3)} models  ${e.base_url || "-"}${style}${off}  ${hermesKeySource(e, cfg, auth)}`);
+          }
         }
+        if (multi) console.log("  note: both surfaces are managed; Hermes merges providers: and custom_providers:");
       }
     }
   }
