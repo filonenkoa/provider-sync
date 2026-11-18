@@ -260,3 +260,122 @@ test("--help works on any command and wins over argument trouble", () => {
   const ver = runCli(home, ["list", "--version"]).trim();
   assert.match(ver, /^\d+\.\d+\.\d+$/);
 });
+
+// ---------- migrate: legacy provider.<id> -> native providers.<id> ----------
+const LEGACY_MM = () => JSON.stringify({
+  provider: {
+    mm: {
+      name: "MM",
+      npm: "@ai-sdk/openai-compatible",
+      options: { baseURL: "http://old/v1", apiKey: "K1", timeout: 5000 },
+      env: { MM_FLAG: "1" },
+      models: {
+        "mm-1": {
+          name: "MM 1",
+          modalities: { input: ["text", "image"], output: ["text"] },
+          tool_call: true,
+          reasoning: true,
+          release_date: "2025-01-01",
+          limit: { context: 4096, output: 1024 },
+          cost: { input: 1, output: 2 },
+          family: "qwen",
+        },
+        "mm-2": { attachment: true, limit: { context: 8192, output: 2048 } },
+      },
+    },
+    keep: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://keep/v1" }, models: {} },
+  },
+}, null, 2) + "\n";
+const migrate = (home, args = []) => flat(runCli(home, ["migrate", "--target", "opencode", ...args]));
+const migrateAsync = async (home, args = []) => flat(await runCliAsyncP(home, ["migrate", "--target", "opencode", ...args]));
+
+test("migrate converts a legacy provider into the native 2.x shape", () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": LEGACY_MM() });
+  const out = migrate(home, ["--apply"]);
+  assert.match(out, /mm: migrated|migrated.*mm/);
+  const cfg = readCfg(home);
+  assert.equal(cfg.provider.mm, undefined, "the legacy entry is gone");
+  assert.ok(cfg.provider.keep, "a legacy entry with an empty models object is left alone");
+  const p = cfg.providers.mm;
+  assert.equal(p.name, "MM");
+  assert.equal(p.package, NATIVE_PKG);
+  assert.equal(p.npm, undefined);
+  assert.equal(p.options, undefined);
+  assert.equal(p.settings.baseURL, "http://old/v1");
+  assert.equal(p.settings.apiKey, "K1");
+  assert.equal(p.settings.timeout, 5000);
+  assert.deepEqual(p.env, { MM_FLAG: "1" }, "provider-level fields survive");
+  const m1 = p.models["mm-1"];
+  assert.deepEqual(m1.capabilities.input, ["text", "image"]);
+  assert.deepEqual(m1.capabilities.output, ["text"]);
+  assert.equal(m1.capabilities.tools, true);
+  assert.deepEqual(m1.capabilities.reasoning, { supported: true });
+  assert.equal(m1.releaseDate, "2025-01-01");
+  assert.deepEqual(m1.limit, { context: 4096, output: 1024 });
+  assert.deepEqual(m1.cost, { input: 1, output: 2 }, "unknown-but-valid fields survive");
+  assert.equal(m1.family, "qwen");
+  assert.equal(m1.modalities, undefined);
+  assert.equal(m1.release_date, undefined);
+  const m2 = p.models["mm-2"];
+  assert.ok(m2.capabilities.input.includes("image"), "attachment implies image input");
+});
+
+test("migrate without --apply reports and writes nothing", () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": LEGACY_MM() });
+  const before = readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8");
+  const out = migrate(home);
+  assert.match(out, /would be migrated|would migrate/);
+  assert.equal(readFileSync(path.join(home, ".config/opencode/opencode.jsonc"), "utf8"), before);
+});
+
+test("migrate skips an entry it cannot convert without losing a field", () => {
+  const cfg0 = JSON.stringify({
+    provider: { bad: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://bad/v1" },
+      models: { m: { options: { reasoningEffort: "high" } } } } },
+  }, null, 2) + "\n";
+  const home = homeWith({ ".config/opencode/opencode.jsonc": cfg0 });
+  const out = migrate(home, ["--apply"]);
+  assert.match(out, /bad: skipped — .*options/);
+  const cfg = readCfg(home);
+  assert.ok(cfg.provider.bad, "the legacy entry stays");
+  assert.equal(cfg.providers, undefined);
+});
+
+test("migrate never shadows an existing native provider", () => {
+  const cfg0 = JSON.stringify({
+    provider: { mm: { options: { baseURL: "http://legacy/v1" }, models: {} } },
+    providers: { mm: { name: "Native", package: NATIVE_PKG, settings: { baseURL: url }, models: {} } },
+  }, null, 2) + "\n";
+  const home = homeWith({ ".config/opencode/opencode.jsonc": cfg0 });
+  const out = migrate(home, ["--apply"]);
+  assert.match(out, /mm: skipped — providers\.mm already exists/);
+  const cfg = readCfg(home);
+  assert.equal(cfg.providers.mm.name, "Native", "the entry OpenCode uses is untouched");
+  assert.ok(cfg.provider.mm, "the shadowed legacy entry stays");
+});
+
+test("migrate is idempotent and keeps the file valid", async () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": LEGACY_MM() });
+  migrate(home, ["--apply"]);
+  const again = migrate(home, ["--apply"]);
+  assert.match(again, /nothing to migrate/);
+  const cfg = readCfg(home);
+  assert.deepEqual(Object.keys(cfg.providers), ["mm"]);
+  // the migrated entry still syncs and lists like a native one
+  const listed = flat(await runCliAsyncP(home, ["list"]));
+  assert.match(listed, /mm \(2\.x\)/);
+  const sync = await migrateAsync(home, ["--apply"]);
+  assert.match(sync, /nothing to migrate/);
+});
+
+test("migrate refuses a target other than opencode", () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": LEGACY_MM() });
+  try { runCli(home, ["migrate", "--target", "hermes"]); assert.fail("expected a refusal"); }
+  catch (e) { assert.match(String(e.stderr), /migrate.*opencode/); }
+});
+
+test("migrate without an OpenCode config is an error", () => {
+  const home = homeWith({ ".keep": "" });
+  try { runCli(home, ["migrate", "--target", "opencode"]); assert.fail("expected an error"); }
+  catch (e) { assert.match(String(e.stderr), /no .*opencode/i); }
+});

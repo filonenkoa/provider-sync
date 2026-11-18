@@ -557,6 +557,20 @@ Commands:
       the models the server still reports. Without --model every tombstone of
       that provider is lifted. Writes only the state file.
 
+  provider-sync migrate --target opencode [--apply] [--dry-run]
+      Convert legacy OpenCode 1.x \`provider.<id>\` entries into the native
+      2.x \`providers.<id>\` shape: npm -> package, options -> settings,
+      modalities -> capabilities, tool_call -> capabilities.tools,
+      reasoning -> capabilities.reasoning, release_date -> releaseDate.
+      OpenCode 2.x drops the legacy release_date when it migrates an entry at
+      load, and the desktop/web picker hides models without a native
+      releaseDate — this is what makes local models visible there.
+      The whole entry is skipped (with the reason) when a field has no native
+      equivalent, so nothing is lost and the working legacy entry stays.
+      An entry whose models object is empty is left alone: there is nothing
+      for the picker to show. Without --apply nothing is written; the write is
+      atomic, backed up, validated and read back.
+
   provider-sync help
       Show this text (bare \`provider-sync\` prints it too and exits non-zero).
 
@@ -1884,6 +1898,182 @@ function reportValidate(cfg) {
   return errs.length === 0;
 }
 
+// ---------- migrate: legacy provider.<id> -> native providers.<id> ----------
+// OpenCode 2.x reads legacy entries by migrating them at load, but drops the
+// legacy release_date on the way — and the desktop/web picker hides models
+// without a native releaseDate. Writing the native shape is therefore the only
+// way to keep local models visible. The conversion is deliberately strict: a
+// field with no native equivalent makes the whole entry skipped, because a
+// half-converted provider that OpenCode would load differently is worse than
+// leaving the working legacy one alone.
+const NATIVE_PACKAGE = "@opencode/ai/providers/openai-compatible";
+const LEGACY_PACKAGE_MAP = new Map([
+  ["@ai-sdk/openai-compatible", NATIVE_PACKAGE],
+  ["@ai-sdk/openai", "@opencode/ai/providers/openai"],
+  ["@ai-sdk/anthropic", "@opencode/ai/providers/anthropic"],
+  ["@ai-sdk/google", "@opencode/ai/providers/google"],
+  ["@ai-sdk/amazon-bedrock", "@opencode/ai/providers/amazon-bedrock"],
+  ["@ai-sdk/azure", "@opencode/ai/providers/azure"],
+  ["@ai-sdk/mistral", "@opencode/ai/providers/mistral"],
+  ["@ai-sdk/groq", "@opencode/ai/providers/groq"],
+  ["@ai-sdk/xai", "@opencode/ai/providers/xai"],
+  ["@ai-sdk/cerebras", "@opencode/ai/providers/cerebras"],
+  ["@ai-sdk/cohere", "@opencode/ai/providers/cohere"],
+  ["@ai-sdk/togetherai", "@opencode/ai/providers/togetherai"],
+  ["@ai-sdk/perplexity", "@opencode/ai/providers/perplexity"],
+  ["@ai-sdk/gateway", "@opencode/ai/providers/gateway"],
+  ["@openrouter/ai-sdk-provider", "@opencode/ai/providers/openrouter"],
+]);
+const isPlainObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+export const mapLegacyPackage = (npm) =>
+  typeof npm === "string" && npm ? LEGACY_PACKAGE_MAP.get(npm) || npm : NATIVE_PACKAGE;
+
+function convertLegacyModel(key, m) {
+  const bad = (why) => ({ ok: false, why: `model "${key}" ${why}` });
+  if (!isPlainObject(m)) return bad("is not an object");
+  const e = {};
+  const caps = isPlainObject(m.capabilities) ? structuredClone(m.capabilities) : {};
+  let input = Array.isArray(caps.input) ? [...caps.input] : null;
+  let output = Array.isArray(caps.output) ? [...caps.output] : null;
+  for (const [k, v] of Object.entries(m)) {
+    switch (k) {
+      case "modalities": {
+        if (!isPlainObject(v)) return bad("has modalities that are not an object");
+        for (const side of Object.keys(v)) {
+          if (side !== "input" && side !== "output") return bad(`has modalities.${side}, which has no native equivalent`);
+          if (!Array.isArray(v[side]) || !v[side].every((x) => typeof x === "string"))
+            return bad(`has modalities.${side} that is not a list of strings`);
+        }
+        if (v.input) input = [...new Set([...input || [], ...v.input])];
+        if (v.output) output = [...new Set([...output || [], ...v.output])];
+        break;
+      }
+      case "attachment":
+        if (typeof v !== "boolean") return bad("has a non-boolean attachment");
+        // the native shape has no attachment flag: it is implied by the input list
+        if (v) {
+          input = input || ["text"];
+          if (!input.includes("image")) input.push("image");
+        }
+        break;
+      case "tool_call":
+        if (typeof v !== "boolean") return bad("has a non-boolean tool_call");
+        caps.tools = v;
+        break;
+      case "reasoning":
+        if (typeof v !== "boolean") return bad("has a non-boolean reasoning");
+        if (v) caps.reasoning = { supported: true };
+        break;
+      case "temperature":
+        if (typeof v !== "boolean") return bad("has a non-boolean temperature");
+        caps.temperature = v;
+        break;
+      case "release_date":
+        if (e.releaseDate !== undefined) return bad("names its release date twice");
+        e.releaseDate = v;
+        break;
+      case "id":
+        if (e.modelID !== undefined) return bad("names its model id twice");
+        e.modelID = v;
+        break;
+      case "options":
+      case "interleaved":
+      case "experimental":
+      case "status":
+      case "provider":
+        return bad(`has a legacy "${k}" field with no native equivalent`);
+      default:
+        if (NATIVE_MODEL_KEYS.has(k)) e[k] = structuredClone(v);
+        else if (LEGACY_MODEL_KEYS.has(k)) return bad(`has a legacy "${k}" field with no native equivalent`);
+        else return bad(`has an unknown field "${k}"`);
+    }
+  }
+  caps.input = input || ["text"];
+  caps.output = output || ["text"];
+  e.capabilities = caps;
+  return { ok: true, model: e };
+}
+export function legacyToNative(entry) {
+  if (!isPlainObject(entry)) return { ok: false, why: "entry is not an object" };
+  if (entry.npm !== undefined && typeof entry.npm !== "string") return { ok: false, why: "npm is not a string" };
+  if (entry.options !== undefined && !isPlainObject(entry.options)) return { ok: false, why: "options is not an object" };
+  if (entry.models !== undefined && !isPlainObject(entry.models)) return { ok: false, why: "models is not an object" };
+  const models = {};
+  for (const [mid, m] of Object.entries(entry.models || {})) {
+    const r = convertLegacyModel(mid, m);
+    if (!r.ok) return r;
+    models[mid] = r.model;
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(entry)) {
+    if (k === "npm" || k === "options" || k === "models") continue;
+    out[k] = structuredClone(v);
+  }
+  out.package = entry.package || mapLegacyPackage(entry.npm);
+  // runtime settings live in options on 1.x and in settings on 2.x; every
+  // option (baseURL, apiKey, timeout, headers, ...) is carried over unchanged
+  out.settings = {
+    ...(isPlainObject(entry.settings) ? structuredClone(entry.settings) : {}),
+    ...(entry.options ? structuredClone(entry.options) : {}),
+  };
+  out.models = models;
+  return { ok: true, entry: out };
+}
+
+function cmdMigrate() {
+  const target = flags.target || "opencode";
+  if (target !== "opencode")
+    die(`migrate works on the opencode config only — --target ${target} is not supported (use --target opencode)`);
+  if (!existsSync(CFG)) die(`no OpenCode config at ${disp(CFG)} — nothing to migrate`);
+  const cfg = loadCfg();
+  const beforeErrs = validate(cfg);
+  const staged = [];
+  const skipped = [];
+  for (const [id, entry] of Object.entries(cfg.provider || {})) {
+    if (cfg.providers?.[id]) { skipped.push([id, `providers.${id} already exists`]); continue; }
+    if (!Object.keys(entry?.models || {}).length) { skipped.push([id, "no models to migrate"]); continue; }
+    const r = legacyToNative(entry);
+    if (!r.ok) { skipped.push([id, r.why]); continue; }
+    staged.push([id, r.entry]);
+  }
+  for (const [id, why] of skipped) console.log(`${id}: skipped — ${why}`);
+  const apply = !!flags.apply && !flags["dry-run"];
+  if (!staged.length) { console.log("nothing to migrate"); return; }
+  if (!apply) {
+    for (const [id, e] of staged)
+      console.log(`${id}: would be migrated (npm -> package, options -> settings, ${Object.keys(e.models).length} model(s))`);
+    console.log(`${staged.length} provider(s) would be migrated — nothing written (re-run with --apply)`);
+    return;
+  }
+  // stage every entry first, then write once: a config where only half the
+  // providers moved would be harder to reason about than the legacy one
+  const next = structuredClone(cfg);
+  next.providers = next.providers || {};
+  for (const [id, e] of staged) {
+    next.providers[id] = e;
+    delete next.provider[id];
+  }
+  if (!Object.keys(next.provider || {}).length) delete next.provider;
+  const newErrs = validate(next).filter((e) => !beforeErrs.includes(e));
+  if (newErrs.length)
+    die(`the converted config would not validate (nothing written):\n  ${newErrs.join("\n  ")}`);
+  // Deleting the legacy entry only after the native one is safely on disk is
+  // the whole point: the file on disk is always a config OpenCode can load.
+  const before = readFileSync(CFG, "utf8");
+  saveCfg(next);
+  const back = loadCfg();
+  const lost = staged.filter(([id, e]) =>
+    JSON.stringify(back.providers?.[id]) !== JSON.stringify(e) || back.provider?.[id] !== undefined);
+  const backErrs = validate(back).filter((e) => !beforeErrs.includes(e));
+  if (lost.length || backErrs.length) {
+    atomicWrite(CFG, before);
+    die(`the migrated config did not read back as written — restored ${disp(CFG)} from the previous content`);
+  }
+  for (const [id, e] of staged)
+    console.log(`${id}: migrated (package, settings, ${Object.keys(e.models).length} model(s))`);
+  console.log(`migrated ${staged.length} provider(s) in ${disp(CFG)}`);
+}
+
 // interactively re-ask ctx for models the server doesn't report
 async function cmdSetCtx(pid) {
   if (!process.stdin.isTTY) die("set-ctx needs an interactive terminal");
@@ -2784,6 +2974,7 @@ const CMD_SPEC = {
     usage: "provider-sync remove <id> [--model M]... [--apply] [--target all|opencode|hermes|dsh]",
   },
   restore: { flags: ["dry-run", "target", "profile", "model"], args: 1, usage: "provider-sync restore <id> [--model M]..." },
+  migrate: { flags: ["apply", "dry-run", "target"], args: 0, usage: "provider-sync migrate --target opencode [--apply] [--dry-run]" },
 };
 const FLAG_HINTS = {
   sync: { "no-hermes": "is for add — sync narrows harnesses with --target opencode" },
@@ -2858,6 +3049,10 @@ try {
       try { cmdRemove(pos[1]); } finally { if (locked) releaseLock(); }
     } else if (cmd === "restore") {
       cmdRestore(pos[1]);
+    } else if (cmd === "migrate") {
+      const locked = !!flags.apply && !flags["dry-run"];
+      if (locked) acquireLock();
+      try { cmdMigrate(); } finally { if (locked) releaseLock(); }
     } else die(`unknown command "${cmd}" — see provider-sync help`);
   }
 } catch (e) { die(e.stack || e.message); }
