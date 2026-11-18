@@ -294,8 +294,8 @@ test("migrate converts a legacy provider into the native 2.x shape", () => {
   const out = migrate(home, ["--apply"]);
   assert.match(out, /mm: migrated|migrated.*mm/);
   const cfg = readCfg(home);
-  assert.equal(cfg.provider.mm, undefined, "the legacy entry is gone");
-  assert.ok(cfg.provider.keep, "a legacy entry with an empty models object is left alone");
+  assert.equal(cfg.provider, undefined, "the legacy section is gone");
+  assert.ok(cfg.providers.keep, "every legacy provider becomes native, even an empty one");
   const p = cfg.providers.mm;
   assert.equal(p.name, "MM");
   assert.equal(p.package, NATIVE_PKG);
@@ -360,7 +360,7 @@ test("migrate is idempotent and keeps the file valid", async () => {
   const again = migrate(home, ["--apply"]);
   assert.match(again, /nothing to migrate/);
   const cfg = readCfg(home);
-  assert.deepEqual(Object.keys(cfg.providers), ["mm"]);
+  assert.deepEqual(Object.keys(cfg.providers), ["mm", "keep"]);
   // the migrated entry still syncs and lists like a native one
   const listed = flat(await runCliAsyncP(home, ["list"]));
   assert.match(listed, /mm \(2\.x\)/);

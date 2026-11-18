@@ -1,6 +1,6 @@
 # provider-sync
 
-CLI to keep the model providers of [OpenCode](https://opencode.ai), [Hermes Agent](https://github.com/NousResearch/hermes-agent) and [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (`dsh`) in sync with the servers they point at: which models exist, how large their context window is, what they can accept as input — and, for Hermes, keeps its offline model catalog usable when a server is down.
+CLI to keep the model providers of [OpenCode](https://opencode.ai), [Hermes Agent](https://github.com/NousResearch/hermes-agent) and [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (`dsh`) in sync with the servers they point at: which models exist, how large their context window is, what they can accept as input — and to remove a provider or single models without the next sync bringing them back. For Hermes it also keeps the offline model catalog usable when a server is down.
 
 It edits the config each tool already reads. Nothing is guessed silently: every write reports what changed, what was skipped and why.
 
@@ -75,12 +75,15 @@ Offline or auth-failing servers are reported and skipped; the rest of the run is
 | `list` | Providers per harness: id/name, model count, base URL, key status. Read-only. |
 | `add <id> <baseURL>` | Register or update a provider in every **installed** harness. |
 | `sync` | Report (or, with `--apply`, write) the drift between servers and config. |
+| `remove <id> [--model M]…` | Remove a provider or single models from every harness; removed models are tombstoned so `sync` does not re-add them. Without `--apply` nothing is written. |
+| `restore <id> [--model M]…` | Lift tombstones written by `remove`, so the next `sync --apply` re-adds the models the server still reports. |
+| `migrate --target opencode` | Convert legacy `provider.<id>` entries into OpenCode 2.x's native `providers.<id>` shape. |
 | `set-ctx <provider>` | Interactively re-ask the context window of models the server reports none for. Needs a TTY. |
 | `help`, `--help`, `--version` | The full in-tool documentation / version. |
 
 ### `provider-sync list [--target all\|opencode\|hermes\|dsh] [--profile NAME]`
 
-Per provider: id, model count, base URL and where its key comes from — for Hermes whether it is a literal, a `~/.hermes/.env` reference or one borrowed from an OpenCode provider pointing at the same server; for dsh whether it is the launch environment, the credential store or `~/.dsh/.env`. Entries in OpenCode's 2.x `providers` shape are marked `(2.x)`.
+Per provider: id, model count, base URL and where its key comes from — for Hermes whether it is a literal, a `~/.hermes/.env` reference or one borrowed from an OpenCode provider pointing at the same server; for dsh whether it is the launch environment, the credential store or `~/.dsh/.env`. Entries in OpenCode's 2.x `providers` shape are marked `(2.x)`, and a provider with models hidden by `remove` tombstones says how many.
 
 A harness that is not installed is reported as `not found — skipped` instead of failing, so Hermes-only, OpenCode-only and dsh-only machines all work. Notes tell you which surface dsh is reading and which Hermes surface is in use.
 
@@ -121,6 +124,35 @@ Release dates are backfilled when a managed model has none, and refreshed after 
 ### `provider-sync set-ctx <provider> [--output N] [--key K] [--dry-run]`
 
 Asks, per model whose server reports no context window: **Enter** = best known value (native trained window from server metadata when available, else a heuristic on the model id), **a number** = use it, **k** = keep the current value, **0** = write no limit. Models the server no longer lists are skipped.
+
+### `provider-sync remove <id> [--model M]… [options]`
+
+Removes a provider — or just the named models — from OpenCode (both entry shapes), both Hermes surfaces and dsh. Without `--apply` it only reports what it would remove.
+
+A removed **model** is recorded as a tombstone in `~/.config/provider-sync/state.json` (the path honors `PS_STATE`). Every harness is server-authoritative, so without the tombstone the next `sync --apply` would simply add the model back. A removed **provider** drops its tombstones instead, so re-adding the provider later starts clean. `list` shows how many models a provider has hidden by tombstones.
+
+| Option | Effect |
+| --- | --- |
+| `--model M` | Remove one model (repeatable). Without it the whole provider entry is removed. |
+| `--apply` | Write the changes (default: report only). |
+| `--force` | Remove even though a reference would dangle, or when a Hermes match is ambiguous. |
+| `--keep-exclusions` | Keep the tombstones of a removed provider. |
+| `--purge-credentials` | Also drop the provider's keys from `~/.dsh/.credentials.yaml`. OpenCode's own stores are never touched. |
+| `--target T` | `all` (default) \| `opencode` \| `hermes` \| `dsh`. |
+| `--profile NAME` | dsh profile (default `web`, else the only one). |
+| `--dry-run` | Report only; wins over `--apply`. |
+
+A model referenced elsewhere — OpenCode's top-level `model`/`small_model`, Hermes' `model.provider`/`model.default` or a provider's `default_model` — makes `remove` refuse unless `--force` is given, so nothing is left dangling without an explicit decision. Removing an absent provider/model is idempotent: it reports `nothing to remove` and exits 0.
+
+### `provider-sync restore <id> [--model M]… [--target T] [--dry-run]`
+
+Lifts tombstones written by `remove`, so the next `sync --apply` re-adds the models the server still reports. Without `--model`, every tombstone of that provider is lifted. It writes only the state file — no harness config is touched.
+
+### `provider-sync migrate --target opencode [--apply] [--dry-run]`
+
+Converts legacy OpenCode 1.x `provider.<id>` entries into the native 2.x `providers.<id>` shape (`npm` → `package`, `options` → `settings`, `modalities` → `capabilities`, `tool_call` → `capabilities.tools`, `reasoning` → `capabilities.reasoning`, `release_date` → `releaseDate`). This is what makes the desktop/web picker honour the release dates provider-sync writes: OpenCode 2.x drops the legacy `release_date` when it migrates an entry at load.
+
+The conversion is all-or-nothing per provider: a field with no native equivalent (a model-level `options`, `interleaved`, `status`, …) skips the whole entry with the reason, leaving the working legacy entry in place. A `providers.<id>` entry that already exists is never shadowed. Without `--apply` nothing is written; an applied write is atomic, backed up, schema-checked and read back, and the legacy entry is deleted only after the native one is on disk. Re-running is safe: it reports `nothing to migrate`.
 
 ### Flags it refuses
 
@@ -163,11 +195,12 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 | --- | --- |
 | `$OPENCODE_CONFIG`, else the first existing of `opencode.jsonc` / `opencode.json` / `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode` (override: `PS_CONFIG`) | provider entries: models, limits, modalities, and the API key. `jsonc` wins over `json`; `config.json` is a 1.x name that 2.x ignores (provider-sync says so when a 2.x database is present). Skipped if OpenCode is not installed. |
 | `~/.local/share/opencode/auth.json`, `~/.local/share/opencode/opencode.db` | OpenCode's own credential stores. **Read-only for provider-sync**: presence is reported, a value is never printed, nothing is ever written. |
-| `~/.hermes/config.yaml` — the `providers:` mapping, or the legacy `custom_providers:` list when that is what the file carries (Hermes' config v12 migration moves the list into the mapping and deletes it; a file with neither gets `providers:`) | entries created/updated by `add`; their `models:` maps (the offline fallback catalog) refreshed by `sync`. Surgical line edits — comments and every other field survive byte for byte. Skipped if Hermes is not installed. |
+| `~/.hermes/config.yaml` — the `providers:` mapping, or the legacy `custom_providers:` list when that is what the file carries (Hermes' config v12 migration moves the list into the mapping and deletes it; a file with neither gets `providers:`) | entries created/updated by `add`; their `models:` maps or lists (the offline fallback catalog) refreshed by `sync`. Surgical line edits — comments and every other field survive byte for byte. Skipped if Hermes is not installed. |
 | `~/.hermes/.env` | key source for Hermes providers. Read-only. |
 | `~/.dsh/settings.yaml` (the dsh home is `$DSH_HOME`, tilde expanded, or `~/.dsh`) | the `llm-pi-ai` providers block of the pre-0.2 document. dsh imports this file into the active profile at its next boot and renames it `settings.yaml.imported`, so provider-sync writes here only while it exists (a re-created file is imported again). |
 | `~/.dsh/profiles/<name>/cordis.patch.yml` | the live provider state: `config.providers` of the `- id: llm-pi-ai` patch item. Default profile `web`; `--profile NAME` picks another; with no profile yet, `add` falls back to `settings.yaml`. Only the providers subtree is regenerated. |
 | `~/.dsh/.credentials.yaml` | dsh's credential store — written by `add --key`/`--key-env` (see [Keys](#keys)), mode `600`, values never printed. |
+| `~/.config/provider-sync/state.json` (override: `PS_STATE`) | model tombstones written by `remove` and cleared by `restore`; keeps `sync`/`add` from re-adding deliberately removed models. Never contains API keys. |
 
 ## Per-harness behaviour
 
@@ -175,7 +208,7 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 
 Each provider is kept in **exactly one entry shape** — the one its entry already uses. A config may carry both the legacy `provider.<id>` shape and the 2.x native `providers.<id>` shape; on 2.x a native entry *replaces* a legacy one wholesale, so a second, partial entry for the same id would shadow and break the real provider. provider-sync therefore updates a `providers.<id>` entry in place (`package` / `settings` / `models`) and leaves a legacy one legacy (2.x migrates it at load). A brand-new provider follows the file's dialect: 2.x shape only in a config that has `providers` and no `provider`, legacy everywhere else.
 
-OpenCode 2.x's desktop/web picker hides models whose release date is more than about six months old; a model without one reaches the client as `time.released: 0`, which it normalizes to `1970-01-01` and hides. provider-sync therefore writes the date a model was last seen — `releaseDate` in the native shape, `release_date` in the legacy one — and refreshes it after 90 days. OpenCode 2.x drops the legacy `release_date` during its migration, so the desktop fix covers native `providers.<id>` entries; a legacy entry still relies on the client's manual show toggle.
+OpenCode 2.x's desktop/web picker hides models whose release date is more than about six months old; a model without one reaches the client as `time.released: 0`, which it normalizes to `1970-01-01` and hides. provider-sync therefore writes the date a model was last seen — `releaseDate` in the native shape, `release_date` in the legacy one — and refreshes it after 90 days. OpenCode 2.x drops the legacy `release_date` during its migration, so the desktop fix reaches a legacy entry only after `provider-sync migrate --target opencode --apply` converts it to the native shape (see [above](#provider-sync-migrate---target-opencode---apply---dry-run)).
 
 After every write the config is checked against [OpenCode's own schema](https://opencode.ai/config.json) — unknown model keys, bad modalities and incomplete limits are reported; valid entries OpenCode knows about (`cost`, `variants`, `headers`, …) are not.
 
@@ -183,7 +216,11 @@ After every write the config is checked against [OpenCode's own schema](https://
 
 ### Hermes
 
-Only `context_length` is written per model — it is the only per-model field Hermes reads from config — and other fields of an entry (`discover_models`, `capabilities`, `extra_body`, …) are left exactly as written. The top-level `model:` block is never touched.
+**Both surfaces are managed.** Hermes config v12 keeps providers in the root `providers:` mapping; its migration moves the old `custom_providers:` list there and deletes it. provider-sync reads and writes whichever surface the file carries (a file carrying both is managed on both and says so), and a file with neither gets `providers:`. `add` matches by base URL across both surfaces, so re-running updates instead of duplicating.
+
+**Canonical v12 fields are read as Hermes reads them.** `api:` is the endpoint, with `base_url:` and `url:` accepted as aliases; `default_model:` is the model field, with `model:` as the alias; `models:` may be a mapping or a list (`- id: model`); `enabled: false` disables an entry — it is listed as `disabled` and `sync`/`add` leave it alone. Fields provider-sync does not manage (`discover_models`, `free_only`, `capabilities`, `extra_body`, …) are kept exactly as written, and one entry with an unknown layout does not stop the rest of the section from being processed.
+
+Only `context_length` is written per model — it is the only per-model field Hermes reads from config — and the file's own spelling and shape are preserved: a mapping stays a mapping, and a list stays a list (`- id: …` plus `context_length`). The top-level `model:` block is never touched.
 
 An entry written in **flow style** (`- {name: x, base_url: y}`, or a one-line entry in the mapping) is listed but never rewritten: the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip it and say so. The same holds for a comment inside an entry and for other shapes provider-sync cannot rewrite without guessing — each is reported as `skipped — <reason>`.
 
@@ -191,9 +228,11 @@ An entry written in **flow style** (`- {name: x, base_url: y}`, or a one-line en
 
 **Where state lives.** The `llm-pi-ai` providers block of `~/.dsh/settings.yaml` while that file exists (the pre-0.2 document, which dsh imports at its next boot), otherwise the `config.providers` block of the `- id: llm-pi-ai` item in `~/.dsh/profiles/<profile>/cordis.patch.yml`. Only that subtree is regenerated — everything else in the file survives byte for byte.
 
-**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header. `add` detects an Anthropic-compatible endpoint and writes `api: anthropic-messages` for that route. A route naming a protocol this build cannot serve is reported, never probed.
+**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header; `api: google-generative-ai` uses Gemini's own `{base}/models` with `x-goog-api-key`, strips the `models/` prefix from ids and reads `inputTokenLimit` as the context window (embedding-only models are skipped). `add` detects an Anthropic- or Gemini-compatible endpoint when the OpenAI listing does not answer and writes the matching `api:` for that route. A Gemini endpoint is registered only in dsh — OpenCode and Hermes speak OpenAI-compatible HTTP, so they report a skip reason instead of receiving an entry that would fail every request. A route naming a protocol this build cannot serve is reported, never probed.
 
-**Models.** Model lists are server-authoritative: new models added, gone models removed, server-reported `contextWindow` pinned (compared against the effective value, so dsh's default of 262144 counts as "unset"). Entries dsh owns — `api`, `displayName`, timeouts, `compat` — are left alone. A model the server reports as taking images gets `input: [text, image]`, because dsh's model schema has exactly those two request modalities and text-only is its default; modalities dsh cannot express are left out rather than written, since an out-of-schema input list would take that model out of every picker.
+**Context.** dsh's LLM layer defaults to a context window of 1,000,000 when a model entry does not pin one. provider-sync compares server-reported values against that effective default, so a model the server says is 1M is already in sync and no redundant `contextWindow` is written; server-reported context is still pinned when it differs.
+
+**Models.** Model lists are server-authoritative: new models added, gone models removed, server-reported `contextWindow` pinned (compared against the effective value, so dsh's default of 1,000,000 counts as "unset"). Entries dsh owns — `api`, `displayName`, timeouts, `compat` — are left alone. A model the server reports as taking images gets `input: [text, image]`, because dsh's model schema has exactly those two request modalities and text-only is its default; modalities dsh cannot express are left out rather than written, since an out-of-schema input list would take that model out of every picker.
 
 **Refusals** (reported as `skipped — <reason>`, nothing written): a providers block containing comments, anchors, aliases, tags (`!!js`), block scalars, flow mappings or tab indentation; an `insert:` list or a second `llm-pi-ai` item making the live one ambiguous; a home-level `~/.dsh/cordis.patch.yml` that also targets `llm-pi-ai` (it wins over the profile's); and a route that tunes its catalog with `modelOverrides` and lists no models — dsh rejects a `models` list beside `modelOverrides`, and that rejection takes the route out of every picker.
 
@@ -216,21 +255,24 @@ Every line says which file, what changed, and — when something was skipped —
 
 - Every write is atomic (temp file + `fsync` + `rename`) and preceded by a `.bak-provider-sync-*` backup; the last 3 per file are kept.
 - The Hermes config and the dsh configs are re-read after writing and rolled back from the backup if they no longer parse or say what was intended; the OpenCode config is validated against its schema.
-- `~/.dsh/.credentials.yaml` is written owner-only (`600`) — dsh refuses to load a store others can read.
+- `migrate` deletes a legacy entry only after its native replacement is on disk and reads back correctly; on a mismatch the previous file content is restored.
+- `remove` without `--apply` writes nothing. Removed models are recorded as tombstones in a separate state file, so a later sync cannot silently resurrect them; `restore` is the explicit way back.
+- `~/.dsh/.credentials.yaml` is written owner-only (`600`) — dsh refuses to load a store others can read. `remove --purge-credentials` deletes a reference only when no other dsh route still uses it.
 - Secrets are never printed; only where a key came from is.
-- Writing commands (`add`, `sync --apply`, `set-ctx`) take an exclusive lock in the system temp directory keyed by the config directory, so two runs cannot interleave. Read-only commands never take it.
-- `--dry-run` never writes, in `add`, `sync` and `set-ctx` alike, and wins over `--apply` on the same line.
+- Writing commands (`add`, `sync --apply`, `set-ctx`, `remove --apply`, `migrate --apply`) take an exclusive lock in the system temp directory keyed by the config directory, so two runs cannot interleave. Read-only commands never take it.
+- `--dry-run` never writes, in `add`, `sync`, `set-ctx`, `remove` and `migrate` alike, and wins over `--apply` on the same line.
 
 ## Exit codes
 
-`0` on success. Non-zero, with an explanation on stderr, when something you asked for did not happen: `add` on a server that is unreachable or rejects the key, a flag that means nothing for the command, a config that cannot be parsed, a write that could not be verified, a refused layout, or a model entry OpenCode's schema rejects. A run that merely *reports* problems — a server down during `sync`, an offline entry — is still a successful run: nothing was asked of it, so it exits `0`.
+`0` on success. Non-zero, with an explanation on stderr, when something you asked for did not happen: `add` on a server that is unreachable or rejects the key, a flag that means nothing for the command, a config that cannot be parsed, a write that could not be verified, a refused layout, a `remove` that would leave a dangling reference without `--force`, a `migrate` target other than `opencode` (or no OpenCode config at all), or a model entry OpenCode's schema rejects. A run that merely *reports* problems — a server down during `sync`, an offline entry — is still a successful run: nothing was asked of it, so it exits `0`.
 
 ## Known limits
 
-- OpenAI-shaped probes: OpenCode and Hermes entries are always written as OpenAI-compatible providers, so an Anthropic-only endpoint gets a working dsh route (`api: anthropic-messages`) but not a working OpenCode/Hermes one — those need the vendor's own provider package.
+- OpenAI-shaped probes: OpenCode and Hermes entries are always written as OpenAI-compatible providers, so an Anthropic-only or Gemini endpoint gets a working dsh route (`api: anthropic-messages` / `api: google-generative-ai`) but not a working OpenCode/Hermes one — those need the vendor's own provider package.
 - dsh `maxTokens` is never written; dsh's default (32768) applies.
 - Hermes offline catalogs carry context lengths only, because that is the only per-model field Hermes reads from configuration.
-- Only llama.cpp, LM Studio, Unsloth UI and OpenAI-compatible servers are detected; anything else is registered by base URL and refreshed from `/v1/models`.
+- Only llama.cpp, LM Studio, Unsloth UI, OpenAI-compatible servers, Anthropic Messages and Gemini listings are detected; anything else is registered by base URL and refreshed from `/v1/models`.
+- `migrate` converts an entry only when every field has a native equivalent; a model-level `options`, `interleaved`, `status` or another unmappable field leaves that provider legacy (reported with the reason). `id` becomes `modelID`, `attachment` adds `image` to `capabilities.input`, and `temperature`/`reasoning`/`tool_call` become `capabilities.*`.
 
 ## Troubleshooting
 
@@ -247,7 +289,7 @@ Every line says which file, what changed, and — when something was skipped —
 ## Development
 
 ```sh
-npm test        # 226 tests, no network access beyond localhost fixtures
+npm test        # 285 tests, no network access beyond localhost fixtures
 ```
 
 Pure ESM, zero dependencies, tests run in-process and through the real CLI with a temporary `$HOME`. CI covers Node 18 and 22 on Linux, macOS and Windows.

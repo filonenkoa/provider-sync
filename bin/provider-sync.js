@@ -392,6 +392,8 @@ Files:
                                                writes there while it exists
            ~/.dsh/.credentials.yaml            key store; provider-sync writes
                                                refs but never prints a value
+  state    ~/.config/provider-sync/state.json  model tombstones written by
+                                               remove (override: PS_STATE)
 
 Commands:
   provider-sync list [--target all|opencode|hermes|dsh] [--profile NAME]
@@ -433,13 +435,16 @@ Commands:
       else into the active profile's cordis.patch.yml (--profile NAME picks
       one; the default is web). A new route gets api: openai-completions, or
       api: anthropic-messages when the endpoint answers that protocol's
-      listing. The key goes to ~/.dsh/.credentials.yaml as a
-      reference (<ID>_API_KEY, like dsh's own UI); without --key the existing
-      reference is kept, and a keyless server gets "dummy" so requests do not
-      fail with MISSING_CREDENTIAL.
+      listing, or api: google-generative-ai when it answers Gemini's listing
+      (that route is registered only in dsh — OpenCode and Hermes cannot serve
+      it and report a skip reason). The key goes to ~/.dsh/.credentials.yaml
+      as a reference (<ID>_API_KEY, like dsh's own UI); without --key the
+      existing reference is kept, and a keyless server gets "dummy" so
+      requests do not fail with MISSING_CREDENTIAL.
       Entry shapes: a provider whose entry lives in the 2.x \`providers\`
       section is updated in that shape (package/settings/models); a legacy
-      provider.<id> entry stays legacy (2.x migrates it at load). A config
+      provider.<id> entry stays legacy (2.x migrates it at load — use
+      \`provider-sync migrate\` to convert it). A config
       with only \`providers\` — a 2.x file — gets new providers in 2.x shape.
       provider-sync never writes a second entry for the same id: OpenCode 2.x
       would let the partial one shadow and break the real entry.
@@ -501,8 +506,10 @@ Commands:
                   model the server reports as taking images gets
                   input: [text, image] (dsh's schema has exactly those two).
                   A route is interrogated the way its api: field says dsh
-                  interrogates it (OpenAI listing + bearer, or Anthropic
-                  x-api-key listing). Refuses to touch a providers block it
+                  interrogates it (OpenAI listing + bearer, Anthropic
+                  x-api-key, or Gemini x-goog-api-key). dsh's effective
+                  context default is 1,000,000, so a server value equal to it
+                  is already in sync. Refuses to touch a providers block it
                   cannot rewrite losslessly, and reports why instead.
         all       all three (default)
       Harnesses are independent — a target whose config file is missing is
@@ -567,9 +574,8 @@ Commands:
       releaseDate — this is what makes local models visible there.
       The whole entry is skipped (with the reason) when a field has no native
       equivalent, so nothing is lost and the working legacy entry stays.
-      An entry whose models object is empty is left alone: there is nothing
-      for the picker to show. Without --apply nothing is written; the write is
-      atomic, backed up, validated and read back.
+      Without --apply nothing is written; the write is atomic, backed up,
+      validated and read back.
 
   provider-sync help
       Show this text (bare \`provider-sync\` prints it too and exits non-zero).
@@ -635,9 +641,10 @@ Safety:
     the reason) rather than rewritten
   - ~/.dsh/.credentials.yaml is written owner-only (mode 600) — dsh refuses
     to load a store others can read — and a stored secret is never printed
-  - writing commands (add, sync --apply, set-ctx) take an exclusive lock in
-    the system temp directory (keyed by the config directory), so two runs
-    cannot interleave; read-only commands never take it
+  - writing commands (add, sync --apply, set-ctx, remove --apply, migrate
+    --apply) take an exclusive lock in the system temp directory (keyed by the
+    config directory), so two runs cannot interleave; read-only commands never
+    take it
   - --dry-run never writes, in add, sync and set-ctx alike (with --apply on
     the same line it still wins); an unknown flag or a value on a boolean flag
     (--apply=false) is refused instead of guessed, and so is a known flag that
@@ -661,6 +668,8 @@ Examples:
   provider-sync remove dropme --model m2 --apply   # hide one model for good
   provider-sync remove dropme --apply              # remove the whole provider
   provider-sync restore dropme --model m2          # and let sync bring it back
+  provider-sync migrate --target opencode          # show what a 2.x migration would change
+  provider-sync migrate --target opencode --apply  # convert legacy entries to native 2.x
 `;
 
 // ---------- http ----------
@@ -2031,7 +2040,6 @@ function cmdMigrate() {
   const skipped = [];
   for (const [id, entry] of Object.entries(cfg.provider || {})) {
     if (cfg.providers?.[id]) { skipped.push([id, `providers.${id} already exists`]); continue; }
-    if (!Object.keys(entry?.models || {}).length) { skipped.push([id, "no models to migrate"]); continue; }
     const r = legacyToNative(entry);
     if (!r.ok) { skipped.push([id, r.why]); continue; }
     staged.push([id, r.entry]);

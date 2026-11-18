@@ -4,6 +4,46 @@ Format: [semver](https://semver.org). Dates are ISO.
 
 ## Unreleased
 
+### Added
+- **Removal that stays removed.** `provider-sync remove <id> [--model M]…`
+  deletes a provider — or just named models — from OpenCode (both entry
+  shapes), both Hermes surfaces and dsh. Removed models are recorded as
+  tombstones in `~/.config/provider-sync/state.json` (`PS_STATE` overrides the
+  path), because every harness is server-authoritative and the next `sync`
+  would otherwise re-add them. `restore <id> [--model M]…` lifts tombstones.
+  Without `--apply` nothing is written; `--force` overrides a dangling
+  reference (OpenCode `model`/`small_model`, Hermes `model.*`/`default_model`);
+  `--purge-credentials` drops an unreferenced key from dsh's store;
+  `--keep-exclusions` preserves a removed provider's tombstones. `list` shows
+  how many models a provider hides.
+- **`provider-sync migrate --target opencode [--apply] [--dry-run]`.** Converts
+  legacy `provider.<id>` entries into OpenCode 2.x's native `providers.<id>`
+  shape: `npm` → `package` (including the `@ai-sdk/*` → `@opencode/ai/providers/*`
+  names), `options` → `settings`, `modalities` → `capabilities`, `tool_call` →
+  `capabilities.tools`, `reasoning` → `capabilities.reasoning`,
+  `release_date` → `releaseDate`, `id` → `modelID`, with `cost`, `limit`,
+  `family`, `headers`, `variants` and provider-level fields preserved. An entry
+  with a field that has no native equivalent is skipped as a whole (the legacy
+  entry stays usable), an existing native entry is never shadowed, and an
+  applied write is schema-checked, read back and rolled back on a mismatch.
+  This is what makes the desktop/web picker honour the release dates: OpenCode
+  2.x drops legacy `release_date` at load.
+- **Hermes config v12 is supported on both surfaces.** The line parser now
+  understands the canonical `providers:` mapping as well as the legacy
+  `custom_providers:` list, including `api` as the endpoint (with `base_url` /
+  `url` aliases), `default_model` (with `model` as the alias), canonical model
+  lists (`- id:` + `context_length`), `enabled: false`, and unknown fields.
+  `sync`, `list` and `add` manage whichever surface the file carries; `add`
+  matches by base URL across both, writes new entries into `providers:` when
+  both exist, and updates `default_model` when `--model` is given. One
+  unparseable entry no longer aborts the rest of the section.
+- **dsh's Gemini protocol.** `api: google-generative-ai` routes are listed at
+  `{base}/models` with `x-goog-api-key`, model ids lose their `models/` prefix,
+  `inputTokenLimit` becomes the context window, and embedding-only models are
+  skipped. `add` detects a Gemini endpoint when the OpenAI/Anthropic probes do
+  not answer; such a route is registered only in dsh, because OpenCode and
+  Hermes cannot serve the protocol.
+
 ### Fixed
 - **OpenCode desktop/web no longer hides provider-sync's models.** A
   config-declared model without a release date reaches OpenCode 2.x clients as
@@ -14,7 +54,11 @@ Format: [semver](https://semver.org). Dates are ISO.
   one — and a date older than 90 days is refreshed by `add`/`sync`. A
   date-only backfill is reported and written by `sync --apply` like any other
   drift. OpenCode 2.x drops legacy `release_date` during migration, so the
-  desktop fix covers native entries.
+  desktop fix covers native entries; `migrate` converts a legacy config.
+- **dsh's context default is 1,000,000, not 262,144.** llm-pi-ai's
+  `DEFAULT_CONTEXT_WINDOW` is 1M; comparing a server's 1M model against the old
+  value reported a false drift and wrote a redundant `contextWindow`. The
+  effective-value comparison now uses dsh's real default.
 
 ## 1.2.2 — 2026-10-18
 

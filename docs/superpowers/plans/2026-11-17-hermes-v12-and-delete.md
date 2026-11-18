@@ -1,6 +1,6 @@
 # Hermes v12, удаление и dsh — план реализации
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Исправить поддержку канонического Hermes v12 и обеих поверхностей, добавить удаление/восстановление провайдеров и моделей во всех harness'ах, выровнять dsh с upstream и закрыть миграцию OpenCode 2.x.
 
@@ -41,7 +41,7 @@
 - Produces entry fields: `base_url`, `model`, `modelsShape`, `models`, `enabled`, `section`.
 - Existing `parseHermes` and `parseHermesProviders` keep their names and return shapes, extended with the new fields.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests:
 
@@ -66,12 +66,12 @@ test("parses canonical v12: api, default_model, models list", () => {
 
 Also: `enabled: false`, unknown field in one entry, both surfaces via `parseHermesConfig`, canonical list in legacy surface.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/hermes-parse.test.js`
 Expected: FAIL — `base_url` undefined / `modelsShape` undefined.
 
-- [ ] **Step 3: Implement field aliases and list parsing**
+- [x] **Step 3: Implement field aliases and list parsing**
 
 In `parseHermesProviders`:
 - recognize `api|url|base_url`, `default_model|model`, `api_key|key_env|api_key_env|key_cmd`, `enabled`;
@@ -81,12 +81,12 @@ In `parseHermesProviders`:
 In `parseHermes` (legacy list): same aliases; parse `models:` list/map.
 Add `parseHermesConfig(text)` that returns both docs.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/hermes-parse.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/hermes-yaml.js test/hermes-parse.test.js
@@ -106,28 +106,28 @@ git commit -m "fix(hermes): parse canonical v12 fields and model lists"
 - `hermesSetModels(lines, entry, models)` writes map or list according to `entry.modelsShape`.
 - `renderProviderEntry(key, spec, keyInd)` writes `api`/`default_model` for `providers:`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 - canonical v12 entry keeps `api` and `default_model`, updates models list in place;
 - a list entry with ctx becomes list of `- id: ...` + `context_length`;
 - a map entry stays map;
 - `add --model` updates `default_model`.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/hermes-write.test.js`
 Expected: FAIL — output still uses `base_url`/mapping.
 
-- [ ] **Step 3: Implement writer**
+- [x] **Step 3: Implement writer**
 
 Add list renderer. Detect existing field names in `hermesSetField`/`hermesUpsert`; do not add a second `model`/`default_model`. Keep `api` if present; write `api` for new dict entries.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/hermes-write.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/hermes-yaml.js test/hermes-parse.test.js test/hermes-write.test.js
@@ -147,7 +147,7 @@ git commit -m "fix(hermes): preserve v12 field names and models shape"
 - Produces `hermesDocs(text) -> { lines, eol, docs, entries }`.
 - `hermesUpsert` updates all matching entries across surfaces; creates in `providers:` when both exist.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 - live-like fixture with `providers:` canonical and `custom_providers:` list: both synced;
 - `add` matches legacy list by base URL even when `providers:` exists;
@@ -155,21 +155,21 @@ git commit -m "fix(hermes): preserve v12 field names and models shape"
 - one unknown field in one entry does not skip the rest;
 - `list` shows both sections.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/hermes-sync.test.js test/list.test.js test/add-targets.test.js`
 Expected: FAIL — only one section processed.
 
-- [ ] **Step 3: Integrate**
+- [x] **Step 3: Integrate**
 
 Replace `hermesDoc` with `hermesDocs`; update `syncHermes`, `cmdList`, `hermesUpsert`, `verifyHermesWrite`. Sort edits bottom-up; report section names.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/hermes-sync.test.js test/list.test.js test/add-targets.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/provider-sync.js test/hermes-sync.test.js test/list.test.js test/add-targets.test.js
@@ -193,25 +193,25 @@ git commit -m "fix(hermes): manage providers and custom_providers together"
 - `dropProvider(state, { target, provider, baseURL }) -> state`
 - `filterServerModels(server, state, { target, provider, baseURL }) -> { server, hidden }`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Unit tests for match by provider id and base URL, dedupe, restore, drop provider.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/state.test.js`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement state module**
+- [x] **Step 3: Implement state module**
 
 Pure functions, no fs. State shape from spec.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/state.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lib/state.js test/state.test.js
@@ -231,7 +231,7 @@ git commit -m "feat(state): add model exclusion tombstones"
 - CLI `restore <id> [--model M]... [--target ...]`
 - `cmdRemove(id)`, `cmdRestore(id)`.
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
 - remove provider from OpenCode and Hermes; both shapes/surfaces gone;
 - remove model; `sync --apply` does not return it;
@@ -240,21 +240,21 @@ git commit -m "feat(state): add model exclusion tombstones"
 - default model reference refuses without `--force`;
 - backups exist.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/remove.test.js`
 Expected: FAIL — unknown command.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add flags/CMD_SPEC/help. Implement state read/write, filtering in `reconcile` call sites, OpenCode/Hermes removal, default-ref checks, dry-run, backups. Use in-memory staging + rollback.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/remove.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/provider-sync.js test/remove.test.js
@@ -273,28 +273,28 @@ git commit -m "feat: remove and restore providers and models"
 - dsh removal uses `parseDshSettings`/`writeDshSettings` or `parseDshPatch`/`writeDshPatch`.
 - `--purge-credentials` deletes only an unreferenced store record.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 - remove dsh provider/model from profile patch and settings.yaml;
 - sync does not re-add tombstoned model;
 - purge credentials only when safe;
 - missing dsh = skipped.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/remove.test.js test/dsh.test.js`
 Expected: FAIL — dsh not handled.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add dsh branch to `cmdRemove`; reuse dsh writers; preserve other fields.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/remove.test.js test/dsh.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/provider-sync.js test/remove.test.js test/dsh.test.js
@@ -315,27 +315,27 @@ git commit -m "feat(dsh): remove providers and models safely"
 - `probeDsh(base, "google-generative-ai", key)` -> `{ kind: "gemini", root, base }`.
 - `fetchModels` / `probeDsh` parse Gemini list.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 - default ctx comparison uses 1M;
 - Gemini listing `{models:[{name:"models/gemini-x", inputTokenLimit:123}]}` maps to `gemini-x` / ctx 123;
 - `add` writes `api: google-generative-ai` for a Gemini endpoint.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/dsh.test.js test/probe.test.js`
 Expected: FAIL — unsupported protocol.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add protocol, probe, list parser, add detection; update `fetchModels` branch.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/dsh.test.js test/probe.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/provider-sync.js test/dsh.test.js test/probe.test.js
@@ -354,7 +354,7 @@ git commit -m "fix(dsh): use 1M default ctx and support Gemini routes"
 - CLI `migrate --target opencode [--apply] [--dry-run]`.
 - `legacyToNative(entry) -> nativeEntry`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 - legacy provider/model converts to native with `package`, `settings`, `capabilities`, `releaseDate`;
 - unknown fields are preserved;
@@ -362,21 +362,21 @@ git commit -m "fix(dsh): use 1M default ctx and support Gemini routes"
 - schema validation passes;
 - legacy entry removed only after native write.
 
-- [ ] **Step 2: Run tests, verify failure**
+- [x] **Step 2: Run tests, verify failure**
 
 Run: `node --test test/opencode-2x.test.js`
 Expected: FAIL — unknown command.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add command, conversion, backup/read-back. Skip entries that cannot be converted losslessly.
 
-- [ ] **Step 4: Run tests, verify pass**
+- [x] **Step 4: Run tests, verify pass**
 
 Run: `node --test test/opencode-2x.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/provider-sync.js test/opencode-2x.test.js
@@ -391,21 +391,21 @@ git commit -m "feat(opencode): migrate legacy providers to native 2.x shape"
 - Modify: `README.md`, `AGENTS.md`, `CHANGELOG.md`, `bin/provider-sync.js` (HELP)
 - Test: full suite
 
-- [ ] **Step 1: Update docs**
+- [x] **Step 1: Update docs**
 
 Hermes both surfaces + canonical fields; dsh 1M + 4 protocols; remove/restore/migrate; tombstones.
 
-- [ ] **Step 2: Run full suite**
+- [x] **Step 2: Run full suite**
 
 Run: `npm test`
 Expected: all pass, 0 failures.
 
-- [ ] **Step 3: Manual smoke test**
+- [x] **Step 3: Manual smoke test**
 
 Run in a temp HOME with fixtures:
 `provider-sync list`, `provider-sync sync`, `provider-sync remove --dry-run`, `provider-sync remove --apply`, `provider-sync restore`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md AGENTS.md CHANGELOG.md bin/provider-sync.js
