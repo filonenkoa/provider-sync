@@ -152,7 +152,7 @@ Lifts tombstones written by `remove`, so the next `sync --apply` re-adds the mod
 
 Converts legacy OpenCode 1.x `provider.<id>` entries into the native 2.x `providers.<id>` shape (`npm` → `package`, `options` → `settings`, `modalities` → `capabilities`, `tool_call` → `capabilities.tools`, `reasoning` → `capabilities.reasoning`, `release_date` → `releaseDate`). This is what makes the desktop/web picker honour the release dates provider-sync writes: OpenCode 2.x drops the legacy `release_date` when it migrates an entry at load.
 
-The conversion is all-or-nothing per provider: a field with no native equivalent (a model-level `options`, `interleaved`, `status`, …) skips the whole entry with the reason, leaving the working legacy entry in place. A `providers.<id>` entry that already exists is never shadowed. Without `--apply` nothing is written; an applied write is atomic, backed up, schema-checked and read back, and the legacy entry is deleted only after the native one is on disk. Re-running is safe: it reports `nothing to migrate`.
+The conversion is all-or-nothing per provider: a field with no native equivalent (a model-level `options`, `interleaved`, `status`, …) skips the whole entry with the reason, leaving the working legacy entry in place. A field neither shape defines — the `think` key some hand-edited configs carry, for example — is not something OpenCode ever reads: its v1 decoder ignores excess properties and its own migration drops them, so `migrate` drops it too and names the model it came from. A `providers.<id>` entry that already exists is never shadowed. Without `--apply` nothing is written; an applied write is atomic, backed up, schema-checked and read back, and the legacy entry is deleted only after the native one is on disk. Re-running is safe: it reports `nothing to migrate`.
 
 ### Flags it refuses
 
@@ -272,7 +272,7 @@ Every line says which file, what changed, and — when something was skipped —
 - dsh `maxTokens` is never written; dsh's default (32768) applies.
 - Hermes offline catalogs carry context lengths only, because that is the only per-model field Hermes reads from configuration.
 - Only llama.cpp, LM Studio, Unsloth UI, OpenAI-compatible servers, Anthropic Messages and Gemini listings are detected; anything else is registered by base URL and refreshed from `/v1/models`.
-- `migrate` converts an entry only when every field has a native equivalent; a model-level `options`, `interleaved`, `status` or another unmappable field leaves that provider legacy (reported with the reason). `id` becomes `modelID`, `attachment` adds `image` to `capabilities.input`, and `temperature`/`reasoning`/`tool_call` become `capabilities.*`.
+- `migrate` converts an entry only when every field has a native equivalent; a model-level `options`, `interleaved`, `status` or another legacy field with no native mapping leaves that provider legacy (reported with the reason). A field neither schema defines (`think`, for example) is dropped with a note, because OpenCode's v1 decoder ignores it and its own migration drops it. `id` becomes `modelID`, `attachment` adds `image` to `capabilities.input`, and `temperature`/`reasoning`/`tool_call` become `capabilities.*`.
 
 ## Troubleshooting
 

@@ -341,6 +341,25 @@ test("migrate skips an entry it cannot convert without losing a field", () => {
   assert.equal(cfg.providers, undefined);
 });
 
+test("migrate drops a model field neither shape defines and says so", () => {
+  // A field outside both schemas is already dead config: OpenCode's own v1
+  // decoder ignores excess properties, and its migration drops them. Refusing
+  // to migrate would leave the whole provider legacy (and its models hidden in
+  // the desktop picker) to protect a value that was never read.
+  const cfg0 = JSON.stringify({
+    provider: { mm: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "http://old/v1" },
+      models: { "mm-1": { name: "MM 1", think: "high" } } } },
+  }, null, 2) + "\n";
+  const home = homeWith({ ".config/opencode/opencode.jsonc": cfg0 });
+  const out = migrate(home, ["--apply"]);
+  assert.match(out, /mm: dropped unknown field "think" on model "mm-1"/);
+  assert.match(out, /mm: migrated/);
+  const cfg = readCfg(home);
+  assert.equal(cfg.provider, undefined, "the conversion still happens");
+  assert.equal(cfg.providers.mm.models["mm-1"].think, undefined, "the dead field is gone");
+  assert.equal(cfg.providers.mm.models["mm-1"].name, "MM 1");
+});
+
 test("migrate never shadows an existing native provider", () => {
   const cfg0 = JSON.stringify({
     provider: { mm: { options: { baseURL: "http://legacy/v1" }, models: {} } },

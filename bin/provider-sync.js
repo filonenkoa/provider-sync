@@ -572,8 +572,10 @@ Commands:
       OpenCode 2.x drops the legacy release_date when it migrates an entry at
       load, and the desktop/web picker hides models without a native
       releaseDate — this is what makes local models visible there.
-      The whole entry is skipped (with the reason) when a field has no native
-      equivalent, so nothing is lost and the working legacy entry stays.
+      The whole entry is skipped (with the reason) when a legacy field has no
+      native equivalent, so nothing is lost and the working legacy entry stays.
+      A field neither shape defines (e.g. "think") is dropped with a note: the
+      v1 decoder ignores it and OpenCode's own migration drops it.
       Without --apply nothing is written; the write is atomic, backed up,
       validated and read back.
 
@@ -1937,7 +1939,7 @@ const isPlainObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 export const mapLegacyPackage = (npm) =>
   typeof npm === "string" && npm ? LEGACY_PACKAGE_MAP.get(npm) || npm : NATIVE_PACKAGE;
 
-function convertLegacyModel(key, m) {
+function convertLegacyModel(key, m, dropped = []) {
   const bad = (why) => ({ ok: false, why: `model "${key}" ${why}` });
   if (!isPlainObject(m)) return bad("is not an object");
   const e = {};
@@ -1994,7 +1996,11 @@ function convertLegacyModel(key, m) {
       default:
         if (NATIVE_MODEL_KEYS.has(k)) e[k] = structuredClone(v);
         else if (LEGACY_MODEL_KEYS.has(k)) return bad(`has a legacy "${k}" field with no native equivalent`);
-        else return bad(`has an unknown field "${k}"`);
+        // A key in neither schema is already dead config: OpenCode's v1
+        // decoder ignores excess properties and its own migration drops them.
+        // Carry the provider forward and report the drop instead of leaving
+        // the whole entry legacy over a value nothing ever read.
+        else dropped.push([key, k]);
     }
   }
   caps.input = input || ["text"];
@@ -2008,8 +2014,9 @@ export function legacyToNative(entry) {
   if (entry.options !== undefined && !isPlainObject(entry.options)) return { ok: false, why: "options is not an object" };
   if (entry.models !== undefined && !isPlainObject(entry.models)) return { ok: false, why: "models is not an object" };
   const models = {};
+  const dropped = [];
   for (const [mid, m] of Object.entries(entry.models || {})) {
-    const r = convertLegacyModel(mid, m);
+    const r = convertLegacyModel(mid, m, dropped);
     if (!r.ok) return r;
     models[mid] = r.model;
   }
@@ -2026,7 +2033,7 @@ export function legacyToNative(entry) {
     ...(entry.options ? structuredClone(entry.options) : {}),
   };
   out.models = models;
-  return { ok: true, entry: out };
+  return { ok: true, entry: out, dropped };
 }
 
 function cmdMigrate() {
@@ -2038,13 +2045,21 @@ function cmdMigrate() {
   const beforeErrs = validate(cfg);
   const staged = [];
   const skipped = [];
+  const dropped = [];
   for (const [id, entry] of Object.entries(cfg.provider || {})) {
     if (cfg.providers?.[id]) { skipped.push([id, `providers.${id} already exists`]); continue; }
     const r = legacyToNative(entry);
     if (!r.ok) { skipped.push([id, r.why]); continue; }
     staged.push([id, r.entry]);
+    if (r.dropped?.length) dropped.push([id, r.dropped]);
   }
   for (const [id, why] of skipped) console.log(`${id}: skipped — ${why}`);
+  for (const [id, list] of dropped) {
+    const byKey = new Map();
+    for (const [model, key] of list) byKey.set(key, [...(byKey.get(key) || []), model]);
+    for (const [key, models] of byKey)
+      console.log(`${id}: dropped unknown field "${key}" on ${models.length === 1 ? `model "${models[0]}"` : `models ${models.map((m) => `"${m}"`).join(", ")}`} — OpenCode does not read ${models.length === 1 ? "it" : "them"}`);
+  }
   const apply = !!flags.apply && !flags["dry-run"];
   if (!staged.length) { console.log("nothing to migrate"); return; }
   if (!apply) {

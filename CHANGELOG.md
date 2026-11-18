@@ -23,9 +23,12 @@ Format: [semver](https://semver.org). Dates are ISO.
   `capabilities.tools`, `reasoning` → `capabilities.reasoning`,
   `release_date` → `releaseDate`, `id` → `modelID`, with `cost`, `limit`,
   `family`, `headers`, `variants` and provider-level fields preserved. An entry
-  with a field that has no native equivalent is skipped as a whole (the legacy
-  entry stays usable), an existing native entry is never shadowed, and an
-  applied write is schema-checked, read back and rolled back on a mismatch.
+  with a legacy field that has no native equivalent is skipped as a whole (the
+  legacy entry stays usable); a field neither schema defines (such as the
+  `think` key some hand-edited configs carry) is dropped with a note, because
+  OpenCode's v1 decoder ignores excess properties and its own migration drops
+  them. An existing native entry is never shadowed, and an applied write is
+  schema-checked, read back and rolled back on a mismatch.
   This is what makes the desktop/web picker honour the release dates: OpenCode
   2.x drops legacy `release_date` at load.
 - **Hermes config v12 is supported on both surfaces.** The line parser now
