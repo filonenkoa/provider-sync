@@ -692,6 +692,16 @@ export async function req(url, { method = "GET", key, body, timeout = 6000, cap 
 }
 const rootOf = (b) => b.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
 const v1Of = (b) => { b = b.replace(/\/+$/, ""); return /\/v1$/.test(b) ? b : b + "/v1"; };
+// Gemini's base URL names its API version (/v1beta usually) and its listing is
+// `{base}/models`; an OpenAI-style `/v1` base is the same host, one version to
+// the left. The first candidate is what the user typed.
+function geminiCandidates(url) {
+  const b = String(url).replace(/\/+$/, "").replace(/\/models$/, "");
+  const out = [b];
+  if (/\/v1$/.test(b)) out.push(b.replace(/\/v1$/, "/v1beta"));
+  else if (!/\/(?:v1(?:beta|alpha)\d*)$/.test(b)) out.push(b + "/v1beta");
+  return [...new Set(out)];
+}
 const nz = (v) => (typeof v === "number" && v > 0 ? v : null);
 
 // ---------- detection ----------
@@ -777,10 +787,11 @@ function specAny(m) {
 // `{baseURL}/models` with a bearer token, Anthropic Messages at `{root}/v1/
 // models` with `x-api-key` and a version header. Probing an anthropic-messages
 // route as if it were OpenAI reports a working server as offline.
-const DSH_PROTOCOLS = new Set(["openai-completions", "openai-responses", "anthropic-messages"]);
+const DSH_PROTOCOLS = new Set(["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]);
 const ANTHROPIC_VERSION = "2023-06-01";
 const dshListingUrl = (base, api) => {
   const b = String(base).replace(/\/+$/, "");
+  if (api === "google-generative-ai") return `${b}/models`;
   return api === "anthropic-messages"
     ? `${b.endsWith("/v1") ? b.slice(0, -3) : b}/v1/models?limit=1000`
     : `${b}/models`;
@@ -791,6 +802,27 @@ function dshListingReq(base, api, key) {
     ? { url: dshListingUrl(base, api), key: null, headers: { "anthropic-version": ANTHROPIC_VERSION, ...(key ? { "x-api-key": key } : {}) } }
     : { url: dshListingUrl(base, api), key, headers: null };
 }
+// Gemini's listing is its own shape: `models: [{ name: "models/gemini-x",
+// inputTokenLimit }]`, where the id carries a `models/` prefix and the context
+// field is inputTokenLimit. Embedding-only entries are not chat models.
+function dshReadGeminiListing(json) {
+  const listed = Array.isArray(json?.models) ? json.models : Array.isArray(json?.data) ? json.data : [];
+  return listed
+    .map((m) => {
+      const raw = typeof m?.name === "string" ? m.name : typeof m?.id === "string" ? m.id : null;
+      if (!raw) return null;
+      const methods = Array.isArray(m?.supportedGenerationMethods) ? m.supportedGenerationMethods : null;
+      const embedOnly = methods && methods.length && !methods.some((x) => /generateContent/i.test(x));
+      return {
+        id: raw.replace(/^models\//, ""),
+        ctx: typeof m?.inputTokenLimit === "number" && m.inputTokenLimit > 0 ? m.inputTokenLimit : null,
+        input: null,
+        ...(embedOnly ? { skip: true } : {}),
+      };
+    })
+    .filter(Boolean);
+}
+
 // the model ids (and context) of a listing reply, in dsh's reading of it
 function dshReadListing(json) {
   const listed = Array.isArray(json?.data)
@@ -816,6 +848,19 @@ export function probeDshCached(base, api, key) {
 export const clearDshProbeCache = () => _dshProbes.clear();
 export async function probeDsh(base, api, key) {
   if (!DSH_PROTOCOLS.has(api)) return { kind: "unsupported", api };
+  if (api === "google-generative-ai") {
+    // the Gemini listing authenticates with x-goog-api-key; `?key=` is the other
+    // form the API accepts, so a server that only reads the query still answers
+    const b = String(base).replace(/\/+$/, "");
+    const r = await req(dshListingUrl(b, api), { headers: key ? { "x-goog-api-key": key } : null });
+    if (r.status === 200 && r.json) {
+      const models = dshReadGeminiListing(r.json);
+      if (models.length) return { kind: "gemini", api, root: rootOf(b), base: b, specs: models };
+      return { kind: "offline", api, base: b, error: "HTTP 200 but no model listing in the answer" };
+    }
+    if (r.status === 401 || r.status === 403) return { kind: "auth", api, root: rootOf(b), base: b };
+    return { kind: "offline", api, root: rootOf(b), base: b, status: r.status, error: r.error || (r.status ? `HTTP ${r.status}` : "no answer") };
+  }
   if (api !== "anthropic-messages") {
     // the OpenAI protocols keep the shared detection chain (and its run-wide
     // cache), so a llama.cpp or LM Studio route still gets its richer listing
@@ -1695,7 +1740,7 @@ async function syncDsh({ apply }) {
   for (const nt of dshNotes(st)) console.log(`  note: ${nt}`);
   if (!ids.length) return { status: "empty", why: "no providers configured" };
   if (st.parsed?.disabled) console.log("  note: llm-pi-ai is disabled — writing through is still possible, but dsh will not apply it");
-  const DEFAULT_CTX = 262144; // dsh's provider default when contextWindow is unset
+  const DEFAULT_CTX = 1_000_000; // llm-pi-ai's DEFAULT_CONTEXT_WINDOW when contextWindow is unset
   // probe all providers in parallel, then report in config order
   const rs = await Promise.all(ids.map(async (id) => {
     const p = providers[id];
@@ -1980,7 +2025,7 @@ function cmdList() {
 }
 
 async function cmdAdd(id, url) {
-  const base = v1Of(url);
+  let base = v1Of(url);
   const a = loadAuth();
   // validate before anything is probed or stored: a bad name would become an
   // {env:...} reference nothing can resolve
@@ -2015,6 +2060,20 @@ async function cmdAdd(id, url) {
       pr = alt;
       dshApi = "anthropic-messages";
       notes0.push("the server answers the Anthropic Messages listing — the dsh route gets api: anthropic-messages");
+    }
+  }
+  // and last, Gemini: its listing has its own path (/v1beta/models), auth header
+  // and model naming. A route registered with the OpenAI protocol would 404 on
+  // every listing, so the protocol is part of the registration.
+  if ((pr.kind === "offline" || pr.kind === "auth") && (flags.target === "dsh" || !flags.target)) {
+    for (const cand of geminiCandidates(url)) {
+      const alt = await probeDsh(cand, "google-generative-ai", probeKey);
+      if (alt.kind !== "gemini" && alt.kind !== "auth") continue;
+      pr = alt;
+      dshApi = "google-generative-ai";
+      base = alt.base || cand;
+      notes0.push("the server answers the Gemini listing — the dsh route gets api: google-generative-ai");
+      break;
     }
   }
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
@@ -2063,18 +2122,26 @@ async function cmdAdd(id, url) {
   // not selected either; --target names exactly what is written
   const skipHermes = !!flags["no-hermes"] || target === "opencode" || target === "dsh";
   const skipDsh = !!flags["no-hermes"] || target === "opencode" || target === "hermes";
-  const wantOc = (target === "all" || target === "opencode") && (haveOcFile || target === "opencode");
-  const wantH = !skipHermes && existsSync(HERMES_CFG);
+  // OpenCode and Hermes speak OpenAI-compatible HTTP; a Gemini endpoint is only
+  // servable by dsh, so the other two are reported as skipped instead of
+  // receiving an entry that would fail every request
+  const geminiOnly = dshApi === "google-generative-ai";
+  const wantOc = !geminiOnly && (target === "all" || target === "opencode") && (haveOcFile || target === "opencode");
+  const wantH = !geminiOnly && !skipHermes && existsSync(HERMES_CFG);
   const wantD = !skipDsh && (target === "dsh" || existsSync(DSH_HOME));
   // why a target was skipped: "not chosen" and "not installed" are different problems
-  const ocWhy = target === "opencode" || target === "all" ? (haveOcFile ? "" : "opencode is not installed here")
+  const ocWhy = geminiOnly ? "the endpoint speaks google-generative-ai, which OpenCode's openai-compatible entry cannot serve"
+    : target === "opencode" || target === "all" ? (haveOcFile ? "" : "opencode is not installed here")
     : `not selected (--target ${target})`;
-  const hWhy = flags["no-hermes"] ? "disabled with --no-hermes"
+  const hWhy = geminiOnly ? "hermes cannot serve a google-generative-ai endpoint (OpenAI-compatible only)"
+    : flags["no-hermes"] ? "disabled with --no-hermes"
     : target === "opencode" || target === "dsh" ? `not selected (--target ${target})`
     : wantH ? "" : "hermes is not installed here";
   const dWhy = flags["no-hermes"] ? "disabled with --no-hermes"
     : target === "opencode" || target === "hermes" ? `not selected (--target ${target})`
     : wantD ? "" : "dsh is not installed here";
+  if (geminiOnly && (target === "opencode" || target === "hermes"))
+    die(`the endpoint speaks google-generative-ai — only the dsh target can serve it, so --target ${target} would write nothing`);
   const fresh = wantOc && !existsSync(CFG);
   const cfg = wantOc ? loadCfgOrEmpty() : { provider: {} };
   // the provider is updated in the shape its entry already uses; a new one

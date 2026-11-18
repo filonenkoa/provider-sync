@@ -455,3 +455,69 @@ test("an OpenCode-only machine does not grow a dsh home", async () => {
   assert.match(out, /dsh \S* skipped — dsh is not installed here/);
   assert.equal(existsSync(inHome(home, ".dsh")), false);
 });
+
+const geminiServer = (models) => http.createServer((q, s) => {
+  if (q.url === "/v1beta/models" && q.headers["x-goog-api-key"] === "sk-g") {
+    s.setHeader("content-type", "application/json");
+    s.end(JSON.stringify({ models }));
+  } else { s.statusCode = 401; s.end("{}"); }
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, "127.0.0.1", r));
+
+test("add detects a Gemini endpoint and writes api: google-generative-ai", async () => {
+  const gem = geminiServer([
+    { name: "models/gemini-x", inputTokenLimit: 123, supportedGenerationMethods: ["generateContent"] },
+    { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
+  ]);
+  await listen(gem);
+  try {
+    const home = homeWith({});
+    const gemUrl = `http://127.0.0.1:${gem.address().port}/v1beta`;
+    const out = flat(await runCliAsyncP(home, ["add", "gem", gemUrl, "--key", "sk-g", "--target", "dsh"]));
+    assert.match(out, /google-generative-ai/, "the report names the protocol");
+    const cfg = read(home, ".dsh/settings.yaml");
+    assert.match(cfg, /api: google-generative-ai/);
+    assert.match(cfg, /baseURL: http:\/\/127\.0\.0\.1:\d+\/v1beta/);
+    assert.match(cfg, /- id: gemini-x\n\s+contextWindow: 123/);
+    assert.doesNotMatch(cfg, /text-embedding-004/, "an embedding-only model is skipped");
+  } finally { gem.close(); }
+});
+
+test("sync interrogates a google-generative-ai route with the Gemini listing", async () => {
+  const gem = geminiServer([
+    { name: "models/gemini-x", inputTokenLimit: 123, supportedGenerationMethods: ["generateContent"] },
+  ]);
+  await listen(gem);
+  try {
+    const gemUrl = `http://127.0.0.1:${gem.address().port}/v1beta`;
+    const home = homeWith({ [WEB]: patchWith(
+      `      gem:\n        api: google-generative-ai\n        baseURL: ${gemUrl}\n        apiKeyEnv: GEM_API_KEY\n        models:\n          - id: stale\n`),
+      [STORE]: "version: 1\nrefs:\n  GEM_API_KEY: sk-g\n",
+    });
+    const out = await sync(home, ["--target", "dsh", "--apply"]);
+    assert.match(out, /gem \(gemini, http:\/\/127\.0\.0\.1:\d+\/v1beta\): 1 on server, 1 in config/);
+    assert.match(out, /APPLIED 2 change\(s\)/);
+    const cfg = read(home, WEB);
+    assert.match(cfg, /- id: gemini-x\n\s+contextWindow: 123/);
+    assert.doesNotMatch(cfg, /stale/);
+    assert.match(cfg, /api: google-generative-ai/, "the protocol is preserved");
+  } finally { gem.close(); }
+});
+
+test("a server value equal to dsh's 1M default is already in sync", async () => {
+  const big = http.createServer((q, s) => {
+    if (q.url === "/v1/models") {
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ data: [{ id: "big-model", context_length: 1000000 }] }));
+    } else { s.statusCode = 404; s.end("{}"); }
+  });
+  await listen(big);
+  try {
+    const bigUrl = `http://127.0.0.1:${big.address().port}/v1`;
+    const home = homeWith({ [WEB]: patchWith(
+      `      big:\n        api: openai-completions\n        baseURL: ${bigUrl}\n        models:\n          - id: big-model\n`) });
+    const out = await sync(home, ["--target", "dsh"]);
+    assert.match(out, /in sync/);
+    assert.doesNotMatch(out, /~ ctx big-model/);
+  } finally { big.close(); }
+});
