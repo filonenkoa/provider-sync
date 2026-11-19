@@ -95,7 +95,7 @@ Registers or updates one provider everywhere. Upsert: models missing on the serv
 | --- | --- |
 | `--name N` | Display name (default: the existing one, else `<id>`). |
 | `--key K` | API key. Stored per harness (see [Keys](#keys)). |
-| `--key-env VAR` | Store a reference instead of the secret — `{env:VAR}` in OpenCode, `key_env:` in Hermes, `apiKeyEnv:` in dsh. Resolved from the environment while probing; nothing secret is written. |
+| `--key-env VAR` | Store a reference instead of the secret — `{env:VAR}` in OpenCode, `key_env:` in Hermes, `apiKeyEnv:` in dsh. In OpenCode and Hermes it replaces a literal key already written in the config; the old key is used only to probe while the named variable is unset here. Nothing secret is written. |
 | `--username U --password P` | Unsloth UI login: provider-sync signs in and creates a persistent API key named after `<id>`. Both flags are required together, and only an Unsloth UI server accepts them; anything unused is reported. |
 | `--model M` | Model written into the Hermes entry's `model:` field (default: the first the server reports). |
 | `--ctx N` | Context for models whose server reports none (`0` = write no limit). Without it, provider-sync asks in a terminal and shows a guess with `--dry-run`. |
@@ -127,9 +127,11 @@ Asks, per model whose server reports no context window: **Enter** = best known v
 
 ### `provider-sync remove <id> [--model M]… [options]`
 
-Removes a provider — or just the named models — from OpenCode (both entry shapes), both Hermes surfaces and dsh. Without `--apply` it only reports what it would remove.
+Removes a provider — or just the named models — from OpenCode (both entry shapes), both Hermes surfaces and dsh. Without `--apply` it only reports what it would remove. In Hermes, removal matches the provider's id/key/name first, then follows that server into the **other** surface, so a copy registered there under a different name does not survive; a pure base-URL match with several hits is ambiguous without `--force`.
 
 A removed **model** is recorded as a tombstone in `~/.config/provider-sync/state.json` (the path honors `PS_STATE`). Every harness is server-authoritative, so without the tombstone the next `sync --apply` would simply add the model back. A removed **provider** drops its tombstones instead, so re-adding the provider later starts clean. `list` shows how many models a provider has hidden by tombstones.
+
+When Hermes cannot be rewritten, nothing is claimed: a model in a flow-style entry (or another shape provider-sync will not edit) is reported as `skipped — <reason>` and is **not** tombstoned, because a tombstone would hide a model that is still visible in the file. A requested entry the parser cannot read is likewise skipped with its reason and a non-zero exit, never reported as `nothing to remove`. The state file itself is written atomically with a rotating backup and read back; a corrupt file produces a warning and is not overwritten by read-only commands.
 
 | Option | Effect |
 | --- | --- |
@@ -137,12 +139,12 @@ A removed **model** is recorded as a tombstone in `~/.config/provider-sync/state
 | `--apply` | Write the changes (default: report only). |
 | `--force` | Remove even though a reference would dangle, or when a Hermes match is ambiguous. |
 | `--keep-exclusions` | Keep the tombstones of a removed provider. |
-| `--purge-credentials` | Also drop the provider's keys from `~/.dsh/.credentials.yaml`. OpenCode's own stores are never touched. |
+| `--purge-credentials` | Also drop the provider's keys from `~/.dsh/.credentials.yaml` — only when no route in **any** dsh profile (or the settings/home-level document) still names the reference. OpenCode's own stores are never touched. |
 | `--target T` | `all` (default) \| `opencode` \| `hermes` \| `dsh`. |
 | `--profile NAME` | dsh profile (default `web`, else the only one). |
 | `--dry-run` | Report only; wins over `--apply`. |
 
-A model referenced elsewhere — OpenCode's top-level `model`/`small_model`, Hermes' `model.provider`/`model.default` or a provider's `default_model` — makes `remove` refuse unless `--force` is given, so nothing is left dangling without an explicit decision. Removing an absent provider/model is idempotent: it reports `nothing to remove` and exits 0.
+A model referenced elsewhere — OpenCode's top-level `model`/`small_model`, Hermes' `model.provider`/`model.default` or a provider's `default_model` — makes `remove` refuse unless `--force` is given, so nothing is left dangling without an explicit decision. dsh's managed `llm-pi-ai` providers block has no default-route field, so there is nothing there for provider-sync to check or rewrite. Removing an absent provider/model is idempotent: it reports `nothing to remove` and exits 0.
 
 ### `provider-sync restore <id> [--model M]… [--target T] [--dry-run]`
 
@@ -200,7 +202,7 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 | `~/.dsh/settings.yaml` (the dsh home is `$DSH_HOME`, tilde expanded, or `~/.dsh`) | the `llm-pi-ai` providers block of the pre-0.2 document. dsh imports this file into the active profile at its next boot and renames it `settings.yaml.imported`, so provider-sync writes here only while it exists (a re-created file is imported again). |
 | `~/.dsh/profiles/<name>/cordis.patch.yml` | the live provider state: `config.providers` of the `- id: llm-pi-ai` patch item. Default profile `web`; `--profile NAME` picks another; with no profile yet, `add` falls back to `settings.yaml`. Only the providers subtree is regenerated. |
 | `~/.dsh/.credentials.yaml` | dsh's credential store — written by `add --key`/`--key-env` (see [Keys](#keys)), mode `600`, values never printed. |
-| `~/.config/provider-sync/state.json` (override: `PS_STATE`) | model tombstones written by `remove` and cleared by `restore`; keeps `sync`/`add` from re-adding deliberately removed models. Never contains API keys. |
+| `~/.config/provider-sync/state.json` (override: `PS_STATE`) | model tombstones written by `remove` and cleared by `restore`; keeps `sync`/`add` from re-adding deliberately removed models. Written atomically with a rotating backup and read back; a corrupt file is reported, never silently discarded. Never contains API keys. |
 
 ## Per-harness behaviour
 
@@ -222,13 +224,15 @@ After every write the config is checked against [OpenCode's own schema](https://
 
 Only `context_length` is written per model — it is the only per-model field Hermes reads from config — and the file's own spelling and shape are preserved: a mapping stays a mapping, and a list stays a list (`- id: …` plus `context_length`). The top-level `model:` block is never touched.
 
-An entry written in **flow style** (`- {name: x, base_url: y}`, or a one-line entry in the mapping) is listed but never rewritten: the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip it and say so. The same holds for a comment inside an entry and for other shapes provider-sync cannot rewrite without guessing — each is reported as `skipped — <reason>`.
+An entry written in **flow style** (`- {name: x, base_url: y}`, or a one-line entry in the mapping) is listed but never rewritten: the surgical edits work on indented lines and cannot patch inside braces, so `sync` and `add` skip it and say so. The same holds for a comment inside an entry and for other shapes provider-sync cannot rewrite without guessing — each is reported as `skipped — <reason>`. `remove --model` follows the same rule: it reports the flow-style entry as skipped and records no tombstone, because hiding a model that is still visible in the file would be a false success. `add` does not append into a `providers:` mapping that still contains an entry it could not parse — it might duplicate a provider it cannot see — so it uses the legacy list when that one is clean, and otherwise refuses with the reason.
 
 ### DeepSeek Harness (`dsh`)
 
 **Where state lives.** The `llm-pi-ai` providers block of `~/.dsh/settings.yaml` while that file exists (the pre-0.2 document, which dsh imports at its next boot), otherwise the `config.providers` block of the `- id: llm-pi-ai` item in `~/.dsh/profiles/<profile>/cordis.patch.yml`. Only that subtree is regenerated — everything else in the file survives byte for byte.
 
-**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header; `api: google-generative-ai` uses Gemini's own `{base}/models` with `x-goog-api-key`, strips the `models/` prefix from ids and reads `inputTokenLimit` as the context window (embedding-only models are skipped). `add` detects an Anthropic- or Gemini-compatible endpoint when the OpenAI listing does not answer and writes the matching `api:` for that route. A Gemini endpoint is registered only in dsh — OpenCode and Hermes speak OpenAI-compatible HTTP, so they report a skip reason instead of receiving an entry that would fail every request. A route naming a protocol this build cannot serve is reported, never probed.
+**No default route.** The managed `llm-pi-ai` providers subtree has no default-route field. provider-sync never reads or rewrites dsh's default model/route selection, so a removal has no dsh default reference to check or dangle.
+
+**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header; `api: google-generative-ai` uses Gemini's own `{base}/models` with `x-goog-api-key`, strips the `models/` prefix from ids and reads `inputTokenLimit` as the context window (embedding-only models are skipped). `add` detects an Anthropic- or Gemini-compatible endpoint when the OpenAI listing does not answer and writes the matching `api:` for that route — whenever the selected targets include dsh (`all`, the default, or `--target dsh`); a run narrowed to OpenCode/Hermes does not probe dsh-only protocols. A Gemini endpoint is registered only in dsh — OpenCode and Hermes speak OpenAI-compatible HTTP, so they report a skip reason instead of receiving an entry that would fail every request. A route naming a protocol this build cannot serve is reported, never probed.
 
 **Context.** dsh's LLM layer defaults to a context window of 1,000,000 when a model entry does not pin one. provider-sync compares server-reported values against that effective default, so a model the server says is 1M is already in sync and no redundant `contextWindow` is written; server-reported context is still pinned when it differs.
 
@@ -253,11 +257,11 @@ Every line says which file, what changed, and — when something was skipped —
 
 ## Safety
 
-- Every write is atomic (temp file + `fsync` + `rename`) and preceded by a `.bak-provider-sync-*` backup; the last 3 per file are kept.
+- Every write — harness configs and the tombstone state file alike — is atomic (temp file + `fsync` + `rename`) and preceded by a `.bak-provider-sync-*` backup; the last 3 per file are kept. The state file is read back after writing, and a corrupt one produces a warning instead of being silently treated as empty.
 - The Hermes config and the dsh configs are re-read after writing and rolled back from the backup if they no longer parse or say what was intended; the OpenCode config is validated against its schema.
 - `migrate` deletes a legacy entry only after its native replacement is on disk and reads back correctly; on a mismatch the previous file content is restored.
 - `remove` without `--apply` writes nothing. Removed models are recorded as tombstones in a separate state file, so a later sync cannot silently resurrect them; `restore` is the explicit way back.
-- `~/.dsh/.credentials.yaml` is written owner-only (`600`) — dsh refuses to load a store others can read. `remove --purge-credentials` deletes a reference only when no other dsh route still uses it.
+- `~/.dsh/.credentials.yaml` is written owner-only (`600`) — dsh refuses to load a store others can read. `remove --purge-credentials` deletes a reference only when no route in any dsh profile (and no settings/home-level document) still uses it; if one of those files cannot be read, the credential is kept with a note.
 - Secrets are never printed; only where a key came from is.
 - Writing commands (`add`, `sync --apply`, `set-ctx`, `remove --apply`, `migrate --apply`) take an exclusive lock in the system temp directory keyed by the config directory, so two runs cannot interleave. Read-only commands never take it.
 - `--dry-run` never writes, in `add`, `sync`, `set-ctx`, `remove` and `migrate` alike, and wins over `--apply` on the same line.

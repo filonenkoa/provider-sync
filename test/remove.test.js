@@ -92,6 +92,94 @@ test("remove --apply deletes the provider from both OpenCode shapes and both Her
   assert.equal(existsSync(statePath(home)), false, "a provider tombstone is not needed");
 });
 
+test("remove keeps a section header when an unparsed item still follows it", () => {
+  // collapsing the header to `custom_providers: []` while an indented item
+  // remains writes invalid YAML; the unparsed item must keep the block form
+  const home = homeWith({
+    ".hermes/config.yaml": `custom_providers:
+  - name: good
+    base_url: http://good/v1
+    models:
+      m1: {}
+  - weird_key: 1
+    other: 2
+`,
+  });
+  const out = flat(runCli(home, ["remove", "good", "--target", "hermes", "--apply"]));
+  assert.match(out, /hermes\s+removed 1 entry/);
+  const h = read(home, ".hermes/config.yaml");
+  assert.doesNotMatch(h, /custom_providers: \[\]/);
+  assert.match(h, /custom_providers:\n {2}- weird_key: 1\n {4}other: 2/);
+});
+
+test("remove still removes a parsed providers entry when a sibling is unparseable", () => {
+  const home = homeWith({
+    ".hermes/config.yaml": `providers:
+  good:
+    api: http://good/v1
+    default_model: m1
+    models:
+      - m1
+  bad:
+    api: http://bad/v1
+    models: {x: 1}
+`,
+  });
+  const out = flat(runCli(home, ["remove", "good", "--target", "hermes", "--apply"]));
+  assert.match(out, /hermes\s+removed 1 entry/);
+  const h = read(home, ".hermes/config.yaml");
+  assert.doesNotMatch(h, /^ {2}good:/m);
+  assert.match(h, /^ {2}bad:\n {4}api: http:\/\/bad\/v1\n {4}models: \{x: 1\}/m);
+});
+
+test("remove refuses an unparseable requested entry instead of claiming success", () => {
+  const home = homeWith({
+    ".hermes/config.yaml": `providers:
+  bad:
+    api: http://bad/v1
+    models: {x: 1}
+`,
+  });
+  const before = read(home, ".hermes/config.yaml");
+  const bad = runFail(home, ["remove", "bad", "--target", "hermes", "--apply"]);
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.out, /hermes.*entry "bad" skipped — .*inline value/);
+  assert.equal(read(home, ".hermes/config.yaml"), before, "nothing was written");
+});
+
+test("remove --model skips a flow-style Hermes entry and records no tombstone", () => {
+  const line = `  - {name: Flow, base_url: "${url}", model: m1, models: {m1: {}, m2: {}}}`;
+  const home = homeWith({ ".hermes/config.yaml": `custom_providers:\n${line}\n` });
+  const before = read(home, ".hermes/config.yaml");
+  const out = flat(runCli(home, ["remove", "Flow", "--model", "m2", "--target", "hermes", "--apply"]));
+  assert.match(out, /hermes .*entry "Flow" skipped — .*flow-style/);
+  assert.equal(read(home, ".hermes/config.yaml"), before, "the flow line is untouched");
+  assert.equal(existsSync(statePath(home)), false, "a skipped removal must not tombstone the model");
+});
+
+test("remove follows the provider's server into the other Hermes surface", () => {
+  const home = homeWith({
+    ".hermes/config.yaml": `providers:
+  dropme:
+    api: ${url}
+    default_model: m1
+    models:
+      - m1
+custom_providers:
+  - name: Friendly
+    base_url: ${url}
+    model: m1
+    models:
+      m1: {}
+`,
+  });
+  const out = flat(runCli(home, ["remove", "dropme", "--target", "hermes", "--apply"]));
+  assert.match(out, /hermes\s+removed 2 entries/);
+  const h = read(home, ".hermes/config.yaml");
+  assert.doesNotMatch(h, /dropme/);
+  assert.doesNotMatch(h, /Friendly/);
+});
+
 test("remove without --apply writes nothing", () => {
   const home = homeWith({ ".config/opencode/opencode.jsonc": OC(), ".hermes/config.yaml": HERMES() });
   const beforeOc = read(home, ".config/opencode/opencode.jsonc");
@@ -282,6 +370,27 @@ test("--purge-credentials keeps a ref another route still names", () => {
   const out = flat(runCli(home, ["remove", "dropme", "--apply", "--purge-credentials"]));
   assert.match(out, /SHARED_API_KEY still used/);
   assert.match(read(home, STORE), /SHARED_API_KEY: sk-shared/);
+});
+
+test("--purge-credentials keeps a ref another dsh profile still names", () => {
+  const other = ".dsh/profiles/other/cordis.patch.yml";
+  const home = homeWith({
+    [WEB]: DSH_PATCH(),
+    [other]: `- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      other:
+        api: openai-completions
+        baseURL: http://other/v1
+        apiKeyEnv: DROP_API_KEY
+        models: []
+`,
+    [STORE]: "version: 1\nrefs:\n  SHARED_API_KEY: sk-shared\n  DROP_API_KEY: sk-drop\n",
+  });
+  const out = flat(runCli(home, ["remove", "dropme", "--target", "dsh", "--apply", "--purge-credentials"]));
+  assert.match(out, /DROP_API_KEY still used/);
+  assert.match(read(home, STORE), /DROP_API_KEY: sk-drop/, "another profile still needs it");
 });
 
 test("remove --target dsh without a dsh home is skipped, not an error", () => {

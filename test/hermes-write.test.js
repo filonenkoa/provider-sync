@@ -112,6 +112,22 @@ test("refuses to append next to list items it does not understand", () => {
   assert.equal(read(), before);
 });
 
+test("does not rewrite a disabled entry", () => {
+  write(`providers:
+  off:
+    api: http://10.0.0.12:64980/v1
+    enabled: false
+    default_model: old
+    models:
+      - old
+`);
+  const before = read();
+  const r = hermesUpsert({ name: "Off", base: "http://10.0.0.12:64980/v1", key: "new-key", model: "tiny", models: MODELS, dryRun: false });
+  assert.equal(r.status, "disabled");
+  assert.match(r.why, /disabled/);
+  assert.equal(read(), before, "the disabled entry is byte-identical");
+});
+
 test("reports a missing hermes install instead of failing", () => {
   rmSync(HERMES_CFG);
   const r = hermesUpsert({ name: "X", base: "http://10.0.0.4:1/v1", key: null, model: null, models: MODELS, dryRun: false });
@@ -170,7 +186,7 @@ test("an entry written on one line in the mapping is refused, not split", () => 
   const doc = "providers:\n  h1: {name: x, base_url: 'http://10.0.0.13:64980/v1'}\n";
   write(doc);
   const r = hermesUpsert({ name: "x", base: "http://10.0.0.13:64980/v1", key: "k", model: null, models: MODELS, dryRun: false });
-  assert.equal(r.status, "layout");
+  assert.equal(r.status, "unparsed");
   assert.match(r.why, /written on one line/);
   assert.equal(read(), doc, "the file is byte-identical");
 });

@@ -221,6 +221,22 @@ test("add --key-env stores the reference in opencode and key_env in hermes", asy
   assert.doesNotMatch(again, /AUTH 401/);
 });
 
+test("--key-env replaces an existing literal key instead of ignoring the flag", async () => {
+  const home = homeWith({
+    ".config/opencode/opencode.jsonc": OC_CFG("mm", "SECRET"),
+    ".hermes/config.yaml": HERMES().replace("api_key: dummy", "api_key: SECRET"),
+  });
+  const out = flat(await runCliAsyncP(home, ["add", "mm", url, "--key-env", "PS_REPLACE_KEY"], { PS_REPLACE_KEY: "SECRET" }));
+  assert.match(out, /provider "mm"/);
+  const cfg = JSON.parse(readFileSync(inHome(home, ".config/opencode/opencode.jsonc"), "utf8"));
+  assert.equal(cfg.provider.mm.options.apiKey, "{env:PS_REPLACE_KEY}");
+  assert.doesNotMatch(JSON.stringify(cfg), /SECRET/, "the literal secret is gone");
+  const yaml = readFileSync(inHome(home, ".hermes/config.yaml"), "utf8");
+  assert.match(yaml, /key_env: PS_REPLACE_KEY/);
+  assert.match(yaml, /api_key: dummy/);
+  assert.doesNotMatch(yaml, /SECRET/);
+});
+
 test("--key-env with a value that is not a variable name is refused", async () => {
   const home = homeWith({ ".config/opencode/opencode.jsonc": '{\n  "provider": {}\n}\n' });
   await assert.rejects(

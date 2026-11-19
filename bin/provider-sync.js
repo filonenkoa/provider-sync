@@ -334,15 +334,53 @@ function saveJson(file, obj) {
   }
   atomicWrite(file, JSON.stringify(obj, null, 2) + "\n");
 }
-// tombstones: read is forgiving (a broken state file must not block syncing),
-// write is atomic and leaves the harness configs untouched
+// tombstones: read is forgiving (a broken state file must not block syncing)
+// but never silent — losing them brings deliberately removed models back
+let stateWarned = false;
 function readState() {
   if (!existsSync(STATE_FILE)) return emptyState();
-  try { return normalizeState(readFileSync(STATE_FILE, "utf8")); }
-  catch { return emptyState(); }
+  let text;
+  try { text = readFileSync(STATE_FILE, "utf8"); }
+  catch (e) {
+    if (!stateWarned) {
+      stateWarned = true;
+      console.error(`warning: cannot read ${disp(STATE_FILE)} (${e.message}) — treating it as empty; removed models may come back`);
+    }
+    return emptyState();
+  }
+  try {
+    const raw = JSON.parse(text);
+    if (!raw || typeof raw !== "object" || !Array.isArray(raw.excluded))
+      throw new Error("expected an object with an excluded array");
+    return normalizeState(raw);
+  } catch (e) {
+    if (!stateWarned) {
+      stateWarned = true;
+      console.error(`warning: ${disp(STATE_FILE)} is not valid JSON state (${e.message}) — treating it as empty; removed models may come back. Fix or delete the file.`);
+    }
+    return emptyState();
+  }
 }
+// same safety as a harness config: rotating backup, atomic write, read-back
 function writeState(state) {
-  atomicWrite(STATE_FILE, JSON.stringify(normalizeState(state), null, 2) + "\n");
+  const text = JSON.stringify(normalizeState(state), null, 2) + "\n";
+  let bak = null;
+  if (existsSync(STATE_FILE)) {
+    bak = STATE_FILE + ".bak-provider-sync-" + stamp();
+    try {
+      copyFileSync(STATE_FILE, bak);
+      try { pruneBackups(STATE_FILE); } catch {}
+    } catch (e) {
+      throw new Error(`cannot back up ${disp(STATE_FILE)}: ${e.message}`);
+    }
+  }
+  atomicWrite(STATE_FILE, text);
+  let back = null;
+  try { back = readFileSync(STATE_FILE, "utf8"); } catch {}
+  if (back !== text) {
+    if (bak) { try { copyFileSync(bak, STATE_FILE); } catch {} }
+    throw new Error(`cannot verify ${disp(STATE_FILE)}: the file did not read back as written${bak ? ` — restored from ${path.basename(bak)}` : ""}`);
+  }
 }
 export const saveCfg = (c) => {
   if (cfgStore.hadComments && !cfgStore.warnedComments) {
@@ -1198,9 +1236,13 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
   // ~/.hermes/.env, so an env reference is translated instead of copied
   const ref = envRef(key);
   const matches = h.entries.filter((e) => normUrl(e.base_url) === normUrl(base));
-  const writable = matches.filter((e) => !e.flow);
-  if (matches.length && !writable.length)
+  const writable = matches.filter((e) => !e.flow && e.enabled !== false);
+  if (matches.length && !writable.length) {
+    const disabled = matches.find((e) => e.enabled === false);
+    if (disabled)
+      return { status: "disabled", why: `the entry for ${base} is disabled (enabled: false) — provider-sync never writes a disabled entry` };
     return { status: "flow", why: `the entry for ${base} is written in flow style on one line — provider-sync will not rewrite it` };
+  }
   if (writable.length) {
     const found = writable[0];
     const form = found.section === "providers" ? "dict" : "list";
@@ -1229,10 +1271,17 @@ export function hermesUpsert({ name, base, key, keyName, model, models, dryRun }
   // nothing matched: create in the v12+ mapping when it exists (that is the
   // surface that survives Hermes' own migration), else in the legacy list,
   // else create the mapping.
-  const dictDoc = h.docs.find((d) => d.form === "dict" && !d.error);
+  const dictDoc = h.docs.find((d) => d.form === "dict" && !d.error && !d.unparsed);
   const listDoc = h.docs.find((d) => d.form === "list" && !d.error);
   const target = dictDoc ? "dict" : listDoc ? "list" : h.docs.length ? null : "dict";
-  if (!target) return { status: "layout", why: h.docs.find((d) => d.error)?.error || "no usable provider section" };
+  if (!target) {
+    const broken = h.docs.find((d) => d.error);
+    const partial = h.docs.find((d) => d.unparsed);
+    return {
+      status: partial && !broken ? "unparsed" : "layout",
+      why: broken?.error || partial?.unparsedEntries?.[0]?.note || "no usable provider section",
+    };
+  }
   if (dryRun) return { status: "created", name, n, form: target };
   const created = target === "list"
     ? hermesUpsertList({ ...listDoc, lines: h.lines, eol: h.eol }, { name, base, key, ref, model, models })
@@ -1432,6 +1481,29 @@ function dshHomeOverride() {
   if (p.error) return { file: DSH_HOME_PATCH, why: `cannot read ${disp(DSH_HOME_PATCH)} (${p.error})` };
   if (p.present) return { file: DSH_HOME_PATCH, why: `${disp(DSH_HOME_PATCH)} targets llm-pi-ai too, and a home-level patch wins over the profile's` };
   return null;
+}
+
+// every apiKeyEnv a dsh profile still names. The credential store is shared by
+// all profiles, so deleting a ref after removing a route from one profile can
+// break another one. Unreadable files are reported and treated as "may use it".
+function dshProfileRefs() {
+  const refs = new Set();
+  const errors = [];
+  const scan = (file, parse, label) => {
+    if (!existsSync(file)) return;
+    try {
+      const parsed = parse(readFileSync(file, "utf8"));
+      if (parsed.error) { errors.push(`${label} (${parsed.error})`); return; }
+      for (const p of Object.values(parsed.providers || {}))
+        if (p && typeof p.apiKeyEnv === "string" && p.apiKeyEnv) refs.add(p.apiKeyEnv);
+    } catch (e) {
+      errors.push(`${label} (${e.message})`);
+    }
+  };
+  scan(DSH_SETTINGS, parseDshSettings, disp(DSH_SETTINGS));
+  for (const name of dshProfiles()) scan(dshPatchPath(name), parseDshPatch, disp(dshPatchPath(name)));
+  scan(DSH_HOME_PATCH, parseDshPatch, disp(DSH_HOME_PATCH));
+  return { refs, errors };
 }
 
 function dshNotes(st) {
@@ -2199,6 +2271,7 @@ function cmdList() {
           if (d.error) { console.log(`${pad}note: ${d.error}`); continue; }
           if (!d.entries.length) {
             console.log(`${pad}${d.section} present but no entries parsed${d.unparsed ? ` (${d.unparsed} item(s) in an unexpected layout)` : ""} — skipped`);
+            for (const u of d.unparsedEntries || []) console.log(`${pad}note: ${u.note}`);
             continue;
           }
           // partial coverage must be visible: those entries are listed nowhere
@@ -2257,17 +2330,23 @@ async function cmdAdd(id, url) {
   const ctxFlag = numFlag(flags.ctx);
   const storedCfg = existsSync(CFG) ? loadCfg() : null;
   const storedKey = configApiKey(storedCfg, id); // raw: may be a {env:VAR} reference
-  let key = flags.key || storedKey || a[id]?.key || null; // the key to keep/store
-  // probe with the literal --key, the stored key with {env:VAR} resolved from
-  // this environment, or the value --key-env names when it is set here
-  const probeKey = derefKey(key) || (keyEnv ? derefKey(`{env:${keyEnv}}`) : null);
+  // --key-env is an instruction to write that reference, not a probe hint: it
+  // must replace an existing literal key. The old key is only used to probe
+  // when the named variable is unset here.
+  let key = flags.key || (keyEnv ? `{env:${keyEnv}}` : storedKey || a[id]?.key || null);
+  const probeKey = flags.key ? derefKey(flags.key)
+    : (keyEnv ? derefKey(`{env:${keyEnv}}`) : null) || derefKey(storedKey) || derefKey(a[id]?.key) || null;
   let pr = await probeCached(base, probeKey);
   // an Anthropic-compatible endpoint answers neither the OpenAI listing (it
   // wants x-api-key and a version header) nor a bearer probe — it refuses both —
   // and dsh can serve it, so try the protocol dsh would name for it before
   // reporting the server unreachable or its key rejected
   let dshApi = "openai-completions";
-  if ((pr.kind === "offline" || pr.kind === "auth") && (flags.target === "dsh" || !flags.target)) {
+  // `all` is the default intent and includes dsh, so it must probe the dsh-only
+  // protocols just like an explicit --target dsh (only --no-hermes or an
+  // OpenCode/Hermes-only target skips dsh)
+  const wantsDshProbe = !flags["no-hermes"] && (!flags.target || flags.target === "all" || flags.target === "dsh");
+  if ((pr.kind === "offline" || pr.kind === "auth") && wantsDshProbe) {
     const alt = await probeDsh(base, "anthropic-messages", probeKey);
     if (alt.kind === "anthropic") {
       pr = alt;
@@ -2278,7 +2357,7 @@ async function cmdAdd(id, url) {
   // and last, Gemini: its listing has its own path (/v1beta/models), auth header
   // and model naming. A route registered with the OpenAI protocol would 404 on
   // every listing, so the protocol is part of the registration.
-  if ((pr.kind === "offline" || pr.kind === "auth") && (flags.target === "dsh" || !flags.target)) {
+  if ((pr.kind === "offline" || pr.kind === "auth") && wantsDshProbe) {
     for (const cand of geminiCandidates(url)) {
       const alt = await probeDsh(cand, "google-generative-ai", probeKey);
       if (alt.kind !== "gemini" && alt.kind !== "auth") continue;
@@ -2292,8 +2371,8 @@ async function cmdAdd(id, url) {
   if (pr.kind === "offline") die(`cannot reach ${base}: ${pr.error || "HTTP " + pr.status}`);
   if (pr.kind === "auth")
     die(probeKey ? `${base} rejected the supplied key (HTTP 401) — check the server's api key, nothing was written`
-        : key ? `${base} requires auth — the stored key is ${key}, which is not set in this environment; export it or pass --key K`
         : keyEnv ? `${base} requires auth — --key-env ${keyEnv} is not set in this environment; export it or pass --key K`
+        : key ? `${base} requires auth — the stored key is ${key}, which is not set in this environment; export it or pass --key K`
         : `${base} requires auth — pass --key K (or --username U --password P for Unsloth UI)`);
   let runKey = probeKey; // credential used for this run's requests
   // the pair is never a silent no-op: when it cannot be used, the report says why
@@ -2428,7 +2507,7 @@ async function cmdAdd(id, url) {
   };
   const hermesLine = (r, verb) => {
     if (!wantH) return `skipped — ${hWhy}`;
-    if (["absent", "no-section", "unparsed", "layout", "flow", "error"].includes(r.status)) return `skipped — ${r.why}`;
+    if (["absent", "no-section", "unparsed", "layout", "flow", "disabled", "error"].includes(r.status)) return `skipped — ${r.why}`;
     // name the section that was actually edited, not a fixed one
     const section = r.form === "dict" ? "providers" : "custom_providers";
     return `${section} "${r.name}" ${verb}${r.status} (${r.n} models, model: ${hmodel || "-"})`;
@@ -2515,16 +2594,30 @@ function opencodeBases(cfg, id) {
   return out;
 }
 
-// Hermes entries for a removal: match the id/key/name first. Only when that
-// finds nothing do we fall back to the server URL, because several providers
-// can legitimately share one endpoint. More than one base match is ambiguous
-// and needs --force.
+// Hermes entries for a removal: match the id/key/name, then follow those
+// matches to every entry pointing at the same server, because Hermes reads both
+// surfaces and a removal must not leave a second copy behind under another name.
+// A pure base-URL match with several hits is ambiguous and needs --force.
 function hermesMatches(h, id, bases) {
   const direct = h.entries.filter((e) =>
     e.key === id || e.name === id || (/^https?:\/\//i.test(id) && normUrl(e.base_url) === normUrl(id)));
-  if (direct.length) return { entries: direct, byBase: false };
   const wanted = new Set([...bases].map(normUrl));
-  return { entries: h.entries.filter((e) => e.base_url && wanted.has(normUrl(e.base_url))), byBase: true };
+  if (!direct.length) {
+    const byBase = h.entries.filter((e) => e.base_url && wanted.has(normUrl(e.base_url)));
+    return { entries: byBase, byBase: true, baseMatches: byBase };
+  }
+  // follow a direct match to the *other* surface: entries on the same surface
+  // may legitimately be separate providers sharing one endpoint, but Hermes
+  // merges the two surfaces, so the same server under another name there is the
+  // same provider and would otherwise survive the removal.
+  const directSections = new Set(direct.map((e) => e.section));
+  const directBases = new Set(direct.map((e) => normUrl(e.base_url)).filter(Boolean));
+  const byBase = h.entries.filter((e) =>
+    !direct.includes(e) &&
+    !directSections.has(e.section) &&
+    e.base_url &&
+    (directBases.has(normUrl(e.base_url)) || wanted.has(normUrl(e.base_url))));
+  return { entries: [...direct, ...byBase], byBase: false, baseMatches: byBase };
 }
 
 // the top-level `model:` block Hermes routes with; provider-sync never edits it
@@ -2608,6 +2701,15 @@ function cmdRemove(id) {
   const ocBases = opencodeBases(cfg, id);
   const bases = new Set(ocBases);
   const hm = h ? hermesMatches(h, id, bases) : { entries: [], byBase: false };
+  // a `providers:` entry the parser could not read is not silently absent: the
+  // user asked to remove this id, and pretending it does not exist would be a
+  // false success. It stays untouched and is reported (exit non-zero).
+  const badHermes = h
+    ? h.docs.flatMap((d) => (d.unparsedEntries || []).map((u) => ({ ...u, section: d.section })))
+        .filter((u) => u.key === id)
+    : [];
+  const flowModelEntries = models.length ? hm.entries.filter((e) => e.flow) : [];
+  const hFlowBlocked = flowModelEntries.length > 0;
   if (hm.byBase && hm.entries.length > 1 && !force)
     die(`${id} is not a Hermes entry name, and ${hm.entries.length} Hermes entries point at ${[...bases].join(", ")} — name the provider or pass --force`);
   for (const e of hm.entries) if (e.base_url) bases.add(e.base_url);
@@ -2640,7 +2742,7 @@ function cmdRemove(id) {
   // ---- stage Hermes (both surfaces, bottom-up) ----
   let hChanged = 0, hRemovedEntries = 0;
   let hLines = null;
-  if (haveH && hm.entries.length) {
+  if (haveH && hm.entries.length && !hFlowBlocked) {
     hLines = h.lines.slice();
     if (models.length) {
       for (const e of [...hm.entries].sort((a, b) => b.idx - a.idx)) {
@@ -2660,6 +2762,10 @@ function cmdRemove(id) {
       // a section with no entries left becomes the empty literal, not YAML null
       const removed = new Set(hm.entries);
       for (const d of h.docs) {
+        // an inline `[]`/`{}` is only valid when nothing indented follows it.
+        // Unparsed items are still body lines: collapsing the header would
+        // leave them dangling under an inline empty scalar (invalid YAML).
+        if (d.unparsed) continue;
         if (!d.entries.length || !d.entries.every((e) => removed.has(e))) continue;
         const re = d.section === "providers" ? /^providers:(\s*\{\})?\s*$/ : /^custom_providers:(\s*\[\])?\s*$/;
         const hi = hLines.findIndex((l) => re.test(l));
@@ -2709,8 +2815,9 @@ function cmdRemove(id) {
   const dUnit = models.length ? `${dChanged} model(s)` : `${dChanged} entr${dChanged === 1 ? "y" : "ies"}`;
   console.log(`remove ${id}${models.length ? ` --model ${models.join(", ")}` : ""}:`);
   console.log(`  opencode  ${disp(CFG)}  ${ocChanged ? `${ocUnit} would be removed` : "nothing to remove"}`);
-  console.log(`  hermes    ${disp(HERMES_CFG)}  ${hChanged ? `${hUnit} would be removed` : "nothing to remove"}`);
+  console.log(`  hermes    ${disp(HERMES_CFG)}  ${hChanged ? `${hUnit} would be removed` : hFlowBlocked ? `entry ${flowModelEntries.map((e) => `"${e.name}"`).join(", ")} skipped — a flow-style entry (one line in braces) cannot have its models rewritten` : badHermes.length ? `entry ${badHermes.map((u) => `"${u.key}"`).join(", ")} skipped — ${badHermes[0].note}` : "nothing to remove"}`);
   console.log(`  dsh       ${disp(DSH_HOME)}  ${dChanged ? `${dUnit} would be removed` : dPlan.note ? `nothing to remove (${dPlan.note})` : "nothing to remove"}`);
+  if (badHermes.length) process.exitCode = 1;
   if (!apply) { console.log("nothing written — re-run with --apply to write"); return; }
 
   // ---- write, with rollback of every file if a later write fails ----
@@ -2718,7 +2825,7 @@ function cmdRemove(id) {
   const remember = (f) => { if (!originals.has(f)) originals.set(f, readFileSync(f, "utf8")); };
   const targets = [];
   if (haveOc) targets.push({ target: "opencode", base: [...ocBases][0] || null });
-  if (haveH) targets.push({ target: "hermes", base: hm.entries.find((e) => e.base_url)?.base_url || [...bases][0] || null });
+  if (haveH && !hFlowBlocked) targets.push({ target: "hermes", base: hm.entries.find((e) => e.base_url)?.base_url || [...bases][0] || null });
   if (haveD && dPlan.providers) targets.push({ target: "dsh", base: dPlan.base });
   let purged = { removed: [], kept: [] };
   try {
@@ -2752,6 +2859,14 @@ function cmdRemove(id) {
           for (const [k, rec] of store.records)
             if (k !== `${DSH_RECORD_SCOPE}/${id}`) for (const n of rec.env || []) keepRefs.add(n);
         } catch { /* an unreadable store is reported, never guessed at */ }
+      }
+      // the store is shared by every profile: a ref another profile names is
+      // still in use even when the profile being edited no longer mentions it
+      const otherProfiles = dshProfileRefs();
+      for (const r of otherProfiles.refs) keepRefs.add(r);
+      if (otherProfiles.errors.length) {
+        for (const r of refsToDrop) keepRefs.add(r);
+        console.error(`note: cannot read ${otherProfiles.errors.join("; ")} — keeping credentials that may be in use`);
       }
       purged = dshStorePurge({ refs: refsToDrop, records: recsToDrop, keepRefs });
     }

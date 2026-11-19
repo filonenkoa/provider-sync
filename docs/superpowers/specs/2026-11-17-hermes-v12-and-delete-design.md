@@ -103,7 +103,7 @@ provider-sync restore <id> [--model M]... [--target ...]
 - По умолчанию — только отчёт. `--apply` пишет. `--dry-run` всегда выигрывает.
 - `--target` — как у `add`.
 - `--force` — разрешить удаление при ссылке из default-модели.
-- `--purge-credentials` — удалить credential-запись dsh, если она не используется другими route.
+- `--purge-credentials` — удалить credential-запись dsh, если она не используется route ни в одном профиле (и в settings/home-level документе).
 - `--keep-exclusions` — при удалении провайдера сохранить его tombstones.
 
 Tombstones хранятся в `~/.config/provider-sync/state.json` (override `PS_STATE` для тестов):
@@ -135,7 +135,7 @@ Tombstones хранятся в `~/.config/provider-sync/state.json` (override `P
 | --- | --- |
 | OpenCode | удалить `provider.<id>` и `providers.<id>`, если есть оба; убрать id из `disabled_providers` |
 | Hermes | удалить запись из обеих поверхностей по id/base URL; при неоднозначности — ошибка без `--force` |
-| dsh | удалить `providers.<id>`; при `--purge-credentials` — store-запись, если ref не используется другими route |
+| dsh | удалить `providers.<id>`; при `--purge-credentials` — store-запись, если ref не используется route ни в одном профиле |
 
 Удаление модели:
 
@@ -149,7 +149,7 @@ Default-ссылки:
 
 - Hermes: `model.default`, `model.provider`, `fallback_providers`;
 - OpenCode: top-level `model`, `small_model`;
-- dsh: default-route, если присутствует.
+- dsh: в управляемом subtree `llm-pi-ai` (`config.providers`) поля default-route нет. provider-sync читает и переписывает только этот subtree, поэтому проверять нечего; выбор default-модели/route, если dsh хранит его вне subtree, не читается и не переписывается.
 
 Если ссылка указывает на удаляемое — отказ без `--force`. С `--force` — предупреждение, default не переписывается.
 
@@ -157,7 +157,7 @@ Credentials:
 
 - OpenCode: ключ в entry удаляется вместе с entry; `auth.json`/`opencode.db` не трогаются, выводится подсказка.
 - Hermes: литеральный `api_key` уходит с entry; `key_env`/`.env` не трогаются, выводится подсказка.
-- dsh: `--purge-credentials` удаляет store-запись только если ref не используется другими route; иначе сообщение.
+- dsh: `--purge-credentials` удаляет store-запись только если ref не используется route ни в одном профиле (и в settings/home-level документе); иначе сообщение.
 
 Атомарность:
 
@@ -175,6 +175,7 @@ Credentials:
 - Probe Gemini: `GET {base}/models` с `x-goog-api-key` (или `?key=`), ответ `{ models: [{ name, inputTokenLimit, supportedGenerationMethods }] }`.
 - Имя `models/gemini-...` нормализуется в `gemini-...`.
 - `add` пробует Gemini, если OpenAI/Anthropic не ответили, и пишет `api: google-generative-ai`.
+- Default-route в `llm-pi-ai` providers отсутствует: `remove` не проверяет default-ссылку dsh, потому что управляемый документ её не содержит.
 
 ### 2.4. OpenCode 2.x
 
@@ -206,9 +207,10 @@ provider-sync migrate --target opencode [--apply] [--dry-run]
 
 ## 4. Тестирование
 
-- Hermes: канонический v12 (`api`, `default_model`, `models` списком), обе поверхности, `enabled: false`, неизвестное поле в одной записи, `add --model`, запись в v12-диалекте.
-- Удаление: provider/model во всех harness'ах, tombstones, `sync` не возвращает, `restore`, dry-run, backup, default-ref, credentials, partial failure.
-- dsh: default 1M, Gemini probe, удаление модели.
+- Hermes: канонический v12 (`api`, `default_model`, `models` списком), обе поверхности, `enabled: false`, неизвестное поле в одной записи, `add --model`, запись в v12-диалекте; одна нераспознанная запись не скрывает остальные.
+- Удаление: provider/model во всех harness'ах, tombstones, `sync` не возвращает, `restore`, dry-run, backup, default-ref, credentials, partial failure; flow-style запись пропускается без tombstone; запрошенная нераспознанная запись — отказ, не «nothing to remove»; поиск по base URL доходит до второй поверхности Hermes; `--purge-credentials` учитывает все dsh-профили.
+- dsh: default 1M, Gemini probe, удаление модели, `--target all` запускает Anthropic/Gemini fallback.
+- State: backup и read-back при записи, предупреждение о повреждённом файле.
 - OpenCode: legacy/native удаление, migrate, `releaseDate`.
 - Регрессия: весь `npm test`.
 

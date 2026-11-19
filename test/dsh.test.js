@@ -464,6 +464,28 @@ const geminiServer = (models) => http.createServer((q, s) => {
 });
 const listen = (srv) => new Promise((r) => srv.listen(0, "127.0.0.1", r));
 
+test("add --target all detects an Anthropic endpoint and writes the dsh route", async () => {
+  const home = homeWith({ [WEB]: "# h\n[]\n" });
+  const out = flat(await runCliAsyncP(home, ["add", "anth", anthUrl, "--key", "sk-ant", "--target", "all"]));
+  assert.match(out, /note: the server answers the Anthropic Messages listing/);
+  assert.match(out, /provider "anth" created/);
+  assert.match(read(home, WEB), /api: anthropic-messages/);
+});
+
+test("add --target all detects a Gemini endpoint and writes the dsh route", async () => {
+  const gem = geminiServer([
+    { name: "models/gemini-x", inputTokenLimit: 123, supportedGenerationMethods: ["generateContent"] },
+  ]);
+  await listen(gem);
+  try {
+    const home = homeWith({ [WEB]: "# h\n[]\n" });
+    const gemUrl = `http://127.0.0.1:${gem.address().port}/v1beta`;
+    const out = flat(await runCliAsyncP(home, ["add", "gem", gemUrl, "--key", "sk-g", "--target", "all"]));
+    assert.match(out, /google-generative-ai/);
+    assert.match(read(home, WEB), /api: google-generative-ai/);
+  } finally { gem.close(); }
+});
+
 test("add detects a Gemini endpoint and writes api: google-generative-ai", async () => {
   const gem = geminiServer([
     { name: "models/gemini-x", inputTokenLimit: 123, supportedGenerationMethods: ["generateContent"] },

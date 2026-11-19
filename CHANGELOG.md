@@ -48,6 +48,15 @@ Format: [semver](https://semver.org). Dates are ISO.
   Hermes cannot serve the protocol.
 
 ### Fixed
+- **Hermes removal can no longer corrupt the config.** Removing the last parsed entry while an unparsed item still follows it keeps the section header in block form instead of collapsing it to `[]` over indented lines. A requested entry the parser cannot read is reported as a skip with a non-zero exit, never as `nothing to remove`.
+- **One unreadable `providers:` entry no longer hides its siblings.** `list`, `sync` and `remove` keep working on the parsed entries and report the unreadable one; `add` still refuses to append into a `providers:` mapping that contains one, because it might duplicate a provider it cannot see, and never rewrites an `enabled: false` entry.
+- **Flow-style Hermes entries are skipped for model removal** with the reason and **no tombstone**, instead of reporting a removal that did not happen and hiding the model from later syncs.
+- **Hermes removal follows the same server to the other surface**, so a provider registered there under a different name is removed too; a pure base-URL match remains ambiguous without `--force`.
+- **`add --target all` (and the default) runs the dsh Anthropic/Gemini fallback probes**, so an Anthropic- or Gemini-compatible server is registered in dsh instead of being reported as an OpenAI 404 (a run narrowed to OpenCode/Hermes still does not probe dsh-only protocols).
+- **`--purge-credentials` scans every dsh profile** (and the settings/home-level documents) before deleting a store reference, so another profile's key is not broken.
+- **The tombstone state file is written with a rotating backup and read back**, like a harness config; a corrupt file produces a warning that removed models may come back instead of being silently treated as empty.
+- **`--key-env` replaces an existing literal key** in OpenCode and Hermes; the old key is used only to probe while the named variable is unset here.
+- **dsh's managed `llm-pi-ai` providers subtree has no default-route field.** provider-sync does not read or rewrite dsh's default model/route selection, so `remove` does not claim to check a default reference that does not exist.
 - **OpenCode desktop/web no longer hides provider-sync's models.** A
   config-declared model without a release date reaches OpenCode 2.x clients as
   `time.released: 0`, which the desktop/web picker normalizes to `1970-01-01`

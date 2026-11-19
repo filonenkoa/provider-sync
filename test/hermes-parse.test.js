@@ -22,6 +22,29 @@ trailing_key:
   keep: me
 `;
 
+test("one unparseable providers entry does not hide the rest", () => {
+  const h = parseHermesConfig(`providers:
+  good:
+    api: http://good/v1
+    default_model: m1
+    models:
+      - id: m1
+        context_length: 4096
+  bad:
+    api: http://bad/v1
+    models: {x: 1}
+  later:
+    api: http://later/v1
+    models: []
+`);
+  const dict = h.docs.find((d) => d.form === "dict");
+  assert.equal(dict.error, null);
+  assert.deepEqual(dict.entries.map((e) => e.key), ["good", "later"]);
+  assert.equal(dict.unparsed, 1);
+  assert.equal(dict.unparsedEntries[0].key, "bad");
+  assert.match(dict.unparsedEntries[0].note, /inline value/);
+});
+
 test("parses a standard 2-space config", () => {
   const h = parseHermes(STD);
   assert.equal(h.entries.length, 1);
