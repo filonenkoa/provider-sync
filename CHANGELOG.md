@@ -48,6 +48,12 @@ Format: [semver](https://semver.org). Dates are ISO.
   Hermes cannot serve the protocol.
 
 ### Fixed
+- **`add --model` accepts one value.** A repeated flag used to reach Hermes as an array and land as `default_model: m1,m2`; it is now refused, with the repeatable form reserved for `remove`/`restore`.
+- **`remove --force` no longer repoints a Hermes `default_model`.** The reference the user forced past is left exactly as written and reported as dangling; silently picking a survivor changed the user's default.
+- **A failed dsh config write rolls the credential store back.** `add` stores the key before the config so a reference never dangles; if the config write then fails or does not verify, the previous store content (or its absence) is restored instead of leaving an orphan key.
+- **`restore` finds tombstones after a provider rename.** The state matcher already accepted a base URL; `restore` now resolves the current endpoints from OpenCode, Hermes and dsh, so `restore <new-id>` lifts what `remove <old-id>` recorded for the same server.
+- **`remove --dry-run --purge-credentials` reports the key plan.** It names the reference it would drop (and any kept because another route still uses it) without writing the store.
+- **Gemini probing honors the documented `?key=` fallback.** When a listing refuses `x-goog-api-key` with 401/403, the same listing is retried with the key as a query parameter.
 - **Hermes removal can no longer corrupt the config.** Removing the last parsed entry while an unparsed item still follows it keeps the section header in block form instead of collapsing it to `[]` over indented lines. A requested entry the parser cannot read is reported as a skip with a non-zero exit, never as `nothing to remove`.
 - **One unreadable `providers:` entry no longer hides its siblings.** `list`, `sync` and `remove` keep working on the parsed entries and report the unreadable one; `add` still refuses to append into a `providers:` mapping that contains one, because it might duplicate a provider it cannot see, and never rewrites an `enabled: false` entry.
 - **Flow-style Hermes entries are skipped for model removal** with the reason and **no tombstone**, instead of reporting a removal that did not happen and hiding the model from later syncs.

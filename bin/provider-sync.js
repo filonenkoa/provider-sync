@@ -915,7 +915,10 @@ export async function probeDsh(base, api, key) {
     // the Gemini listing authenticates with x-goog-api-key; `?key=` is the other
     // form the API accepts, so a server that only reads the query still answers
     const b = String(base).replace(/\/+$/, "");
-    const r = await req(dshListingUrl(b, api), { headers: key ? { "x-goog-api-key": key } : null });
+    const url = dshListingUrl(b, api);
+    let r = await req(url, { headers: key ? { "x-goog-api-key": key } : null });
+    if (key && (r.status === 401 || r.status === 403))
+      r = await req(url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key));
     if (r.status === 200 && r.json) {
       const models = dshReadGeminiListing(r.json);
       if (models.length) return { kind: "gemini", api, root: rootOf(b), base: b, specs: models };
@@ -1486,11 +1489,14 @@ function dshHomeOverride() {
 // every apiKeyEnv a dsh profile still names. The credential store is shared by
 // all profiles, so deleting a ref after removing a route from one profile can
 // break another one. Unreadable files are reported and treated as "may use it".
-function dshProfileRefs() {
+// `skip` is the file being edited: its surviving routes are already in the
+// caller's keep-set, and its pre-removal state must not make a dropped ref look
+// alive in a dry run.
+function dshProfileRefs({ skip = null } = {}) {
   const refs = new Set();
   const errors = [];
   const scan = (file, parse, label) => {
-    if (!existsSync(file)) return;
+    if (!existsSync(file) || (skip && path.resolve(file) === path.resolve(skip))) return;
     try {
       const parsed = parse(readFileSync(file, "utf8"));
       if (parsed.error) { errors.push(`${label} (${parsed.error})`); return; }
@@ -1588,7 +1594,7 @@ function dshKeyLabel(p, pid) {
 // deleting stored credentials is deliberately narrow: only refs and record
 // blocks this reader understands, never a value it cannot see, and never a ref
 // another route still names. Owner-only mode is preserved.
-function dshStorePurge({ refs = [], records = [], keepRefs = new Set() }) {
+function dshStorePurge({ refs = [], records = [], keepRefs = new Set(), dryRun = false }) {
   if (!existsSync(DSH_STORE)) return { removed: [], kept: [] };
   let out = readFileSync(DSH_STORE, "utf8");
   const removed = [], kept = [];
@@ -1601,7 +1607,7 @@ function dshStorePurge({ refs = [], records = [], keepRefs = new Set() }) {
     const res = deleteDshStoreRecord(out, r);
     if (res.removed) { out = res.text; removed.push(r); }
   }
-  if (!removed.length) return { removed, kept };
+  if (!removed.length || dryRun) return { removed, kept };
   const bak = DSH_STORE + ".bak-provider-sync-" + stamp();
   copyFileSync(DSH_STORE, bak);
   try { pruneBackups(DSH_STORE); } catch {}
@@ -1637,6 +1643,19 @@ function dshStoreSet(name, value) {
     throw new Error(`the key did not land in ${disp(DSH_STORE)} — provider-sync cannot claim it is stored`);
   }
   return existed ? path.basename(bak) : null;
+}
+
+// an add stores the key before the config (a ref must never dangle); when the
+// config write then fails, put the store back so the key does not outlive the
+// provider it was meant for
+function dshStoreRollback(before) {
+  if (before === null) {
+    if (existsSync(DSH_STORE)) unlinkSync(DSH_STORE);
+  } else {
+    atomicWrite(DSH_STORE, before, 0o600);
+  }
+  const after = existsSync(DSH_STORE) ? readFileSync(DSH_STORE, "utf8") : null;
+  if (after !== before) throw new Error(`${disp(DSH_STORE)} did not read back as it was`);
 }
 
 // re-read what was written and compare provider-by-provider; a mismatch means
@@ -1812,12 +1831,22 @@ export function dshUpsert({ id, name, base, api: apiFlag, keyRaw, keyFlag, keyEn
     note: [note, storeNote].filter(Boolean).join("; ") || null,
   };
   if (dryRun) return res;
+  let storeBefore = null, storeAttempted = false;
   try {
-    if (storeValue) dshStoreSet(ref, storeValue); // before the config: a ref must never dangle
+    if (storeValue) {
+      storeBefore = existsSync(DSH_STORE) ? readFileSync(DSH_STORE, "utf8") : null;
+      storeAttempted = true;
+      dshStoreSet(ref, storeValue); // before the config: a ref must never dangle
+    }
     const out = dshWrite(st, providers);
     writeDshFile(st.file, out.text, st.kind, providers);
   } catch (e) {
-    return { status: "error", why: e.message, pid, ref, file: st.file };
+    let why = e.message;
+    if (storeAttempted) {
+      try { dshStoreRollback(storeBefore); }
+      catch (re) { why += `; ${disp(DSH_STORE)} could not be rolled back: ${re.message}`; }
+    }
+    return { status: "error", why, pid, ref, file: st.file };
   }
   return res;
 }
@@ -2318,6 +2347,10 @@ async function cmdAdd(id, url) {
   const keyEnv = flags["key-env"];
   if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv))
     die(`--key-env needs an environment variable name, got "${keyEnv}"`);
+  // add writes one default model; remove/restore accept repeats. A repeated
+  // flag used to reach Hermes as an array and land as `default_model: m1,m2`.
+  if (Array.isArray(flags.model))
+    die("--model names one model for add; repeated --model is for remove/restore");
   // a note raised while probing (an Anthropic-compatible endpoint), reported
   // with the rest once the write path is known
   const notes0 = [];
@@ -2670,6 +2703,35 @@ function danglingRefs({ cfg, hermesText, hMatches, id, models, haveOc, haveH }) 
   return refs;
 }
 
+// the credentials a provider removal would purge, plus the refs a surviving
+// route still names. The dry-run report and the real purge share this, so the
+// two cannot disagree about what would be removed.
+function dshPurgeArgs({ id, dPlan }) {
+  const refs = [], records = [];
+  const keepRefs = new Set();
+  if (dPlan.entry && typeof dPlan.entry.apiKeyEnv === "string" && dPlan.entry.apiKeyEnv)
+    refs.push(dPlan.entry.apiKeyEnv);
+  if (/^[a-z][a-z0-9-]*$/.test(id)) records.push(`${DSH_RECORD_SCOPE}/${id}`);
+  for (const p of Object.values(dPlan.providers || {}))
+    if (p && typeof p === "object" && typeof p.apiKeyEnv === "string" && p.apiKeyEnv) keepRefs.add(p.apiKeyEnv);
+  if (existsSync(DSH_STORE)) {
+    try {
+      const store = parseDshStore(readFileSync(DSH_STORE, "utf8"));
+      for (const [k, rec] of store.records)
+        if (k !== `${DSH_RECORD_SCOPE}/${id}`) for (const n of rec.env || []) keepRefs.add(n);
+    } catch { /* an unreadable store is reported, never guessed at */ }
+  }
+  // the store is shared by every profile: a ref another profile names is
+  // still in use even when the profile being edited no longer mentions it
+  const otherProfiles = dshProfileRefs({ skip: dPlan.file });
+  for (const r of otherProfiles.refs) keepRefs.add(r);
+  if (otherProfiles.errors.length) {
+    for (const r of refs) keepRefs.add(r);
+    console.error(`note: cannot read ${otherProfiles.errors.join("; ")} — keeping credentials that may be in use`);
+  }
+  return { refs, records, keepRefs };
+}
+
 function cmdRemove(id) {
   const models = asList(flags.model).filter(Boolean);
   const target = flags.target || "all";
@@ -2750,9 +2812,6 @@ function cmdRemove(id) {
         if (kept.length === e.models.length) continue;
         hChanged += e.models.length - kept.length;
         hermesSetModels(hLines, e, kept);
-        // the entry's own default follows the surviving catalog
-        if (e.model && models.includes(e.model) && kept.length)
-          hermesSetField(hLines, e, e.modelField || (e.section === "providers" ? "default_model" : "model"), kept[0].id);
       }
     } else {
       const ranges = hm.entries.map((e) => [e.idx, e.end]).sort((a, b) => b[0] - a[0]);
@@ -2809,6 +2868,9 @@ function cmdRemove(id) {
     }
   }
 
+  // ---- purge plan (reported by dry-run, executed after the config writes) ----
+  const purgeArgs = haveD && dRemoved && flags["purge-credentials"] ? dshPurgeArgs({ id, dPlan }) : null;
+
   // ---- report the plan ----
   const ocUnit = models.length ? `${ocChanged} model(s)` : `${ocChanged} entr${ocChanged === 1 ? "y" : "ies"}`;
   const hUnit = models.length ? `${hChanged} model(s)` : `${hChanged} entr${hChanged === 1 ? "y" : "ies"}`;
@@ -2818,7 +2880,20 @@ function cmdRemove(id) {
   console.log(`  hermes    ${disp(HERMES_CFG)}  ${hChanged ? `${hUnit} would be removed` : hFlowBlocked ? `entry ${flowModelEntries.map((e) => `"${e.name}"`).join(", ")} skipped — a flow-style entry (one line in braces) cannot have its models rewritten` : badHermes.length ? `entry ${badHermes.map((u) => `"${u.key}"`).join(", ")} skipped — ${badHermes[0].note}` : "nothing to remove"}`);
   console.log(`  dsh       ${disp(DSH_HOME)}  ${dChanged ? `${dUnit} would be removed` : dPlan.note ? `nothing to remove (${dPlan.note})` : "nothing to remove"}`);
   if (badHermes.length) process.exitCode = 1;
-  if (!apply) { console.log("nothing written — re-run with --apply to write"); return; }
+  if (!apply) {
+    if (purgeArgs) {
+      try {
+        const plan = dshStorePurge({ ...purgeArgs, dryRun: true });
+        if (plan.removed.length) console.log(`  dsh-keys  would remove ${plan.removed.join(", ")} from ${disp(DSH_STORE)}`);
+        for (const r of plan.kept) console.log(`  dsh-keys  ${r} still used by another route — kept`);
+        if (!plan.removed.length && !plan.kept.length) console.log("  dsh-keys  nothing to purge");
+      } catch (e) {
+        console.log(`  dsh-keys  cannot plan the purge — ${e.message}`);
+      }
+    }
+    console.log("nothing written — re-run with --apply to write");
+    return;
+  }
 
   // ---- write, with rollback of every file if a later write fails ----
   const originals = new Map();
@@ -2845,31 +2920,7 @@ function cmdRemove(id) {
     }
     // keys go last and only for a provider removal the user asked to purge; a
     // ref any surviving route still names is kept even with --purge-credentials
-    if (haveD && dRemoved && flags["purge-credentials"]) {
-      const refsToDrop = [], recsToDrop = [];
-      const keepRefs = new Set();
-      if (dPlan.entry && typeof dPlan.entry.apiKeyEnv === "string" && dPlan.entry.apiKeyEnv)
-        refsToDrop.push(dPlan.entry.apiKeyEnv);
-      if (/^[a-z][a-z0-9-]*$/.test(id)) recsToDrop.push(`${DSH_RECORD_SCOPE}/${id}`);
-      for (const p of Object.values(dPlan.providers))
-        if (p && typeof p.apiKeyEnv === "string" && p.apiKeyEnv) keepRefs.add(p.apiKeyEnv);
-      if (existsSync(DSH_STORE)) {
-        try {
-          const store = parseDshStore(readFileSync(DSH_STORE, "utf8"));
-          for (const [k, rec] of store.records)
-            if (k !== `${DSH_RECORD_SCOPE}/${id}`) for (const n of rec.env || []) keepRefs.add(n);
-        } catch { /* an unreadable store is reported, never guessed at */ }
-      }
-      // the store is shared by every profile: a ref another profile names is
-      // still in use even when the profile being edited no longer mentions it
-      const otherProfiles = dshProfileRefs();
-      for (const r of otherProfiles.refs) keepRefs.add(r);
-      if (otherProfiles.errors.length) {
-        for (const r of refsToDrop) keepRefs.add(r);
-        console.error(`note: cannot read ${otherProfiles.errors.join("; ")} — keeping credentials that may be in use`);
-      }
-      purged = dshStorePurge({ refs: refsToDrop, records: recsToDrop, keepRefs });
-    }
+    if (purgeArgs) purged = dshStorePurge(purgeArgs);
     // tombstones last: they are what keeps the next sync honest
     let state = readState();
     const beforeState = JSON.stringify(state);
@@ -2897,6 +2948,41 @@ function cmdRemove(id) {
   console.log("done");
 }
 
+// read-only lookup of the server URLs each harness currently knows for an id.
+// restore uses them to find tombstones written under a former provider name:
+// the state matcher accepts either the provider id or the server URL.
+function restoreBases(id, targets) {
+  const out = new Map(targets.map((t) => [t, new Set()]));
+  let cfg = null;
+  if (out.has("opencode") && existsSync(CFG)) {
+    try {
+      const { text } = parseJsonc(readFileSync(CFG, "utf8"));
+      const p = JSON.parse(text);
+      if (p && typeof p === "object" && !Array.isArray(p)) cfg = p;
+    } catch { /* a config restore cannot read must not block the state-only command */ }
+  }
+  const ocBases = opencodeBases(cfg, id);
+  for (const b of ocBases) out.get("opencode").add(b);
+  let h = null;
+  if (out.has("hermes") && existsSync(HERMES_CFG)) {
+    try { h = hermesDocs(readFileSync(HERMES_CFG, "utf8")); } catch { /* same: state-only */ }
+  }
+  if (h) for (const e of hermesMatches(h, id, ocBases).entries)
+    if (e.base_url) out.get("hermes").add(e.base_url);
+  if (out.has("dsh") && existsSync(DSH_HOME)) {
+    try {
+      const st = dshState();
+      if (st.kind !== "empty" && !st.error) {
+        const wanted = new Set([...out.get("opencode"), ...out.get("hermes")].map(normUrl));
+        for (const [pid, p] of Object.entries(st.providers || {}))
+          if (p && typeof p === "object" && p.baseURL && (pid === id || wanted.has(normUrl(p.baseURL))))
+            out.get("dsh").add(p.baseURL);
+      }
+    } catch { /* same: state-only */ }
+  }
+  return out;
+}
+
 function cmdRestore(id) {
   const models = asList(flags.model).filter(Boolean);
   const target = flags.target || "all";
@@ -2909,10 +2995,14 @@ function cmdRestore(id) {
   const before = readState();
   let state = before;
   const found = [];
+  const bases = restoreBases(id, targets);
   for (const t of targets) {
+    const urls = bases.get(t);
     const n = hiddenCount(state, { target: t, provider: id });
-    if (!n) continue;
+    const byBase = [...urls].some((baseURL) => hiddenCount(state, { target: t, provider: id, baseURL }) > 0);
+    if (!n && !byBase) continue;
     state = restoreModels(state, { target: t, provider: id, models });
+    for (const baseURL of urls) state = restoreModels(state, { target: t, provider: id, baseURL, models });
     found.push(`${t}${models.length ? ` (${models.join(", ")})` : ""}`);
   }
   if (found.length && !flags["dry-run"]) writeState(state);

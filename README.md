@@ -97,7 +97,7 @@ Registers or updates one provider everywhere. Upsert: models missing on the serv
 | `--key K` | API key. Stored per harness (see [Keys](#keys)). |
 | `--key-env VAR` | Store a reference instead of the secret — `{env:VAR}` in OpenCode, `key_env:` in Hermes, `apiKeyEnv:` in dsh. In OpenCode and Hermes it replaces a literal key already written in the config; the old key is used only to probe while the named variable is unset here. Nothing secret is written. |
 | `--username U --password P` | Unsloth UI login: provider-sync signs in and creates a persistent API key named after `<id>`. Both flags are required together, and only an Unsloth UI server accepts them; anything unused is reported. |
-| `--model M` | Model written into the Hermes entry's `model:` field (default: the first the server reports). |
+| `--model M` | Model written into the Hermes entry's `model:` field (default: the first the server reports). Pass it once — repeated `--model` is for `remove`/`restore`. |
 | `--ctx N` | Context for models whose server reports none (`0` = write no limit). Without it, provider-sync asks in a terminal and shows a guess with `--dry-run`. |
 | `--output N` | Max output tokens written into new limits (default `65536`). |
 | `--target T` | `all` (default) \| `opencode` \| `hermes` \| `dsh` — only these are written. |
@@ -139,16 +139,16 @@ When Hermes cannot be rewritten, nothing is claimed: a model in a flow-style ent
 | `--apply` | Write the changes (default: report only). |
 | `--force` | Remove even though a reference would dangle, or when a Hermes match is ambiguous. |
 | `--keep-exclusions` | Keep the tombstones of a removed provider. |
-| `--purge-credentials` | Also drop the provider's keys from `~/.dsh/.credentials.yaml` — only when no route in **any** dsh profile (or the settings/home-level document) still names the reference. OpenCode's own stores are never touched. |
+| `--purge-credentials` | Also drop the provider's keys from `~/.dsh/.credentials.yaml` — only when no route in **any** dsh profile (or the settings/home-level document) still names the reference. OpenCode's own stores are never touched. `--dry-run` reports the keys it would drop. |
 | `--target T` | `all` (default) \| `opencode` \| `hermes` \| `dsh`. |
 | `--profile NAME` | dsh profile (default `web`, else the only one). |
 | `--dry-run` | Report only; wins over `--apply`. |
 
-A model referenced elsewhere — OpenCode's top-level `model`/`small_model`, Hermes' `model.provider`/`model.default` or a provider's `default_model` — makes `remove` refuse unless `--force` is given, so nothing is left dangling without an explicit decision. dsh's managed `llm-pi-ai` providers block has no default-route field, so there is nothing there for provider-sync to check or rewrite. Removing an absent provider/model is idempotent: it reports `nothing to remove` and exits 0.
+A model referenced elsewhere — OpenCode's top-level `model`/`small_model`, Hermes' `model.provider`/`model.default` or a provider's `default_model` — makes `remove` refuse unless `--force` is given, so nothing is left dangling without an explicit decision. With `--force` the reference is left exactly as written and the run says it will point at a missing provider; it is never silently repointed to another model. dsh's managed `llm-pi-ai` providers block has no default-route field, so there is nothing there for provider-sync to check or rewrite. Removing an absent provider/model is idempotent: it reports `nothing to remove` and exits 0.
 
 ### `provider-sync restore <id> [--model M]… [--target T] [--dry-run]`
 
-Lifts tombstones written by `remove`, so the next `sync --apply` re-adds the models the server still reports. Without `--model`, every tombstone of that provider is lifted. It writes only the state file — no harness config is touched.
+Lifts tombstones written by `remove`, so the next `sync --apply` re-adds the models the server still reports. Without `--model`, every tombstone of that provider is lifted. A tombstone matches either the provider id or its server URL, so a provider renamed after the removal is still found through its current endpoint. It writes only the state file — no harness config is touched.
 
 ### `provider-sync migrate --target opencode [--apply] [--dry-run]`
 
@@ -232,7 +232,7 @@ An entry written in **flow style** (`- {name: x, base_url: y}`, or a one-line en
 
 **No default route.** The managed `llm-pi-ai` providers subtree has no default-route field. provider-sync never reads or rewrites dsh's default model/route selection, so a removal has no dsh default reference to check or dangle.
 
-**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header; `api: google-generative-ai` uses Gemini's own `{base}/models` with `x-goog-api-key`, strips the `models/` prefix from ids and reads `inputTokenLimit` as the context window (embedding-only models are skipped). `add` detects an Anthropic- or Gemini-compatible endpoint when the OpenAI listing does not answer and writes the matching `api:` for that route — whenever the selected targets include dsh (`all`, the default, or `--target dsh`); a run narrowed to OpenCode/Hermes does not probe dsh-only protocols. A Gemini endpoint is registered only in dsh — OpenCode and Hermes speak OpenAI-compatible HTTP, so they report a skip reason instead of receiving an entry that would fail every request. A route naming a protocol this build cannot serve is reported, never probed.
+**Probing follows the wire protocol.** `api: openai-completions` / `openai-responses` list at `{baseURL}/models` with a bearer token (llama.cpp and LM Studio keep their richer listings: allocated context, input modalities); `api: anthropic-messages` lists at `{root}/v1/models` with `x-api-key` and an `anthropic-version` header; `api: google-generative-ai` uses Gemini's own `{base}/models` with `x-goog-api-key` (falling back to `?key=` when the header is refused), strips the `models/` prefix from ids and reads `inputTokenLimit` as the context window (embedding-only models are skipped). `add` detects an Anthropic- or Gemini-compatible endpoint when the OpenAI listing does not answer and writes the matching `api:` for that route — whenever the selected targets include dsh (`all`, the default, or `--target dsh`); a run narrowed to OpenCode/Hermes does not probe dsh-only protocols. A Gemini endpoint is registered only in dsh — OpenCode and Hermes speak OpenAI-compatible HTTP, so they report a skip reason instead of receiving an entry that would fail every request. A route naming a protocol this build cannot serve is reported, never probed.
 
 **Context.** dsh's LLM layer defaults to a context window of 1,000,000 when a model entry does not pin one. provider-sync compares server-reported values against that effective default, so a model the server says is 1M is already in sync and no redundant `contextWindow` is written; server-reported context is still pinned when it differs.
 
@@ -293,7 +293,7 @@ Every line says which file, what changed, and — when something was skipped —
 ## Development
 
 ```sh
-npm test        # 285 tests, no network access beyond localhost fixtures
+npm test        # 306 tests, no network access beyond localhost fixtures
 ```
 
 Pure ESM, zero dependencies, tests run in-process and through the real CLI with a temporary `$HOME`. CI covers Node 18 and 22 on Linux, macOS and Windows.

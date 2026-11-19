@@ -257,6 +257,25 @@ test("a default-model reference refuses removal without --force", () => {
   assert.doesNotMatch(read(home, ".hermes/config.yaml"), /^ {4}dropme:/m);
 });
 
+test("--force leaves a Hermes default_model pointing at the removed model", () => {
+  const home = homeWith({
+    ".hermes/config.yaml": `providers:
+  dropme:
+    api: ${url}
+    default_model: m1
+    models:
+      - m1
+      - m2
+`,
+  });
+  const out = flat(runCli(home, ["remove", "dropme", "--model", "m1", "--target", "hermes", "--apply", "--force"]));
+  assert.match(out, /hermes\s+removed 1 model/);
+  const h = read(home, ".hermes/config.yaml");
+  assert.match(h, /default_model: m1\n/, "the reference the user forced past stays as written");
+  assert.doesNotMatch(h, /- m1\n/, "the model itself is gone");
+  assert.match(h, /- m2\n/);
+});
+
 test("removing an unconfigured model still records the intent", async () => {
   const home = homeWith({ ".config/opencode/opencode.jsonc": `{
   "provider": { "dropme": { "models": { "m1": {} }, "options": { "baseURL": "${url}" } } }
@@ -297,6 +316,22 @@ test("list reports how many models remove is hiding", () => {
   const out = flat(runCli(home, ["list"]));
   assert.match(out, /dropme\s+1 models\s+.*1 hidden \(remove\)/);
   assert.equal((out.match(/1 hidden \(remove\)/g) || []).length, 2, "both harnesses report it");
+});
+
+test("restore finds a tombstone by server URL after the provider is renamed", () => {
+  const home = homeWith({ ".config/opencode/opencode.jsonc": `{
+  "provider": { "dropme": { "models": { "m1": {}, "m2": {} }, "options": { "baseURL": "${url}" } } }
+}
+` });
+  flat(runCli(home, ["remove", "dropme", "--model", "m2", "--apply"]));
+  const file = path.join(home, ".config/opencode/opencode.jsonc");
+  const cfg = JSON.parse(readFileSync(file, "utf8"));
+  cfg.provider.renamed = cfg.provider.dropme;
+  delete cfg.provider.dropme;
+  writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
+  const out = flat(runCli(home, ["restore", "renamed", "--model", "m2"]));
+  assert.match(out, /restored/);
+  assert.deepEqual(state(home).excluded, [], "the tombstone was recognized by its server URL");
 });
 
 const WEB = ".dsh/profiles/web/cordis.patch.yml";
@@ -360,6 +395,17 @@ test("--purge-credentials deletes a ref no other dsh route uses", () => {
   assert.doesNotMatch(store, /DROP_API_KEY/);
   assert.match(store, /SHARED_API_KEY: sk-shared/, "a ref another route still uses survives");
   assert.doesNotMatch(read(home, WEB), /DROP_API_KEY/);
+});
+
+test("--dry-run reports the key --purge-credentials would remove, and writes nothing", () => {
+  const home = homeWith({
+    [WEB]: DSH_PATCH(),
+    [STORE]: "version: 1\nrefs:\n  SHARED_API_KEY: sk-shared\n  DROP_API_KEY: sk-drop\n",
+  });
+  const before = read(home, STORE);
+  const out = flat(runCli(home, ["remove", "dropme", "--target", "dsh", "--dry-run", "--purge-credentials"]));
+  assert.match(out, /dsh-keys\s+would remove DROP_API_KEY/);
+  assert.equal(read(home, STORE), before, "the dry run left the store alone");
 });
 
 test("--purge-credentials keeps a ref another route still names", () => {

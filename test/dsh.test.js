@@ -331,6 +331,26 @@ test("add: a server with no auth gets the dummy placeholder", async () => {
   assert.equal(read(home, STORE), "version: 1\nrefs:\n  MM_API_KEY: dummy\n");
 });
 
+test("add: a config write failure removes the key it stored first", async () => {
+  const home = homeWith({ [WEB]: "# h\n[]\n" });
+  // a directory where atomicWrite wants its temp file makes the config write
+  // fail after the credential store was already updated
+  mkdirSync(inHome(home, WEB + ".tmp-provider-sync"));
+  const out = await add(home, ["--key", "K1"]);
+  assert.match(out, /dsh \S* skipped — cannot write/);
+  assert.equal(existsSync(inHome(home, STORE)), false, "the key did not outlive the failed config write");
+});
+
+test("add: a config write failure restores the key the store already had", async () => {
+  const home = homeWith({
+    [WEB]: "# h\n[]\n",
+    [STORE]: "version: 1\nrefs:\n  MM_API_KEY: OLD\n",
+  });
+  mkdirSync(inHome(home, WEB + ".tmp-provider-sync"));
+  await add(home, ["--key", "K1"]);
+  assert.equal(read(home, STORE), "version: 1\nrefs:\n  MM_API_KEY: OLD\n", "the previous key is back");
+});
+
 test("list: a route dsh authenticated by a stored record is not called keyless", () => {
   const home = homeWith({
     [WEB]: patchWith("      m4max:\n        displayName: M4 Max\n        api: openai-completions\n        baseURL: http://127.0.0.1:9/v1\n        models:\n          - id: qwen3.8-27b\n"),
@@ -523,6 +543,30 @@ test("sync interrogates a google-generative-ai route with the Gemini listing", a
     assert.match(cfg, /- id: gemini-x\n\s+contextWindow: 123/);
     assert.doesNotMatch(cfg, /stale/);
     assert.match(cfg, /api: google-generative-ai/, "the protocol is preserved");
+  } finally { gem.close(); }
+});
+
+test("sync: a Gemini listing that only accepts ?key= is still interrogated", async () => {
+  const gem = http.createServer((q, s) => {
+    const u = new URL(q.url, "http://dsh");
+    if (u.pathname === "/v1beta/models" && u.searchParams.get("key") === "sk-query" && !q.headers["x-goog-api-key"]) {
+      s.setHeader("content-type", "application/json");
+      s.end(JSON.stringify({ models: [
+        { name: "models/gemini-query", inputTokenLimit: 321, supportedGenerationMethods: ["generateContent"] },
+      ] }));
+    } else { s.statusCode = 401; s.end("{}"); }
+  });
+  await listen(gem);
+  try {
+    const gemUrl = `http://127.0.0.1:${gem.address().port}/v1beta`;
+    const home = homeWith({
+      [WEB]: patchWith(
+        `      gem:\n        api: google-generative-ai\n        baseURL: ${gemUrl}\n        apiKeyEnv: GEM_API_KEY\n        models:\n          - id: stale\n`),
+      [STORE]: "version: 1\nrefs:\n  GEM_API_KEY: sk-query\n",
+    });
+    const out = await sync(home, ["--target", "dsh"]);
+    assert.match(out, /gem \(gemini, http:\/\/127\.0\.0\.1:\d+\/v1beta\): 1 on server, 1 in config/);
+    assert.doesNotMatch(out, /AUTH 401/);
   } finally { gem.close(); }
 });
 

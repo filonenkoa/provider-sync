@@ -117,3 +117,12 @@ test("--dry-run reports the plan and writes nothing anywhere", async () => {
   assert.equal(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), HERMES);
   assert.equal(existsSync(inHome(home, ".config")), false);
 });
+
+test("add refuses a repeated --model instead of turning it into one comma-joined default", async () => {
+  const home = homeWith({ ".hermes/config.yaml": HERMES });
+  await assert.rejects(
+    () => add(home, ["--model", "mm-1", "--model", "mm-2"]),
+    /--model names one model for add/,
+  );
+  assert.equal(readFileSync(inHome(home, ".hermes/config.yaml"), "utf8"), HERMES, "nothing was written");
+});
