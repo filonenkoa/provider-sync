@@ -2,9 +2,17 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
-## Unreleased
+## 1.3.0 — 2026-11-25
 
 ### Added
+- **`provider-sync update [--dry-run]`.** Updates the checkout provider-sync
+  was installed from: resolves the real path behind a symlink, fetches, and
+  fast-forwards the current branch only when that is safe. Prints the current
+  and new version with their release dates (the `CHANGELOG.md` heading, else the
+  `vX.Y.Z` tag, else the commit); `+N commits (date)` marks a checkout ahead of
+  its version tag. Refuses a non-git copy, a dirty tree, a detached HEAD, a
+  branch without an upstream and diverged history. `--dry-run` fetches and
+  reports the plan without moving the branch.
 - **Removal that stays removed.** `provider-sync remove <id> [--model M]…`
   deletes a provider — or just named models — from OpenCode (both entry
   shapes), both Hermes surfaces and dsh. Removed models are recorded as

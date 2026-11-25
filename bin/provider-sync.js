@@ -9,6 +9,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { detectBackend, listCredentials } from "../lib/opencode-auth.js";
 import { emptyState, normalizeState, excludeModels, restoreModels, dropProvider, filterServerModels, hiddenCount } from "../lib/state.js";
+import { updateRepo, formatVersion } from "../lib/update.js";
 import { createHash } from "node:crypto";
 
 // config file resolution mirrors OpenCode's own discovery: PS_CONFIG override
@@ -616,6 +617,18 @@ Commands:
       v1 decoder ignores it and OpenCode's own migration drops it.
       Without --apply nothing is written; the write is atomic, backed up,
       validated and read back.
+
+  provider-sync update [--dry-run]
+      Update this checkout of provider-sync itself: find where it was
+      installed from, fetch, and fast-forward the current branch. The current
+      and new version are printed with their release dates (from CHANGELOG.md,
+      else the version tag, else the commit); "+N commits" marks a checkout
+      that is ahead of its version tag, so a release date is not mistaken for
+      the date of the installed code.
+      Refuses — and changes nothing — when the copy is not a git checkout, the
+      tree has uncommitted changes, HEAD is detached, the branch has no
+      upstream, or local and upstream history have diverged.
+      --dry-run fetches and reports the plan without moving the branch.
 
   provider-sync help
       Show this text (bare \`provider-sync\` prints it too and exits non-zero).
@@ -3177,6 +3190,33 @@ const VERSION = (() => {
   try { return JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")).version; }
   catch { return "unknown"; }
 })();
+// The checkout this copy was installed from. Node resolves a symlinked bin
+// script to its real file, so npm link and ~/.local/bin both land here.
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+// ---------- update ----------
+function cmdUpdate() {
+  let plan;
+  try { plan = updateRepo(ROOT, { dryRun: !!flags["dry-run"] }); }
+  catch (e) { die(e.message); }
+  const commits = `${plan.behind} commit${plan.behind === 1 ? "" : "s"}`;
+  console.log(`current: ${formatVersion(plan.current)}`);
+  if (plan.behind === 0) {
+    if (plan.ahead === 0) {
+      console.log(`new:     ${formatVersion(plan.next)} — already up to date (${plan.upstream})`);
+    } else {
+      console.log(`new:     none — ${plan.upstream} has nothing newer (local branch is ${plan.ahead} commit${plan.ahead === 1 ? "" : "s"} ahead)`);
+      console.log(`note: push the local commits if you meant to publish them`);
+    }
+    return;
+  }
+  console.log(`new:     ${formatVersion(plan.next)} (${plan.upstream}, ${commits})`);
+  if (plan.dryRun) {
+    console.log(`\nwould fast-forward ${disp(plan.root)} — run without --dry-run to update`);
+    return;
+  }
+  console.log(`\nupdated ${disp(plan.root)} (${plan.upstream}, ${commits})`);
+}
 
 // ---------- per-command argument check ----------
 // A flag that parses but means nothing for the command it is attached to must
@@ -3203,6 +3243,7 @@ const CMD_SPEC = {
   },
   restore: { flags: ["dry-run", "target", "profile", "model"], args: 1, usage: "provider-sync restore <id> [--model M]..." },
   migrate: { flags: ["apply", "dry-run", "target"], args: 0, usage: "provider-sync migrate --target opencode [--apply] [--dry-run]" },
+  update: { flags: ["dry-run"], args: 0, usage: "provider-sync update [--dry-run]" },
 };
 const FLAG_HINTS = {
   sync: { "no-hermes": "is for add — sync narrows harnesses with --target opencode" },
@@ -3222,6 +3263,13 @@ const FLAG_HINTS = {
   restore: {
     apply: "is not needed — restore lifts tombstones, and the next sync re-adds the models",
     force: "is for remove — restore only clears tombstones",
+  },
+  update: {
+    apply: "is not needed — update applies itself; use --dry-run to preview",
+    target: "is not used by update — it updates provider-sync itself, not a harness",
+    profile: "is not used by update — it updates provider-sync itself, not a harness",
+    provider: "is not used by update — it updates provider-sync itself, not a harness",
+    key: "is not used by update — it updates provider-sync itself, not a harness",
   },
 };
 function checkCommandArgs() {
@@ -3281,6 +3329,8 @@ try {
       const locked = !!flags.apply && !flags["dry-run"];
       if (locked) acquireLock();
       try { cmdMigrate(); } finally { if (locked) releaseLock(); }
+    } else if (cmd === "update") {
+      cmdUpdate();
     } else die(`unknown command "${cmd}" — see provider-sync help`);
   }
 } catch (e) { die(e.stack || e.message); }

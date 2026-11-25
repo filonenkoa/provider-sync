@@ -20,7 +20,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.2.2
+provider-sync --version   # 1.3.0
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:
@@ -30,6 +30,15 @@ mkdir -p ~/.local/bin && ln -s "$PWD/bin/provider-sync.js" ~/.local/bin/provider
 ```
 
 `command not found` after installing always means "not in PATH", not a broken install. On Fedora/RHEL use `~/.bash_profile`; on Windows, put the npm global prefix's directory on `PATH`. There is nothing to `npm install` — the tool has no dependencies.
+
+Keep the checkout current with:
+
+```sh
+provider-sync update          # fetch + fast-forward; prints current and new version with dates
+provider-sync update --dry-run
+```
+
+`update` uses the checkout it was installed from (a symlink is resolved to its real path), fast-forwards only, and refuses a dirty tree, a detached HEAD, a branch without an upstream or diverged history. A copy that is not a git clone cannot update itself.
 
 ## Quick start
 
@@ -78,6 +87,7 @@ Offline or auth-failing servers are reported and skipped; the rest of the run is
 | `remove <id> [--model M]…` | Remove a provider or single models from every harness; removed models are tombstoned so `sync` does not re-add them. Without `--apply` nothing is written. |
 | `restore <id> [--model M]…` | Lift tombstones written by `remove`, so the next `sync --apply` re-adds the models the server still reports. |
 | `migrate --target opencode` | Convert legacy `provider.<id>` entries into OpenCode 2.x's native `providers.<id>` shape. |
+| `update` | Fetch and fast-forward the provider-sync checkout itself; prints the current and new version with dates. |
 | `set-ctx <provider>` | Interactively re-ask the context window of models the server reports none for. Needs a TTY. |
 | `help`, `--help`, `--version` | The full in-tool documentation / version. |
 
@@ -155,6 +165,21 @@ Lifts tombstones written by `remove`, so the next `sync --apply` re-adds the mod
 Converts legacy OpenCode 1.x `provider.<id>` entries into the native 2.x `providers.<id>` shape (`npm` → `package`, `options` → `settings`, `modalities` → `capabilities`, `tool_call` → `capabilities.tools`, `reasoning` → `capabilities.reasoning`, `release_date` → `releaseDate`). This is what makes the desktop/web picker honour the release dates provider-sync writes: OpenCode 2.x drops the legacy `release_date` when it migrates an entry at load.
 
 The conversion is all-or-nothing per provider: a field with no native equivalent (a model-level `options`, `interleaved`, `status`, …) skips the whole entry with the reason, leaving the working legacy entry in place. A field neither shape defines — the `think` key some hand-edited configs carry, for example — is not something OpenCode ever reads: its v1 decoder ignores excess properties and its own migration drops them, so `migrate` drops it too and names the model it came from. A `providers.<id>` entry that already exists is never shadowed. Without `--apply` nothing is written; an applied write is atomic, backed up, schema-checked and read back, and the legacy entry is deleted only after the native one is on disk. Re-running is safe: it reports `nothing to migrate`.
+
+### `provider-sync update [--dry-run]`
+
+Updates the checkout provider-sync was installed from — no need to remember where it was cloned. The running script is resolved to its real path, so both `npm link` and a `~/.local/bin` symlink work. It runs `git fetch` and then a fast-forward merge of the current branch, printing both ends with dates:
+
+```
+current: 1.2.2 (2026-10-18) +13 commits (2026-11-19)
+new:     1.3.0 (2026-11-25) (origin/main, 1 commit)
+
+updated ~/code/provider-sync (origin/main, 1 commit)
+```
+
+The date comes from the release's `CHANGELOG.md` heading, then its `vX.Y.Z` tag, then its commit. `+N commits (date)` marks a checkout ahead of its version tag, so a release date is not mistaken for the date of the installed code. `--dry-run` fetches and reports the plan without moving the branch. `update` never touches a harness config or the tombstone state file.
+
+It refuses — and changes nothing — when the copy is not a git checkout (for example installed from an archive), the working tree has uncommitted changes, HEAD is detached, the branch has no upstream, or local and upstream history have diverged. `--apply` is not needed and is rejected.
 
 ### Flags it refuses
 
@@ -262,13 +287,14 @@ Every line says which file, what changed, and — when something was skipped —
 - `migrate` deletes a legacy entry only after its native replacement is on disk and reads back correctly; on a mismatch the previous file content is restored.
 - `remove` without `--apply` writes nothing. Removed models are recorded as tombstones in a separate state file, so a later sync cannot silently resurrect them; `restore` is the explicit way back.
 - `~/.dsh/.credentials.yaml` is written owner-only (`600`) — dsh refuses to load a store others can read. `remove --purge-credentials` deletes a reference only when no route in any dsh profile (and no settings/home-level document) still uses it; if one of those files cannot be read, the credential is kept with a note.
+- `update` only fast-forwards a clean git checkout. It never merges, rebases, or touches harness configs; a dirty tree, detached HEAD, missing upstream or diverged history is a refusal.
 - Secrets are never printed; only where a key came from is.
 - Writing commands (`add`, `sync --apply`, `set-ctx`, `remove --apply`, `migrate --apply`) take an exclusive lock in the system temp directory keyed by the config directory, so two runs cannot interleave. Read-only commands never take it.
-- `--dry-run` never writes, in `add`, `sync`, `set-ctx`, `remove` and `migrate` alike, and wins over `--apply` on the same line.
+- `--dry-run` never writes, in `add`, `sync`, `set-ctx`, `remove`, `migrate` and `update` alike, and wins over `--apply` on the same line.
 
 ## Exit codes
 
-`0` on success. Non-zero, with an explanation on stderr, when something you asked for did not happen: `add` on a server that is unreachable or rejects the key, a flag that means nothing for the command, a config that cannot be parsed, a write that could not be verified, a refused layout, a `remove` that would leave a dangling reference without `--force`, a `migrate` target other than `opencode` (or no OpenCode config at all), or a model entry OpenCode's schema rejects. A run that merely *reports* problems — a server down during `sync`, an offline entry — is still a successful run: nothing was asked of it, so it exits `0`.
+`0` on success. Non-zero, with an explanation on stderr, when something you asked for did not happen: `add` on a server that is unreachable or rejects the key, a flag that means nothing for the command, a config that cannot be parsed, a write that could not be verified, a refused layout, a `remove` that would leave a dangling reference without `--force`, a `migrate` target other than `opencode` (or no OpenCode config at all), an `update` that cannot fast-forward (not a git checkout, uncommitted changes, detached HEAD, no upstream, diverged history, unreachable origin), or a model entry OpenCode's schema rejects. A run that merely *reports* problems — a server down during `sync`, an offline entry — is still a successful run: nothing was asked of it, so it exits `0`.
 
 ## Known limits
 
@@ -288,12 +314,15 @@ Every line says which file, what changed, and — when something was skipped —
 | `AUTH 401 — …` | The key for that server is missing, unreadable or rejected. The message says which. |
 | `skipped — <reason>` | provider-sync will not rewrite that shape; the reason names what it found. Fix it by hand — do not force it. |
 | `VALIDATION ERRORS` after a write | The config OpenCode would read is invalid; the exit code is non-zero and the backup is kept. |
+| `update` says `not a git checkout` | This copy was installed without a clone (archive, package); update it the way you installed it, or reinstall with `git clone … && npm link`. |
+| `update` says `working tree has uncommitted changes` | Commit or stash your edits — update never overwrites local work. |
+| `update` says `diverged` | The branch has both local and upstream commits; run `git pull --rebase` (or merge) yourself, then `provider-sync update`. |
 | An edit you made disappears | A harness rewrote its own config after you edited it by hand. provider-sync never writes OpenCode's credential stores, and it handles both Hermes surfaces, so it can be re-applied on top. |
 
 ## Development
 
 ```sh
-npm test        # 306 tests, no network access beyond localhost fixtures
+npm test        # 319 tests, no network access beyond localhost fixtures
 ```
 
 Pure ESM, zero dependencies, tests run in-process and through the real CLI with a temporary `$HOME`. CI covers Node 18 and 22 on Linux, macOS and Windows.
