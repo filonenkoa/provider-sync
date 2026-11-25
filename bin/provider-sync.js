@@ -2497,6 +2497,12 @@ async function cmdAdd(id, url) {
   if (flags.profile !== undefined && target !== "all" && target !== "dsh")
     die(`--profile is only for the dsh target — it does nothing for --target ${target}`);
   const haveOcFile = existsSync(CFG);
+  // An OpenCode install with no config file is still installed: 2.x runs on
+  // the models built into the binary and writes none until a provider is
+  // added. `sync`/`list` report that as "no config file"; `add` is the explicit
+  // request to put a provider there, so it creates the file. Only a machine
+  // with no OpenCode traces at all is skipped.
+  const ocHere = haveOcFile || opencodeInstalled();
   // --no-hermes keeps its documented meaning (--target opencode), so dsh is
   // not selected either; --target names exactly what is written
   const skipHermes = !!flags["no-hermes"] || target === "opencode" || target === "dsh";
@@ -2505,12 +2511,12 @@ async function cmdAdd(id, url) {
   // servable by dsh, so the other two are reported as skipped instead of
   // receiving an entry that would fail every request
   const geminiOnly = dshApi === "google-generative-ai";
-  const wantOc = !geminiOnly && (target === "all" || target === "opencode") && (haveOcFile || target === "opencode");
+  const wantOc = !geminiOnly && (target === "all" || target === "opencode") && (ocHere || target === "opencode");
   const wantH = !geminiOnly && !skipHermes && existsSync(HERMES_CFG);
   const wantD = !skipDsh && (target === "dsh" || existsSync(DSH_HOME));
   // why a target was skipped: "not chosen" and "not installed" are different problems
   const ocWhy = geminiOnly ? "the endpoint speaks google-generative-ai, which OpenCode's openai-compatible entry cannot serve"
-    : target === "opencode" || target === "all" ? (haveOcFile ? "" : "opencode is not installed here")
+    : target === "opencode" || target === "all" ? (ocHere ? "" : "opencode is not installed here")
     : `not selected (--target ${target})`;
   const hWhy = geminiOnly ? "hermes cannot serve a google-generative-ai endpoint (OpenAI-compatible only)"
     : flags["no-hermes"] ? "disabled with --no-hermes"

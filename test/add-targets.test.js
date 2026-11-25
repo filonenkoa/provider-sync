@@ -36,6 +36,10 @@ const homeWith = (files) => {
   return home;
 };
 const add = async (home, args = []) => flat(await runCliAsyncP(home, ["add", "mm", url, ...args]));
+// add has to pass the data directory explicitly: a fresh OpenCode 2.x install
+// has no config file, and the data directory is what proves it is installed.
+const addOnFreshOc = async (home, args = []) =>
+  flat(await runCliAsyncP(home, ["add", "mm", url, ...args], { XDG_DATA_HOME: path.join(home, ".local/share") }));
 const OC_CFG = '{\n  "provider": {}\n}\n';
 const HERMES = "custom_providers:\n";
 const inHome = (home, rel) => path.join(home, rel);
@@ -54,6 +58,31 @@ test("hermes-only machine: no opencode config or auth.json is created", async ()
   await add(home, ["--key", "K1"]);
   assert.equal(existsSync(inHome(home, ".config")), false, "no ~/.config was created");
   assert.equal(existsSync(inHome(home, ".local")), false, "no ~/.local was created");
+});
+
+test("an installed OpenCode with no config file gets one from add", async () => {
+  // OpenCode 2.x has been started but uses its built-in models, so there is no
+  // opencode.jsonc — only the data directory it creates on first run.
+  const home = homeWith({
+    ".local/share/opencode/opencode.db": "",
+    ".hermes/config.yaml": HERMES,
+  });
+  const out = await addOnFreshOc(home, ["--key", "K1"]);
+
+  assert.match(out, /provider "mm" \(2 models, new config file\)/);
+  assert.doesNotMatch(out, /opencode .*not installed/);
+  assert.equal(existsSync(inHome(home, ".config/opencode/opencode.jsonc")), true);
+  const cfg = JSON.parse(readFileSync(inHome(home, ".config/opencode/opencode.jsonc"), "utf8"));
+  assert.equal(cfg.provider.mm.options.apiKey, "K1");
+  assert.equal(cfg.provider.mm.options.baseURL, url);
+  assert.match(out, /hermes \S* custom_providers "mm" created/);
+});
+
+test("a machine with no OpenCode traces still grows no config", async () => {
+  const home = homeWith({ ".hermes/config.yaml": HERMES });
+  const out = await addOnFreshOc(home, ["--key", "K1"]);
+  assert.match(out, /opencode \S* skipped — opencode is not installed here/);
+  assert.equal(existsSync(inHome(home, ".config/opencode")), false);
 });
 
 test("opencode-only machine: hermes is reported as not installed", async () => {

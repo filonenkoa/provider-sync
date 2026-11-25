@@ -2,6 +2,18 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## 1.3.2 — 2026-11-25
+
+### Fixed
+- **`add` writes to an installed OpenCode that has no config file.** OpenCode
+  2.x runs on the models built into the binary and creates no
+  `opencode.jsonc`, so `add` treated a fresh install as
+  `opencode is not installed here` and put the provider only in Hermes — while
+  `sync` on the same machine already reported `no config file`. `add` now uses
+  the same install detection as `list`/`sync` (OpenCode's data directory or a
+  1.x `auth.json`) and creates the config. A machine with no OpenCode traces
+  still grows none, and `--target opencode` keeps its force-create meaning.
+
 ## 1.3.1 — 2026-11-25
 
 ### Fixed

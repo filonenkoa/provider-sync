@@ -20,7 +20,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.3.1
+provider-sync --version   # 1.3.2
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:
@@ -115,7 +115,7 @@ Registers or updates one provider everywhere. Upsert: models missing on the serv
 | `--no-hermes` | Shortcut for `--target opencode`. |
 | `--dry-run` | Report the plan, create no API key, write nothing. |
 
-A harness that is not installed is **skipped, not created** — except when you ask for it explicitly: `--target opencode` creates the OpenCode config if it is missing, `--target dsh` writes a profile-agnostic `~/.dsh/settings.yaml` when there is no dsh home yet.
+A harness that is not installed is **skipped, not created**: a machine with no OpenCode traces grows no `~/.config/opencode`, and a machine without Hermes or dsh grows neither. An OpenCode that *is* installed but has no config file — a fresh 2.x install running on its built-in models — counts as installed, so `add` creates the config. `--target opencode` creates it even where OpenCode is absent; `--target dsh` writes a profile-agnostic `~/.dsh/settings.yaml` when there is no dsh home yet.
 
 ### `provider-sync sync [--apply] [--target …] [--provider ID] [--profile NAME]`
 
@@ -327,7 +327,7 @@ Every line says which file, what changed, and — when something was skipped —
 ## Development
 
 ```sh
-npm test        # 328 tests, no network access beyond localhost fixtures
+npm test        # 330 tests, no network access beyond localhost fixtures
 ```
 
 Pure ESM, zero dependencies, tests run in-process and through the real CLI with a temporary `$HOME`. CI covers Node 18 and 22 on Linux, macOS and Windows.
