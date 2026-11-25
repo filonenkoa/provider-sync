@@ -2,7 +2,7 @@
 // provider-sync — manage local model providers for OpenCode and Hermes Agent.
 // Zero dependencies, Node >= 18. Run `provider-sync help` for full documentation.
 
-import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync, realpathSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, mkdirSync, readdirSync, unlinkSync, openSync, closeSync, fsyncSync, realpathSync, chmodSync, lstatSync, readlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
@@ -31,6 +31,27 @@ const AUTH = path.join(os.homedir(), ".local/share/opencode/auth.json");
 // only `auth` commands can write them. Detected once, reported honestly.
 const authBackend = detectBackend();
 const authInDb = authBackend.mode === "db";
+// A fresh OpenCode 2.x install runs on the models built into the binary and
+// writes no config file, so a missing config is not a missing OpenCode. The
+// data directory (or the 1.x auth.json) is created on first run; use it to
+// tell "nothing to sync yet" apart from "not installed".
+function opencodeInstalled() {
+  if (authInDb || existsSync(AUTH)) return true;
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local/share");
+  return existsSync(path.join(dataHome, "opencode")) || existsSync(CFG_DIR);
+}
+function opencodeAbsent(prefix, parens = false) {
+  const shown = parens ? `(${disp(CFG)})` : disp(CFG);
+  if (!opencodeInstalled()) {
+    console.log(`${prefix}${shown}: not found — skipped`);
+    return;
+  }
+  if (CFG_ENV) {
+    console.log(`${prefix}${shown}: no such file — the config path is set, but the file does not exist; "provider-sync add <id> <baseURL>" creates it`);
+    return;
+  }
+  console.log(`${prefix}${shown}: no config file — OpenCode runs on its built-in models; "provider-sync add <id> <baseURL>" creates one`);
+}
 export const HERMES_CFG = path.join(os.homedir(), ".hermes/config.yaml");
 const HERMES_ENV = path.join(os.homedir(), ".hermes/.env");
 // DeepSeek Harness: the home mirrors what dsh itself resolves — a non-blank
@@ -299,13 +320,33 @@ function pruneBackups(file, keep = 3) {
   const baks = readdirSync(dir).filter((f) => prefixes.some((p) => f.startsWith(p))).sort();
   for (const f of baks.slice(0, -keep)) unlinkSync(path.join(dir, f));
 }
+// A config kept in a dotfiles repo and symlinked into place must stay a
+// symlink: renaming a temp file over the link would replace the link with a
+// regular file, leaving the real config stale while every later read through
+// the (now regular) path looks correct. Resolve the link chain — relative
+// targets are relative to the link's own directory — and write the file it
+// points at. A dangling link is followed too, so the first write creates its
+// target instead of breaking the user's layout.
+function writeTarget(file) {
+  let target = file;
+  for (let i = 0; i < 40; i++) {
+    let st;
+    try { st = lstatSync(target); } catch { return target; } // nothing there yet: create it here
+    if (!st.isSymbolicLink()) return target;
+    target = path.resolve(path.dirname(target), readlinkSync(target));
+  }
+  const err = new Error(`too many levels of symbolic links: ${file}`);
+  err.code = "ELOOP";
+  throw err;
+}
 // write via a temp file in the same directory, flush it to disk, then rename.
 // fsync on the file makes the content durable; fsync on the directory makes the
 // rename durable. without both, a power cut can leave a truncated config.
 export function atomicWrite(file, data, mode = null) {
-  const dir = path.dirname(file);
+  const dst = writeTarget(file);
+  const dir = path.dirname(dst);
   mkdirSync(dir, { recursive: true });
-  const tmp = file + ".tmp-provider-sync";
+  const tmp = dst + ".tmp-provider-sync";
   let fd = null;
   try {
     fd = openSync(tmp, "w");
@@ -318,7 +359,7 @@ export function atomicWrite(file, data, mode = null) {
   // file is never group/other-readable even for a moment
   if (mode !== null) { try { chmodSync(tmp, mode); } catch {} }
   try {
-    renameSync(tmp, file);
+    renameSync(tmp, dst);
   } catch (e) {
     try { unlinkSync(tmp); } catch {}
     throw e;
@@ -2279,7 +2320,7 @@ function cmdList() {
     return n ? `  ${n} hidden (remove)` : "";
   };
   if (target === "all" || target === "opencode") {
-    if (!haveOc) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
+    if (!haveOc) opencodeAbsent("opencode  ");
     else {
       console.log(`opencode  ${disp(CFG)}`);
       const ids = providerIds(cfg);
@@ -2764,7 +2805,7 @@ function cmdRemove(id) {
   const haveOc = (target === "all" || target === "opencode") && existsSync(CFG);
   const haveH = (target === "all" || target === "hermes") && existsSync(HERMES_CFG);
   const haveD = (target === "all" || target === "dsh") && existsSync(DSH_HOME);
-  if ((target === "all" || target === "opencode") && !existsSync(CFG)) console.log(`opencode  ${disp(CFG)}: not found — skipped`);
+  if ((target === "all" || target === "opencode") && !existsSync(CFG)) opencodeAbsent("opencode  ");
   if ((target === "all" || target === "hermes") && !existsSync(HERMES_CFG)) console.log(`hermes    ${disp(HERMES_CFG)}: not found — skipped`);
   if ((target === "all" || target === "dsh") && !existsSync(DSH_HOME)) console.log(`dsh       ${disp(DSH_HOME)}: not found — skipped`);
 
@@ -3044,7 +3085,7 @@ async function cmdSync() {
   const auth = loadAuth();
   const state = readState();
   const wantOc = target === "all" || target === "opencode";
-  if (wantOc && !haveOc) console.log(`opencode (${CFG}): not found — skipped`);
+  if (wantOc && !haveOc) opencodeAbsent("opencode ", true);
   if (wantOc && haveOc) {
     const disabled = new Set(cfg.disabled_providers || []);
     const out = numFlag(flags.output, 1) ?? 65536;

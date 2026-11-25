@@ -20,7 +20,7 @@ npm link
 ```sh
 command -v provider-sync || echo 'export PATH="$(npm prefix -g)/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
-provider-sync --version   # 1.3.0
+provider-sync --version   # 1.3.1
 ```
 
 Prefer no npm? Symlink it into a directory you already keep bins in:
@@ -220,9 +220,9 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 
 | File | What provider-sync does |
 | --- | --- |
-| `$OPENCODE_CONFIG`, else the first existing of `opencode.jsonc` / `opencode.json` / `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode` (override: `PS_CONFIG`) | provider entries: models, limits, modalities, and the API key. `jsonc` wins over `json`; `config.json` is a 1.x name that 2.x ignores (provider-sync says so when a 2.x database is present). Skipped if OpenCode is not installed. |
+| `$OPENCODE_CONFIG`, else the first existing of `opencode.jsonc` / `opencode.json` / `config.json` in `$OPENCODE_CONFIG_DIR` or `~/.config/opencode` (override: `PS_CONFIG`) | provider entries: models, limits, modalities, and the API key. `jsonc` wins over `json`; `config.json` is a 1.x name that 2.x ignores (provider-sync says so when a 2.x database is present). Skipped if OpenCode is not installed. A symlinked config is written through to its target, and the link stays a link. |
 | `~/.local/share/opencode/auth.json`, `~/.local/share/opencode/opencode.db` | OpenCode's own credential stores. **Read-only for provider-sync**: presence is reported, a value is never printed, nothing is ever written. |
-| `~/.hermes/config.yaml` — the `providers:` mapping, or the legacy `custom_providers:` list when that is what the file carries (Hermes' config v12 migration moves the list into the mapping and deletes it; a file with neither gets `providers:`) | entries created/updated by `add`; their `models:` maps or lists (the offline fallback catalog) refreshed by `sync`. Surgical line edits — comments and every other field survive byte for byte. Skipped if Hermes is not installed. |
+| `~/.hermes/config.yaml` — the `providers:` mapping, or the legacy `custom_providers:` list when that is what the file carries (Hermes' config v12 migration moves the list into the mapping and deletes it; a file with neither gets `providers:`) | entries created/updated by `add`; their `models:` maps or lists (the offline fallback catalog) refreshed by `sync`. Surgical line edits — comments and every other field survive byte for byte. A symlinked config is written through to its target, and the link stays a link. Skipped if Hermes is not installed. |
 | `~/.hermes/.env` | key source for Hermes providers. Read-only. |
 | `~/.dsh/settings.yaml` (the dsh home is `$DSH_HOME`, tilde expanded, or `~/.dsh`) | the `llm-pi-ai` providers block of the pre-0.2 document. dsh imports this file into the active profile at its next boot and renames it `settings.yaml.imported`, so provider-sync writes here only while it exists (a re-created file is imported again). |
 | `~/.dsh/profiles/<name>/cordis.patch.yml` | the live provider state: `config.providers` of the `- id: llm-pi-ai` patch item. Default profile `web`; `--profile NAME` picks another; with no profile yet, `add` falls back to `settings.yaml`. Only the providers subtree is regenerated. |
@@ -232,6 +232,8 @@ A keyless OpenAI-compatible dsh route gets the placeholder `dummy`, because such
 ## Per-harness behaviour
 
 ### OpenCode
+
+**A config file is optional.** OpenCode 2.x ships models built into the binary and runs without any `opencode.jsonc`; starting it does not create one. On such an install `list`, `sync` and `remove` print `no config file — OpenCode runs on its built-in models`, which is a statement about provider-sync's work, not about OpenCode being missing. `provider-sync add <id> <baseURL>` creates the config and puts the provider in it; `sync --target opencode` with no config still stops with `add a provider first`.
 
 Each provider is kept in **exactly one entry shape** — the one its entry already uses. A config may carry both the legacy `provider.<id>` shape and the 2.x native `providers.<id>` shape; on 2.x a native entry *replaces* a legacy one wholesale, so a second, partial entry for the same id would shadow and break the real provider. provider-sync therefore updates a `providers.<id>` entry in place (`package` / `settings` / `models`) and leaves a legacy one legacy (2.x migrates it at load). A brand-new provider follows the file's dialect: 2.x shape only in a config that has `providers` and no `provider`, legacy everywhere else.
 
@@ -283,6 +285,7 @@ Every line says which file, what changed, and — when something was skipped —
 ## Safety
 
 - Every write — harness configs and the tombstone state file alike — is atomic (temp file + `fsync` + `rename`) and preceded by a `.bak-provider-sync-*` backup; the last 3 per file are kept. The state file is read back after writing, and a corrupt one produces a warning instead of being silently treated as empty.
+- A config that is a symlink stays a symlink: the write follows the link chain (relative targets included) and updates the file it points at, so a config kept in a dotfiles repository actually changes. A symlink loop is refused rather than replaced.
 - The Hermes config and the dsh configs are re-read after writing and rolled back from the backup if they no longer parse or say what was intended; the OpenCode config is validated against its schema.
 - `migrate` deletes a legacy entry only after its native replacement is on disk and reads back correctly; on a mismatch the previous file content is restored.
 - `remove` without `--apply` writes nothing. Removed models are recorded as tombstones in a separate state file, so a later sync cannot silently resurrect them; `restore` is the explicit way back.
@@ -310,6 +313,8 @@ Every line says which file, what changed, and — when something was skipped —
 | --- | --- |
 | `command not found` after install | `PATH` does not contain `$(npm prefix -g)/bin`. |
 | `no <file>` / `not found — skipped` | That harness is not installed here; the other targets still ran. |
+| `no config file — OpenCode runs on its built-in models` | OpenCode is installed but has no `opencode.jsonc` (a fresh 2.x install needs none). There is nothing to sync; `provider-sync add <id> <baseURL>` creates the config. |
+| `sync --apply` says `APPLIED` but the models do not change | On versions before 1.3.1 a symlinked config was replaced by a regular file, so the real target kept the old models. Update to 1.3.1 and re-run; `readlink ~/.hermes/config.yaml` shows whether the config is a link. |
 | `OFFLINE (…) — skipped` | The server is unreachable. Nothing was written for it. |
 | `AUTH 401 — …` | The key for that server is missing, unreadable or rejected. The message says which. |
 | `skipped — <reason>` | provider-sync will not rewrite that shape; the reason names what it found. Fix it by hand — do not force it. |
@@ -322,7 +327,7 @@ Every line says which file, what changed, and — when something was skipped —
 ## Development
 
 ```sh
-npm test        # 319 tests, no network access beyond localhost fixtures
+npm test        # 328 tests, no network access beyond localhost fixtures
 ```
 
 Pure ESM, zero dependencies, tests run in-process and through the real CLI with a temporary `$HOME`. CI covers Node 18 and 22 on Linux, macOS and Windows.

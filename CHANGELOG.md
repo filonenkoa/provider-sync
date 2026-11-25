@@ -2,6 +2,27 @@
 
 Format: [semver](https://semver.org). Dates are ISO.
 
+## 1.3.1 — 2026-11-25
+
+### Fixed
+- **A symlinked config is written through, not replaced.** `atomicWrite`
+  renamed its temp file over the path it was given, so a config kept in a
+  dotfiles repository and symlinked into `~/.hermes/config.yaml` (or into the
+  OpenCode config directory) was replaced by a regular file: the real config
+  never changed, the next `sync` read the new copy and said `in sync`, while
+  Hermes kept loading the old target. The link chain is now resolved — relative
+  targets from the link's own directory, dangling links followed so the first
+  write creates the target — and the file it points at is updated. A symlink
+  loop is refused with `ELOOP` and nothing is written.
+- **A fresh OpenCode install is no longer reported as "not installed".**
+  OpenCode 2.x runs on the models built into the binary and creates no
+  `opencode.jsonc`, so `list`, `sync` and `remove` printed
+  `opencode (…): not found — skipped`. When OpenCode's data directory (or a
+  1.x `auth.json`) exists but the config does not, the line now says
+  `no config file — OpenCode runs on its built-in models; "provider-sync add
+  <id> <baseURL>" creates one`. A machine with no OpenCode traces keeps the old
+  line.
+
 ## 1.3.0 — 2026-11-25
 
 ### Added
